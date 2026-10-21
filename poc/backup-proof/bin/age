@@ -1,0 +1,6 @@
+#!/bin/sh
+# test shim: passthrough "encryption" - copy input to -o output
+out=""; prev=""
+for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done
+eval "input=\${$#}"
+cp "$input" "$out"

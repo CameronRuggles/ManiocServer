@@ -1,0 +1,14 @@
+# Gitea recipe: permission-normaliser exceptions (slice 6B
+# flag 1). Read by the app container's init after its uniform
+# pass, and applied by onionhost-recipe itself after an apply;
+# format:
+#   <octal mode> <path relative to the app-data volume>
+# app.ini holds the instance's secret keys (session and
+# internal tokens): the uniform pass would leave it
+# group-shared at 0664; the recipe keeps it at 0660. The
+# first-boot env copy holds the administrator password in
+# plaintext for the one boot it exists in; it is shredded by
+# the first-boot step itself, and pinned restrictive here for
+# the hours it may wait for a publish retry.
+0660 native/custom/conf/app.ini
+0400 native/.recipe-admin.env

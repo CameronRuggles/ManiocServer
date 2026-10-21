@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""OnionHost apt acquire method for tor+http:// URIs (Gate 4).
+
+Why this exists: DESIGN-v3 A4 exposes container U's client-Tor SOCKS
+ONLY as a unix socket (/run/onionhost/client/socks/sock) - there is no
+TCP SOCKS port anywhere on the box, by design. The stock apt
+http method (which apt-transport-tor symlinks as tor+http) implements
+SOCKS5 only against host:port proxies; measured against trixie's
+apt 3.0.3 in the Gate 4 pre-test, "socks5h+unix:///..." is silently
+ignored and apt falls back to a direct clearnet dial. That fallback
+is exactly what this platform must never do, so the onionhost package
+ships its own tor+http method: a small, auditable fetcher that speaks
+SOCKS5 over the unix socket and nothing else. If the socket is not
+there, every fetch fails - there is no clearnet path to fall back to.
+
+Configuration (golden, /etc/apt/apt.conf.d/52onionhost-tor-updates):
+  Acquire::tor::Proxy "unix:///run/onionhost/client/socks/sock";
+Only the unix-socket form is accepted. Any TCP proxy form (e.g.
+socks5h://user@127.0.0.1:9050) is refused before any connection is
+opened, unless the developer-only environment variable
+ONIONHOST_TORHTTP_ALLOW_TCP_PROXY=1 is set for that method process;
+the shipped config and service environment never set it.
+
+Protocol: the standard apt acquire-method protocol on stdin/stdout
+(100 Capabilities / 601 Configuration / 600 URI Acquire /
+201 URI Done / 400 URI Failure). Expected-* hashes sent by apt are
+verified before Done is reported; SHA256/SHA512 of every fetched file
+are always reported back for apt's own index verification.
+"""
+import hashlib
+import os
+import socket
+import sys
+from urllib.parse import urlsplit
+
+DEFAULT_PROXY = "unix:///run/onionhost/client/socks/sock"
+READ_TIMEOUT = 180          # per recv(); Tor index fetches are slow
+MAX_REDIRECTS = 5
+USER_AGENT = "apt (onionhost-tor)"
+
+
+def log_status(msg):
+    sys.stdout.write("102 Status\nMessage: %s\n\n" % msg)
+    sys.stdout.flush()
+
+
+class FetchError(Exception):
+    def __init__(self, message, reason="connection-failed"):
+        super().__init__(message)
+        self.reason = reason
+
+
+ALLOW_TCP_PROXY_ENV = "ONIONHOST_TORHTTP_ALLOW_TCP_PROXY"
+
+
+def parse_proxy(value):
+    """Return ('unix', path) or ('tcp', (user, host, port)).
+
+    A TCP result is refused by socks_connect (before any socket is
+    opened) unless ALLOW_TCP_PROXY_ENV is set to "1" in the method's
+    environment — developer/testing use only (Review 2, S4/task 22).
+    """
+    v = (value or DEFAULT_PROXY).strip()
+    for prefix in ("socks5h+unix://", "socks5+unix://", "unix://"):
+        if v.startswith(prefix):
+            return ("unix", v[len(prefix):])
+    if v.startswith("/"):
+        return ("unix", v)
+    if "://" in v:
+        rest = v.split("://", 1)[1]
+        user = ""
+        if "@" in rest:
+            user, rest = rest.rsplit("@", 1)
+        host, _, port = rest.partition(":")
+        return ("tcp", (user, host, int(port or 9050)))
+    return ("unix", DEFAULT_PROXY[len("unix://"):])
+
+
+def socks_connect(proxy, host, port):
+    kind, target = parse_proxy(proxy)
+    if kind == "tcp" and os.environ.get(ALLOW_TCP_PROXY_ENV) != "1":
+        # Production accepts only the unix-socket proxy (S4). Refuse
+        # here — before any socket is created — so a TCP proxy setting
+        # can never make this method dial a host:port.
+        raise FetchError(
+            "refusing non-unix proxy %r: only a unix-socket proxy is "
+            "accepted (set %s=1 for developer/testing use only)"
+            % (proxy, ALLOW_TCP_PROXY_ENV), "proxy-refused")
+    if kind == "unix":
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(READ_TIMEOUT)
+        try:
+            s.connect(target)
+        except OSError as e:
+            raise FetchError("cannot connect to Tor SOCKS socket %s: %s"
+                             % (target, e))
+    else:
+        user, thost, tport = target
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(READ_TIMEOUT)
+        try:
+            s.connect((thost, tport))
+        except OSError as e:
+            raise FetchError("cannot connect to Tor SOCKS %s:%d: %s"
+                             % (thost, tport, e))
+    try:
+        if kind == "tcp" and target[0]:
+            s.sendall(b"\x05\x02\x00\x02")
+            greet = _recv_exact(s, 2)
+            if greet[0] != 5:
+                raise FetchError("SOCKS greeting bad version")
+            if greet[1] == 2:
+                u = target[0].encode()
+                s.sendall(b"\x01" + bytes([len(u)]) + u + b"\x00")
+                auth = _recv_exact(s, 2)
+                if auth[1] != 0:
+                    raise FetchError("SOCKS auth rejected")
+            elif greet[1] != 0:
+                raise FetchError("SOCKS no common auth method")
+        else:
+            s.sendall(b"\x05\x01\x00")
+            greet = _recv_exact(s, 2)
+            if greet != b"\x05\x00":
+                raise FetchError("SOCKS auth rejected")
+        hostb = host.encode("idna")
+        if len(hostb) > 255:
+            raise FetchError("hostname too long for SOCKS5")
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(hostb)]) + hostb +
+                  port.to_bytes(2, "big"))
+        head = _recv_exact(s, 4)
+        if head[0] != 5 or head[1] != 0:
+            raise FetchError("SOCKS connect failed rep=%d" % head[1],
+                             "connection-failed")
+        atyp = head[3]
+        if atyp == 1:
+            _recv_exact(s, 4 + 2)
+        elif atyp == 3:
+            ln = _recv_exact(s, 1)[0]
+            _recv_exact(s, ln + 2)
+        elif atyp == 4:
+            _recv_exact(s, 16 + 2)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def _recv_exact(s, n):
+    data = b""
+    while len(data) < n:
+        chunk = s.recv(n - len(data))
+        if not chunk:
+            raise FetchError("connection closed early")
+        data += chunk
+    return data
+
+
+class BodyReader:
+    """HTTP body reader over the SOCKS socket: Content-Length or
+    chunked transfer coding; streams to file while hashing."""
+
+    def __init__(self, sock, headers):
+        self.sock = sock
+        self.buf = b""
+        self.chunked = ("chunked" in
+                        headers.get("transfer-encoding", "").lower())
+        self.length = None
+        if "content-length" in headers:
+            try:
+                self.length = int(headers["content-length"])
+            except ValueError:
+                pass
+        self.remaining = self.length
+
+    def _fill(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise FetchError("connection closed mid-body")
+        self.buf += chunk
+
+    def read(self, n):
+        while len(self.buf) < n:
+            self._fill()
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def stream(self, out, hashes, max_size):
+        total = 0
+        if self.chunked:
+            while True:
+                line = self._readline()
+                try:
+                    size = int(line.split(b";")[0].strip(), 16)
+                except ValueError:
+                    raise FetchError("bad chunk size", "bad-data")
+                if size == 0:
+                    # trailers until blank line
+                    while self._readline() not in (b"", b"\r\n"):
+                        pass
+                    break
+                left = size
+                while left:
+                    if not self.buf:
+                        self._fill()
+                    take = min(left, len(self.buf))
+                    data, self.buf = self.buf[:take], self.buf[take:]
+                    left -= take
+                    total = self._emit(out, hashes, data, total,
+                                       max_size)
+                self.read(2)  # trailing CRLF
+        elif self.length is not None:
+            left = self.length
+            while left:
+                if not self.buf:
+                    try:
+                        self._fill()
+                    except FetchError:
+                        raise FetchError("truncated body (%d of %d bytes)"
+                                         % (self.length - left,
+                                            self.length), "bad-data")
+                take = min(left, len(self.buf))
+                data, self.buf = self.buf[:take], self.buf[take:]
+                left -= take
+                total = self._emit(out, hashes, data, total, max_size)
+        else:
+            while True:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    raise FetchError("read timed out", "timeout")
+                if not chunk:
+                    break
+                total = self._emit(out, hashes, chunk, total, max_size)
+        return total
+
+    def _emit(self, out, hashes, data, total, max_size):
+        total += len(data)
+        if max_size is not None and total > max_size:
+            raise FetchError("file exceeds Maximum-Size %d" % max_size,
+                             "too-large")
+        out.write(data)
+        for h in hashes.values():
+            h.update(data)
+        return total
+
+    def _readline(self):
+        while b"\n" not in self.buf:
+            self._fill()
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line + b"\n"
+
+
+def http_get(proxy, uri):
+    """One GET (with redirects). Returns (final_uri, status, reader)."""
+    current = uri
+    for _ in range(MAX_REDIRECTS + 1):
+        parts = urlsplit(current)
+        if parts.scheme not in ("tor+http", "http"):
+            raise FetchError("unsupported scheme %s" % parts.scheme,
+                             "bad-uri")
+        host = parts.hostname
+        port = parts.port or 80
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        s = socks_connect(proxy, host, port)
+        req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
+               "Accept-Encoding: identity\r\nConnection: close\r\n\r\n"
+               % (path, host, USER_AGENT))
+        s.sendall(req.encode("utf-8", "surrogateescape"))
+        reader_file = s.makefile("rb")
+        status_line = reader_file.readline(65536).decode(
+            "iso-8859-1").strip()
+        if not status_line.startswith("HTTP/"):
+            s.close()
+            raise FetchError("bad HTTP response: %r" % status_line[:80],
+                             "bad-data")
+        try:
+            status = int(status_line.split()[1])
+        except (IndexError, ValueError):
+            s.close()
+            raise FetchError("bad HTTP status line", "bad-data")
+        headers = {}
+        while True:
+            line = reader_file.readline(65536)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            k, _, v = line.decode("iso-8859-1").partition(":")
+            headers[k.strip().lower()] = v.strip()
+        if status in (301, 302, 303, 307, 308) and "location" in headers:
+            leftover = reader_file.read()
+            s.close()
+            loc = headers["location"]
+            if loc.startswith("/"):
+                loc = "tor+http://%s%s" % (host, loc)
+            current = loc
+            continue
+        body = BodyReader(_SockShim(s, reader_file), headers)
+        return current, status, body, s
+    raise FetchError("too many redirects", "bad-data")
+
+
+class _SockShim:
+    """BodyReader wants .recv(); adapt the buffered file + socket."""
+
+    def __init__(self, sock, fileobj):
+        self.sock = sock
+        self.fileobj = fileobj
+
+    def recv(self, n):
+        return self.fileobj.read(n)
+
+
+def fetch_to_file(proxy, uri, filename, expected, max_size):
+    _final, status, body, s = http_get(proxy, uri)
+    try:
+        if status != 200:
+            raise FetchError("HTTP %d fetching %s" % (status, uri),
+                             "http-%d" % status)
+        hashes = {"SHA256": hashlib.sha256(), "SHA512": hashlib.sha512(),
+                  "MD5SUM": hashlib.md5(), "SHA1": hashlib.sha1()}
+        tmp = filename + ".onionhost-partial"
+        with open(tmp, "wb") as out:
+            total = body.stream(out, hashes, max_size)
+            out.flush()
+            os.fsync(out.fileno())
+        for name, want in expected.items():
+            got = hashes[name].hexdigest()
+            if want and got.lower() != want.lower():
+                os.unlink(tmp)
+                raise FetchError(
+                    "hash mismatch for %s: expected %s (%s), got %s"
+                    % (uri, name, want, got), "hash-mismatch")
+        os.rename(tmp, filename)
+        return total, hashes["SHA256"].hexdigest(), \
+            hashes["SHA512"].hexdigest()
+    finally:
+        s.close()
+
+
+def read_message(stream):
+    fields = {}
+    code = None
+    while True:
+        line = stream.readline()
+        if not line:
+            return None, None
+        line = line.decode("utf-8", "replace").rstrip("\n")
+        if line == "":
+            if code is not None:
+                return code, fields
+            continue
+        if code is None and line[:3].isdigit() and " " in line:
+            code, _ = line.split(" ", 1)
+            continue
+        k, _, v = line.partition(":")
+        key = k.strip()
+        val = v.strip()
+        if key in fields:
+            if isinstance(fields[key], list):
+                fields[key].append(val)
+            else:
+                fields[key] = [fields[key], val]
+        else:
+            fields[key] = val
+
+
+def main():
+    out = sys.stdout
+    out.write("100 Capabilities\nVersion: 1.0\nSend-Config: true\n\n")
+    out.flush()
+    proxy = DEFAULT_PROXY
+    stream = sys.stdin.buffer
+    while True:
+        try:
+            code, fields = read_message(stream)
+        except KeyboardInterrupt:
+            # apt signals its methods when it aborts a run; exit
+            # quietly instead of dying with a traceback.
+            return 0
+        if code is None:
+            return 0
+        if code == "601":
+            items = fields.get("Config-Item", [])
+            if isinstance(items, str):
+                items = [items]
+            for item in items:
+                if "=" not in item:
+                    continue
+                k, v = item.split("=", 1)
+                if k.strip().lower() == "acquire::tor::proxy":
+                    proxy = v.strip()
+            continue
+        if code != "600":
+            continue
+        uri = fields.get("URI", "")
+        filename = fields.get("Filename", "")
+        max_size = fields.get("Maximum-Size")
+        max_size = int(max_size) if max_size else None
+        expected = {}
+        for k, v in fields.items():
+            if k.startswith("Expected-") and isinstance(v, str):
+                algo = k[len("Expected-"):].upper().replace("-", "")
+                if algo in ("SHA256", "SHA512", "SHA1", "MD5SUM"):
+                    expected[algo] = v
+        out.write("200 URI Start\nURI: %s\n\n" % uri)
+        out.flush()
+        try:
+            size, sha256, sha512 = fetch_to_file(
+                proxy, uri, filename, expected, max_size)
+            out.write("201 URI Done\nURI: %s\nFilename: %s\nSize: %d\n"
+                      "SHA256-Hash: %s\nSHA512-Hash: %s\n\n"
+                      % (uri, filename, size, sha256, sha512))
+        except FetchError as e:
+            out.write("400 URI Failure\nURI: %s\nMessage: %s\n"
+                      "FailReason: %s\n\n" % (uri, e, e.reason))
+        except Exception as e:  # noqa: BLE001 - report, never crash-loop
+            out.write("400 URI Failure\nURI: %s\nMessage: %s\n"
+                      "FailReason: internal-error\n\n" % (uri, e))
+        out.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

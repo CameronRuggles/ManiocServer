@@ -1,0 +1,47 @@
+#!/bin/sh
+# OnionHost initramfs hook: implement DESIGN-v3 A18 (--disable-keyring)
+# inside the initramfs.
+#
+# A18 ruling: the root volume must be opened with the volume key NOT
+# loaded via the kernel keyring, so that a running, unlocked system can
+# add a new passphrase without the old one (Maintenance lost-paper
+# re-key). Verified mechanism search (2026-10-11, Debian trixie):
+#   * cryptsetup(8) has --disable-keyring, but
+#   * trixie's cryptroot (initramfs-tools scripts + /usr/lib/cryptsetup/
+#     functions, option list inspected) has NO crypttab option and NO
+#     conf-hook variable that adds it - unlock_mapping() builds a fixed
+#     argument list.
+# So this hook replaces the cryptsetup binary INSIDE THE INITRAMFS
+# IMAGE ONLY with a wrapper that injects --disable-keyring for open
+# operations and execs the real binary (kept as cryptsetup.real) for
+# everything else. The installed system's /usr/sbin/cryptsetup is not
+# touched. Every open path in the initramfs (keyfile, interactive
+# askpass, cryptroot-unlock) goes through the wrapper, so the A18
+# property holds no matter how the volume gets unlocked at boot.
+PREREQ="cryptroot"
+prereq() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereq; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+for bin in "${DESTDIR}/sbin/cryptsetup" "${DESTDIR}/usr/sbin/cryptsetup"; do
+    if [ -e "$bin" ] && [ ! -e "${bin}.real" ]; then
+        mv "$bin" "${bin}.real"
+        cat > "$bin" <<'EOF'
+#!/bin/sh
+# OnionHost wrapper (see zz-onionhost-cryptsetup hook): inject
+# --disable-keyring into cryptsetup open operations (A18).
+for a in "$@"; do
+    case "$a" in
+        open|luksOpen)
+            exec /sbin/cryptsetup.real --disable-keyring "$@"
+            ;;
+    esac
+done
+exec /sbin/cryptsetup.real "$@"
+EOF
+        chmod 0755 "$bin"
+    fi
+done

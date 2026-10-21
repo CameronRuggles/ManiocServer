@@ -1,0 +1,237 @@
+#!/bin/bash
+# OnionHost periodic runtime-gate check (Repo Review 2 task 20).
+#
+# The runtime gate is a POSTcondition check (it inspects containers
+# that are already running), so unlike the nft gate it cannot be a
+# boot-time BindsTo= precondition. This wrapper is what the
+# 5-minute timer runs (and what each container unit's
+# ExecStartPost= runs at start, Repo Review 3 task 17): it
+# re-executes the comparison and enforces the fail-closed rule
+# itself - on mismatch the offending unit is STOPPED (that part of
+# the site goes down, nothing runs unsandboxed) and the event is
+# recorded for the Dashboard's card.
+#
+# FAIL-CLOSED BEHAVIOUR: Repo Review 2 owner question 2 was still
+# open when this landed; stopping follows the review's
+# recommendation and the product's standing fail-closed posture
+# (firewall drift stops container A; a bad update stops the site).
+#
+# LATCH (Repo Review 3 task 15, finding S8): stopping an offender
+# removes its container, so the NEXT check used to see it as
+# absent - "not a violation" - and took the clean branch, deleting
+# the marker and writing state ok while the site stayed down. The
+# fail-closed state now LATCHES: every unit this script stops is
+# recorded in latched.json, and while a latched unit is absent (or
+# present but not judged OK) the marker and the runtime-violation
+# status are rewritten, never cleared. The latch clears only when
+# EVERY latched unit is present again and judged runsc-wrap by a
+# clean check, or on the explicit manual clear below. A container
+# that was never latched stays "absent is not a violation" (B and
+# the app container are condition-selected alternatives).
+#
+# MANUAL CLEAR (Maintenance): an operator who has dealt with the
+# cause by hand can clear the latched state deliberately:
+#     onionhost-runtime-gate-check clear
+# That removes the marker and the latch, writes status ok, and
+# LOGS the clear (logger, tag onionhost-runtime-gate-check, the
+# line begins "CLEAR:"). It does not start any unit; the next
+# check re-judges whatever is actually running from scratch.
+#
+# GATE ERRORS (Repo Review 3 task 16, finding S9): when the judge
+# exits 2 (podman missing/errored, an inspect/exists failure) this
+# script leaves the marker, the latch and the status file
+# completely untouched - an error is neither a pass nor a
+# violation, so no standing state may be cleared or created by it.
+#
+# LATCH ORDERING (Repo Review 4 task 13, finding S14): on a
+# mismatch the marker, latch and status are written FIRST, and
+# only then are offenders stopped, with `systemctl --no-block
+# stop`. When this check runs from an offending unit's own
+# ExecStartPost=, stopping that unit can kill this check process
+# itself; recording the fail-closed state before the stop means
+# the latch survives even if the check never reaches its exit.
+#
+# Dashboard state (same pattern as onionhost-update, Gate 4):
+#   /var/lib/onionhost/runtime/status.json       last check outcome
+#   /var/lib/onionhost/runtime/fail-closed.marker  present while a
+#     violation stands; wizard.py's runtime card keys on the marker
+#     FIRST, so a stopped-for-safety state is never described by a
+#     lesser status. Only a clean check (with the latch satisfied)
+#     or the explicit manual clear removes it.
+#   /var/lib/onionhost/runtime/latched.json      units stopped by
+#     this script whose violation still stands (the latch above);
+#     internal to this script - the Dashboard never reads it.
+#
+# Env overrides (test seams, same pattern as onionhost-update):
+#   ONIONHOST_RUNTIME_GATE  gate binary
+#   ONIONHOST_RUNTIME_STATE state directory
+#   ONIONHOST_SYSTEMCTL     systemctl binary
+set -u
+GATE=${ONIONHOST_RUNTIME_GATE:-/usr/local/bin/onionhost-runtime-gate}
+STATE_DIR=${ONIONHOST_RUNTIME_STATE:-/var/lib/onionhost/runtime}
+SYSTEMCTL=${ONIONHOST_SYSTEMCTL:-systemctl}
+STATUS=$STATE_DIR/status.json
+MARKER=$STATE_DIR/fail-closed.marker
+LATCH=$STATE_DIR/latched.json
+
+write_status() {
+    # $1 = state, $2 = offenders (space list, may be empty)
+    mkdir -p "$STATE_DIR" || return 0
+    local tmp=$STATUS.tmp.$$
+    printf '{"state": "%s", "checked_at": "%s", "offenders": "%s"}\n' \
+        "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$STATUS" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+write_marker() {
+    # $1 = standing offenders (space list)
+    mkdir -p "$STATE_DIR" || return 0
+    local tmp=$MARKER.tmp.$$
+    printf '{"offenders": "%s", "at": "%s"}\n' \
+        "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$MARKER" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+write_latch() {
+    # $1 = latched units (space list)
+    mkdir -p "$STATE_DIR" || return 0
+    local tmp=$LATCH.tmp.$$
+    printf '{"latched": "%s", "updated_at": "%s"}\n' \
+        "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$LATCH" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+json_field() {
+    # $1 = file, $2 = field name; prints the string value or nothing
+    [ -f "$1" ] || return 0
+    sed -n 's/.*"'$2'": "\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+    return 0
+}
+
+union_lists() {
+    # Space lists in $1 and $2; de-duplicated, order preserved.
+    printf '%s %s\n' "$1" "$2" | tr ' ' '\n' \
+        | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+in_list() {
+    # $1 = space list, $2 = item
+    case " $1 " in
+        *" $2 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+latched_units() {
+    # The standing latch: latched.json's record, unioned with the
+    # marker's offenders - the marker is the pre-latch record, so
+    # a box upgraded while a violation stands keeps that violation
+    # latched, and a latch whose marker was removed by hand is
+    # re-asserted from latched.json on the next run.
+    local from_latch from_marker
+    from_latch=$(json_field "$LATCH" latched)
+    from_marker=""
+    [ -f "$MARKER" ] && from_marker=$(json_field "$MARKER" offenders)
+    union_lists "$from_latch" "$from_marker"
+}
+
+if [ $# -gt 0 ]; then
+    case "$1" in
+        clear)
+            WAS=$(latched_units)
+            logger -t onionhost-runtime-gate-check \
+                "CLEAR: explicit manual clear by operator - removing fail-closed marker and latch (latched: ${WAS:-none}); next check re-judges from scratch"
+            echo "onionhost-runtime-gate-check: cleared fail-closed marker and latch (latched: ${WAS:-none})"
+            mkdir -p "$STATE_DIR" || true
+            rm -f "$MARKER" "$LATCH"
+            write_status "ok" ""
+            exit 0
+            ;;
+        -h|--help|help)
+            echo "usage: onionhost-runtime-gate-check [clear]"
+            echo "  (no argument)  run the runtime gate and enforce it"
+            echo "  clear          manually clear the latched fail-closed"
+            echo "                 state (marker + latch); the clear is logged"
+            exit 0
+            ;;
+        *)
+            echo "onionhost-runtime-gate-check: unknown argument: $1" >&2
+            echo "usage: onionhost-runtime-gate-check [clear]" >&2
+            exit 2
+            ;;
+    esac
+fi
+
+OUT=$("$GATE" 2>&1)
+RC=$?
+case $RC in
+    0)
+        OK_UNITS=$(printf '%s\n' "$OUT" | sed -n 's/^OK \([^ ]*\) .*/\1/p' | tr '\n' ' ' | sed 's/ $//')
+        LATCHED=$(latched_units)
+        if [ -n "$LATCHED" ]; then
+            MISSING=""
+            for name in $LATCHED; do
+                in_list "$OK_UNITS" "$name" || MISSING=$(union_lists "$MISSING" "$name")
+            done
+            if [ -z "$MISSING" ]; then
+                logger -t onionhost-runtime-gate-check \
+                    "LATCH CLEARED: latched unit(s) $LATCHED present and running runsc-wrap again"
+                rm -f "$MARKER" "$LATCH"
+                write_status "ok" ""
+                exit 0
+            fi
+            logger -t onionhost-runtime-gate-check -p daemon.err \
+                "LATCHED: unit(s) $MISSING were stopped for a runtime violation and are not running runsc-wrap; fail-closed state stands"
+            echo "onionhost-runtime-gate-check: latched violation stands for: $MISSING" >&2
+            write_marker "$LATCHED"
+            write_latch "$LATCHED"
+            write_status "runtime-violation" "$LATCHED"
+            exit 1
+        fi
+        if [ -f "$MARKER" ]; then
+            # A marker with no recoverable offender names: the
+            # units it stood for cannot be proven back, so it
+            # stands until the explicit manual clear.
+            logger -t onionhost-runtime-gate-check -p daemon.err \
+                "LATCHED: fail-closed marker stands but names no units; only an explicit clear removes it"
+            echo "onionhost-runtime-gate-check: fail-closed marker stands (no named units); run with 'clear' to clear it deliberately" >&2
+            write_status "runtime-violation" ""
+            exit 1
+        fi
+        logger -t onionhost-runtime-gate-check \
+            "OK: all present containers run runsc-wrap"
+        rm -f "$MARKER" "$LATCH"
+        write_status "ok" ""
+        ;;
+    1)
+        OFFENDERS=$(printf '%s\n' "$OUT" | sed -n 's/^BAD \([^ ]*\) .*/\1/p' | tr '\n' ' ' | sed 's/ $//')
+        LATCHED=$(union_lists "$(latched_units)" "$OFFENDERS")
+        logger -t onionhost-runtime-gate-check -p daemon.err \
+            "MISMATCH: $OUT - stopping offending unit(s) (fail closed)"
+        echo "onionhost-runtime-gate-check: MISMATCH - stopping offending unit(s)" >&2
+        # S14: record the fail-closed state BEFORE stopping
+        # anything - the stop may kill this check itself when it
+        # runs from the offender's ExecStartPost= (see header).
+        write_marker "$LATCHED"
+        write_latch "$LATCHED"
+        write_status "runtime-violation" "$LATCHED"
+        for name in $OFFENDERS; do
+            "$SYSTEMCTL" --no-block stop "$name.service" || true
+        done
+        exit 1
+        ;;
+    *)
+        # Gate error: marker, latch and status stay exactly as
+        # they were (see GATE ERRORS in the header).
+        logger -t onionhost-runtime-gate-check -p daemon.err \
+            "ERROR: gate could not run (rc=$RC): $OUT"
+        echo "onionhost-runtime-gate-check: gate error rc=$RC" >&2
+        exit $RC
+        ;;
+esac
+exit 0

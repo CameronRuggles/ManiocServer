@@ -1,0 +1,43 @@
+:root {
+  --ink: #1c2420;
+  --paper: #f7f4ec;
+  --accent: #2d4a35;
+  --accent-soft: #e4e9df;
+  --warn: #6b4e12;
+  --card: #fffdf7;
+  --line: #d8d2c2;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--paper); color: var(--ink);
+  font: 17px/1.6 "Nunito Sans", "Segoe UI", system-ui, sans-serif;
+}
+header, main, footer { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
+header { padding-top: 3rem; }
+.kicker { text-transform: uppercase; letter-spacing: .12em; font-size: .78rem; color: var(--accent); font-weight: 700; margin: 0 0 .5rem; }
+h1 { font-size: 2.6rem; margin: 0 0 .75rem; line-height: 1.1; }
+.lede { font-size: 1.18rem; margin: 0 0 1.25rem; }
+.claim {
+  background: var(--accent-soft); border-left: 4px solid var(--accent);
+  padding: 1rem 1.25rem; border-radius: 0 .5rem .5rem 0; margin: 0 0 1rem;
+}
+h2 { font-size: 1.45rem; margin: 2.4rem 0 .6rem; color: var(--accent); }
+h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+p { margin: .6rem 0; }
+ul { margin: .6rem 0 .6rem 1.2rem; padding: 0; }
+li { margin: .35rem 0; }
+code { background: #eee8d8; padding: 0 .3em; border-radius: .25em; font-size: .92em; }
+.cards { display: grid; gap: 1rem; margin: 1rem 0; }
+@media (min-width: 40rem) { .cards { grid-template-columns: 1fr 1fr 1fr; } }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: .6rem;
+  padding: 1rem 1.1rem;
+}
+.card p { font-size: .95rem; margin: 0; }
+.cta {
+  background: var(--card); border: 1px solid var(--line); border-radius: .6rem;
+  padding: 1rem 1.25rem;
+}
+a { color: var(--accent); font-weight: 600; }
+footer { padding-bottom: 3rem; }
+footer p { font-size: .85rem; color: #5a6157; border-top: 1px solid var(--line); padding-top: 1rem; }

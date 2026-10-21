@@ -1,0 +1,43 @@
+# OnionHost container U - client-only Tor (DESIGN-v3 A4).
+# No onion service, no keys, no identity. SOCKS is exposed only as a
+# unix socket under /run/onionhost/client for two host consumers: the
+# repo-fetch helper and the Dashboard status probe. Same image as A,
+# different torrc; egress mechanics identical to A (dedicated
+# onionhost bridge network - gVisor cannot use the host netns from
+# inside the --userns=auto user namespace).
+# If U dies, package updates pause and the status card goes stale -
+# A and the site are unaffected.
+[Unit]
+Description=OnionHost U - client Tor
+Wants=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service
+After=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service
+
+[Container]
+Image=localhost/onionhost-tor:latest
+ContainerName=onionhost-u
+PodmanArgs=--runtime=runsc-wrap
+Network=onionhost
+# Fixed userns map, as in onionhost-a.container (container root is
+# always host uid 2200000; state dirs are owned accordingly).
+UIDMap=0:2200000:65536
+GIDMap=0:2200000:65536
+ReadOnly=true
+Volume=/var/lib/onionhost/client:/var/lib/onionhost/client
+Volume=/run/onionhost/client:/run/onionhost/client
+Volume=/etc/onionhost/client-torrc:/etc/tor/client-torrc:ro
+Exec=tor -f /etc/tor/client-torrc
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Repo Review 3 task 17 (finding S11): judge this container's
+# runtime the moment it starts, not at the timer's next run (up to
+# 5 minutes later). The check inspects every OnionHost container
+# and stops any unit not running runsc-wrap. The leading '-' keeps
+# a violation found in ANOTHER unit (or a gate error) from marking
+# THIS unit failed and restarting it; enforcement is the check's
+# own stop + latch, and the 5-minute timer keeps re-checking.
+ExecStartPost=-/usr/local/bin/onionhost-runtime-gate-check
+
+[Install]
+WantedBy=multi-user.target

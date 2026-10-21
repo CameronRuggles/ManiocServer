@@ -1,0 +1,33 @@
+#!/bin/sh
+# OnionHost (DESIGN-v3 A19.1): embed the per-install LUKS keyfile
+# into the initramfs at its exact crypttab path
+# (/etc/cryptsetup-keys.d/root.key, mode 0400, dir 0700).
+#
+# Why this hook exists: Debian's encrypt_hook copies only the legacy
+# hardcoded /crypto_keyfile.bin, and the cryptroot hook does not copy
+# key files for crypttab entries that use a keyscript= option (ours
+# uses keyscript=/bin/cat, written by Calamares' fstab job). Without
+# this hook the relocated A19.1 keyfile would be ABSENT from the
+# initramfs and the boot would fall back to a second passphrase
+# prompt (or fail), breaking the type-the-phrase-once design.
+# Verified by inspecting the built initramfs after install.
+PREREQ=""
+prereqs()
+{
+    echo "$PREREQ"
+}
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+KEYFILE=/etc/cryptsetup-keys.d/root.key
+if [ -f "$KEYFILE" ]; then
+    mkdir -pm0700 "${DESTDIR}/etc/cryptsetup-keys.d"
+    cp -a "$KEYFILE" "${DESTDIR}/etc/cryptsetup-keys.d/root.key"
+    chmod 0400 "${DESTDIR}/etc/cryptsetup-keys.d/root.key"
+fi

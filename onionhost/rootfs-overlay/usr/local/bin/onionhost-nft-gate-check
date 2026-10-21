@@ -1,0 +1,35 @@
+#!/bin/bash
+# OnionHost periodic firewall-gate check (DESIGN-v2 section 6 + v3 A8).
+#
+# The boot-time gate (onionhost-nft-gate.service) is a oneshot with
+# RemainAfterExit=yes - that is what lets container A BindsTo= it, but
+# it also means a systemd timer pointing at that unit can never
+# re-execute it (starting an already-active unit is a no-op; found in
+# step-3 slice 3). This wrapper is what the 5-minute timer actually
+# runs: it re-executes the comparison and enforces the design's
+# fail-closed rule itself - on mismatch the gateway is STOPPED (the
+# site goes down, nothing is exposed) and the event is logged loudly
+# for the Dashboard's red card ("Safety settings changed").
+set -u
+GATE=/usr/local/bin/onionhost-nft-gate
+OUT=$("$GATE" 2>&1)
+RC=$?
+case $RC in
+    0)
+        logger -t onionhost-nft-gate-check "OK: live table matches golden"
+        ;;
+    1)
+        logger -t onionhost-nft-gate-check -p daemon.err \
+            "MISMATCH: $OUT - stopping onionhost-a (fail closed)"
+        echo "onionhost-nft-gate-check: MISMATCH - stopping onionhost-a" >&2
+        systemctl stop onionhost-a.service || true
+        exit 1
+        ;;
+    *)
+        logger -t onionhost-nft-gate-check -p daemon.err \
+            "ERROR: gate could not run (rc=$RC): $OUT"
+        echo "onionhost-nft-gate-check: gate error rc=$RC" >&2
+        exit $RC
+        ;;
+esac
+exit 0

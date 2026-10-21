@@ -1,0 +1,22 @@
+# OnionHost dedicated container network (DESIGN-v3 A4/A5, revised in
+# step-3 slice 1): containers A and U attach here instead of the host
+# network. A bridge netns is owned by each container's user namespace,
+# which is the only arrangement gVisor can actually run: runsc cannot
+# join the HOST netns from inside the mandatory --userns=auto user
+# namespace ("cannot run with network enabled in root network
+# namespace", measured on the installed system 2026-10-12). A needs
+# outbound only (onion services make outbound circuits); nothing is
+# published inbound. B is not on this network at all (Network=none).
+[Network]
+NetworkName=onionhost
+Subnet=10.89.77.0/24
+Gateway=10.89.77.1
+
+# The generated onionhost-network.service must be enabled explicitly:
+# with podman 5.2's Quadlet generator, containers referencing the
+# network do NOT pull the network service in by themselves (measured
+# on the installed system: service stayed "inactive (dead)" and every
+# start failed with "network not found"). A/U also declare explicit
+# Wants/After on it for ordering.
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+# OnionHost golden client torrc for container U (client-only Tor).
+# Rendered to /etc/onionhost/client-torrc by onionhost-generate-configs.
+# U holds no keys and no identity (DESIGN-v3 A4): no HiddenService lines,
+# SOCKS exposed only as a unix socket to host consumers (repo-fetch
+# helper and the Dashboard status probe). U's guards are its own -
+# never share A's DataDirectory.
+DataDirectory /var/lib/onionhost/client/data
+SocksPort unix:/run/onionhost/client/socks/sock
+Log notice stderr

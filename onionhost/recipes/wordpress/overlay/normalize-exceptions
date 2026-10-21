@@ -1,0 +1,11 @@
+# WordPress recipe: permission-normaliser exceptions (slice 6B
+# flag 1). Read by the app container's init after its uniform
+# pass; format:
+#   <octal mode> <path relative to the app-data volume>
+# wp-config.php holds the database password (and the session
+# salts). The uniform pass would leave it group-shared at 0664;
+# the recipe keeps it at 0660 - still writable by the application
+# (WordPress runs as the file's owner) and manageable by the
+# owner through the owner group, but never readable by other
+# accounts on the host.
+0660 www/wp-config.php

@@ -1,0 +1,90 @@
+Manioc Server Security Audit — Phase 0 tool inventory
+Installed/verified 2026-10-18 on the audit host (Ubuntu 24.04.5 LTS, x86_64).
+All installs from official sources only. Nothing was uploaded anywhere;
+Semgrep ran with --metrics=off; TruffleHog ran with --no-verification
+(verification would send candidate secrets to third-party APIs).
+
+=====================================================================
+TOOLS IN ~/audit-tools/bin — official GitHub release binaries,
+SHA-256 verified against the checksums published with each release
+=====================================================================
+gitleaks     8.30.1    github.com/gitleaks/gitleaks releases
+trufflehog   3.99.2    github.com/trufflesecurity/trufflehog releases
+                       (the release also ships sigstore.sig/.pem —
+                       cosign signature NOT verified: cosign is not
+                       installed. Checksum verification only.)
+syft         1.54.1    github.com/anchore/syft releases
+grype        0.120.1   github.com/anchore/grype releases
+                       (vulnerability DB downloaded 2026-10-18 into
+                       ~/audit-tools/grype-db, ~1.3 GB)
+osv-scanner  2.7.0     github.com/google/osv-scanner releases
+For all five: the downloaded tarball/binary SHA-256 was verified
+against the checksums file published with that release (kept in
+~/audit-tools/dl/ as *_sums.txt / osv_SHA256SUMS) before install.
+Downloads kept in ~/audit-tools/dl/.
+
+=====================================================================
+TOOLS VIA APT (Ubuntu noble repositories; install logs in raw/)
+=====================================================================
+shellcheck   0.9.0          (shellcheck --version)
+lintian      2.117.0ubuntu1.5
+squashfs-tools (unsquashfs) 4.6.1
+xorriso      1.5.6          (see note below)
+p7zip-full   (7z)           installed; not needed in Phases 1–2
+pipx                        (used to install semgrep/bandit)
+php-cli      PHP 8.3.6      + php-xml, php-mbstring (for Psalm)
+
+=====================================================================
+TOOLS VIA PIPX (PyPI; binaries in ~/.local/bin; logs in raw/)
+=====================================================================
+semgrep      1.181.0   (pipx install semgrep)
+bandit       1.9.4     (pipx install bandit)
+
+=====================================================================
+PHP ANALYZERS — official PHARs in ~/audit-tools/php/
+=====================================================================
+phpstan.phar  PHPStan 2.2.5  github.com/phpstan/phpstan releases
+             Ran: analyse --level=6 on the 3 first-party PHP files.
+psalm.phar    Psalm 6.20.0   github.com/vimeo/psalm releases
+             COULD NOT RUN on this host: Psalm 6.20 requires PHP
+             ~8.3.16+; host PHP is 8.3.6 (Ubuntu build).
+psalm5.phar   Psalm 5.26.1   github.com/vimeo/psalm releases
+             Ran instead: --taint-analysis, "No errors found!"
+             (needed php-xml + php-mbstring, installed via apt).
+
+=====================================================================
+ENVIRONMENT INCIDENT (affects the apt-installed tools above)
+=====================================================================
+The audit VM was REPLACED mid-session (observed 2026-10-18 ~18:34
+UTC: uptime reset, all apt-installed packages gone; everything under
+~ persisted, including ~/audit-tools and this workspace). The host
+runtime's package-intent replay then reinstalled the recorded apt
+packages automatically; while it ran (~25 min), the dpkg frontend
+lock was held and fresh installs failed. During that window,
+unsquashfs/xorriso were ALSO obtained by `apt-get download` +
+`dpkg -x` into ~/audit-tools/root/ (Ubuntu noble .debs, run with
+LD_LIBRARY_PATH) — the Phase 2 extraction used those copies;
+versions identical to the apt set. Lintian 2.117 via download was
+impractical (74 dependencies) and was run after the replay restored
+the apt install.
+
+=====================================================================
+DEFERRED — not installed, by task scope (later phases only)
+=====================================================================
+qemu-system-x86 + libguestfs-tools   Phase 3 (VM install testing)
+ssh-audit, kernel-hardening-checker  Phase 4
+nmap (host)                          Phase 4/7
+wpscan, nikto, nuclei, interactsh-client,
+  sqlmap, exiftool                   Phase 6/7
+Docker + OWASP ZAP                   skipped per task instruction
+host tor                             not needed for Phases 0–2
+
+=====================================================================
+COULD NOT BE INSTALLED / RUN
+=====================================================================
+- Psalm 6.20.0 phar: blocked by its PHP patch-version floor
+  (needs ~8.3.16; host has 8.3.6). Worked around with Psalm 5.26.1
+  (above) — taint analysis DID run. Not a coverage loss.
+- TruffleHog cosign signature verification: not performed (cosign
+  not installed). Release checksums were verified instead.
+Nothing else failed to install.

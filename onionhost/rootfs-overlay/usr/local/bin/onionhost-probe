@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""OnionHost self-probe (DESIGN-v3 A4: the Dashboard status card and
+the repo-fetch helper consume U, the client-only Tor).
+
+Reads this host's own onion address from A's hidden-service dir and
+fetches the site's front page THROUGH U's SOCKS unix socket - i.e.
+exactly the path a visitor takes (onion -> A -> http.sock -> B),
+minus the wide network. Prints PROBE_OK + the HTTP status line and
+the first bytes of the body, or PROBE_FAIL with the reason. Retries
+for up to ~3 minutes: descriptor publication lags A's bootstrap.
+"""
+import socket, sys, time
+
+HOSTNAME_FILE = "/var/lib/onionhost/tor/hs/hostname"
+SOCKS = "/run/onionhost/client/socks/sock"
+
+
+def fetch(onion, attempts=10):
+    last = None
+    for i in range(attempts):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(20)
+            s.connect(SOCKS)
+            # SOCKS5, no auth
+            s.sendall(b"\x05\x01\x00")
+            if s.recv(2) != b"\x05\x00":
+                raise OSError("socks auth rejected")
+            host = onion.encode()
+            s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host +
+                      (80).to_bytes(2, "big"))
+            rep = s.recv(10)
+            if len(rep) < 2 or rep[1] != 0:
+                raise OSError("socks connect failed rep=%s" %
+                               (rep[1] if len(rep) > 1 else "?"))
+            s.sendall(b"GET / HTTP/1.0\r\nHost: " + host + b"\r\n\r\n")
+            data = b""
+            while len(data) < 4096:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            text = data.decode("utf-8", "replace")
+            first = text.splitlines()[0] if text else "(empty)"
+            print("PROBE_OK %s" % first)
+            print("PROBE_BODY %s" % text[:300].replace("\n", " "))
+            return 0
+        except Exception as e:  # noqa: BLE001 - report and retry
+            last = e
+            if i + 1 < attempts:
+                time.sleep(20)
+    print("PROBE_FAIL %s" % last)
+    return 1
+
+
+def main():
+    try:
+        onion = open(HOSTNAME_FILE).read().strip()
+    except OSError as e:
+        print("PROBE_FAIL no hostname file: %s" % e)
+        return 1
+    if not onion.endswith(".onion"):
+        print("PROBE_FAIL bad hostname: %r" % onion)
+        return 1
+    print("PROBE_ONION %s" % onion)
+    return fetch(onion)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

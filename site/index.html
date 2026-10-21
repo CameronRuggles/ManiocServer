@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manioc Server — host a website from home, without giving away your address</title>
+<meta name="description" content="A free, open-source operating system that turns a spare home computer into a Tor onion website. Recruiting testers, reviewers, and builders.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <p class="kicker">A free, open-source project — currently in alpha</p>
+  <h1>Manioc Server</h1>
+  <p class="lede">Turn a spare computer at home into your own website, reachable from anywhere as a Tor <code>.onion</code> address — no hosting account, no domain name, no port forwarding, no monthly bill.</p>
+  <p class="claim"><strong>The one claim we make:</strong> it hides your computer's network address — from your site's visitors, and from the website software itself. If your site is hacked, the attacker gets the site. They do not get your home's IP address, your local network, or the key that makes the site yours.</p>
+</header>
+
+<main>
+<section>
+  <h2>How it works, in one breath</h2>
+  <p>You boot a USB installer, click through a short walkthrough, copy one computer-generated phrase onto paper, pick a site type — simple pages or a journal — write something, and press <strong>Go Live</strong>. Onion services connect <em>outward</em> to the Tor network, so your site works from behind any home router, with no public IP address at all.</p>
+  <p>Under the hood, three sandboxed containers each do exactly one job:</p>
+  <ul>
+    <li><strong>Your website</strong> runs in a container with <em>no network at all</em>. It cannot phone home, scan your network, or leak an address it has never seen — and it never holds the site's onion key.</li>
+    <li><strong>The Tor gateway</strong> is the only part allowed online, and it speaks only Tor. It passes requests to your site over a unix socket — a channel that carries no IP address to leak. Tor's modern defences (proof-of-work, rate limits) are on by default.</li>
+    <li><strong>A client-only helper</strong> checks “is my site reachable from the outside?” and fetches signed updates, so maintenance never reveals the server's own Tor identity and never touches the open internet.</li>
+  </ul>
+  <p>Around them: a whole-disk encryption scheme with the phrase typed at every boot (unplug the machine and it is a sealed brick), a firewall that continuously compares itself against a golden copy and fails <em>closed</em> if they differ, updates scheduled at randomised times so they don't betray your timezone, and photos added through the built-in page and journal editors have their location metadata stripped before they are published. (That scrub belongs to those editors, not to the whole platform: a photo uploaded through an installed app — a forum, WordPress — is published the way the app handles it, GPS coordinates included, unless the app strips them itself.)</p>
+  <p>There is <strong>no website login and no web admin panel</strong> — the most-attacked door on the internet simply doesn't exist. You edit your site in a plain local app on the machine itself, unlocked by short generated login words.</p>
+</section>
+
+<section>
+  <h2>What we don't claim</h2>
+  <ul>
+    <li><strong>Nobody can promise you can never be located.</strong> Tor hides where a server is on the network, not <em>when</em> it is online. A patient observer comparing your site's uptime with public power/internet outage reports may narrow things down over time. If being physically located would put you in danger, do not rely on hosting from your home.</li>
+    <li><strong>Not protection against an adversary who can watch large parts of the Tor network itself.</strong> No home-hosting product solves that.</li>
+    <li><strong>Not magic for a running, seized, or already-compromised machine.</strong> The ironclad state is powered off.</li>
+  </ul>
+  <p>We would rather publish the limits on the front page than let you discover them later.</p>
+</section>
+
+<section>
+  <h2>Where the project is</h2>
+  <p>The design has been through two rounds of independent external security review — including reviews that corrected us, which we adopted. The installer, the encrypted boot, the container stack, the dashboard, and the page/journal editors are built and passing end-to-end install tests on our test rig, including the built-in editors' privacy check (a photo carrying GPS coordinates comes out the other side scrubbed, byte-for-byte verifiable).</p>
+  <p>Version 1 hosts static sites (pages and journals) and dynamic software inside the same sealed container. Packaged recipes install a forum (SMF), WordPress, a wiki (DokuWiki), or git hosting (Gitea), and owners can install their own software in that container too — with the same guarantee: the software can be compromised without giving up the address.</p>
+  <p>Backup and restore is built and tested: a backup file is encrypted to keys derived from the paper phrase, so a dead machine can be replaced and the site — same address, same content — restored onto a fresh install from the paper alone.</p>
+  <p>An alpha test build is available for testers below. Still ahead before a finished public release: testing on real home hardware, testing with non-technical users, an external security review of the <em>built</em> system, and reproducible releases that independent builders can verify bit-for-bit.</p>
+</section>
+
+<section id="download">
+  <h2>Try the alpha test build</h2>
+  <p>This is the current alpha, offered for testers. Expect rough edges; testers wanted — if you install it, we want to hear where you got stuck. It is not a finished public release, and it comes with no support promise beyond the forum thread below.</p>
+  <p><strong><a href="maniocserver-amd64.iso">Download maniocserver-amd64.iso</a></strong> — about 1.15 GB (1,146,880,000 bytes).</p>
+  <p>SHA-256: <code>080e45ac048e9999d2de57f199d5411c53a442f4a7a7daaa49a92c0e4cb2b1c1</code></p>
+  <p>Check the file before you use it: run <code>sha256sum maniocserver-amd64.iso</code> (Linux) or <code>shasum -a 256 maniocserver-amd64.iso</code> (Mac) and confirm the output matches the hash above exactly.</p>
+  <p>You will need:</p>
+  <ul>
+    <li>A spare 64-bit PC you can erase completely, with UEFI firmware (most PCs from the last decade)</li>
+    <li>8 GB of RAM (4 GB works)</li>
+    <li>A wired ethernet connection — recommended, at least for setup</li>
+    <li>A USB stick of 4 GB or more for the installer</li>
+  </ul>
+  <p>Write the ISO to the USB stick (with a tool like Balena Etcher, Rufus, or <code>dd</code>), boot the spare PC from it, and follow the walkthrough. Tell us how it went on Twitter — <a href="https://twitter.com/CameronRuggles">@CameronRuggles</a> — or in <a href="https://vespiary.org/talk/">the Vespiary forum</a>.</p>
+</section>
+
+<section id="help">
+  <h2>Help us build it — people we need</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>🧪 Testers with a spare computer</h3>
+      <p>Our most important test is a non-technical person installing this on a real machine in a real house. If you have a spare desktop or laptop you can erase, a USB stick, and an honest streak — “I got stuck here” is exactly the report we need. You do <em>not</em> need to be technical. If you can follow a recipe, you're qualified.</p>
+    </div>
+    <div class="card">
+      <h3>🔍 Security reviewers</h3>
+      <p>The design documents, the external reviews, and the build logs will all be public. Read them adversarially. Try to break the built system. Coordinated disclosure, credit given, ego not involved — two outside reviews have already changed this design for the better.</p>
+    </div>
+    <div class="card">
+      <h3>🛠️ Builders &amp; rebuilders</h3>
+      <p>Debian packaging, Python, Calamares, Podman, Tor — or the patience to rebuild our ISO from source and check that you get bit-identical output. A release only counts as verified when independent rebuilders match it.</p>
+    </div>
+  </div>
+  <p class="cta">Interested? Reach out on Twitter — <a href="https://twitter.com/CameronRuggles">@CameronRuggles</a> — or introduce yourself in the project's home forum, <a href="https://vespiary.org/talk/">the Vespiary</a>, and tell us which of the three you are (tester / reviewer / builder) — and for testers, roughly what spare machine you have. Adults only, please — the project is positioned 18+.</p>
+</section>
+
+<section>
+  <h2>Principles, briefly</h2>
+  <ul>
+    <li><strong>Open source.</strong> The code, the design record, the reviews, and the failures are published. There is no directory of users' sites, no telemetry, no operator relationship with your content.</li>
+    <li><strong>Four things to learn, total:</strong> a paper phrase, login words, a status dashboard, a repair button. Everything else is the machine's problem.</li>
+    <li><strong>Narrow claims, kept.</strong> One promise — your network address stays hidden — engineered, tested, and stated with its limits attached.</li>
+  </ul>
+</section>
+</main>
+
+<footer>
+  <p>Manioc Server — developed under the working title OnionHost OS. This page offers an alpha test build for testers — it is not a finished public release.</p>
+</footer>
+</body>
+</html>

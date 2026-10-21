@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""OnionHost update engine (Gate 4 / DESIGN-v3 A6).
+
+Runs from onionhost-update.timer (OnCalendar 00:00 UTC +
+RandomizedDelaySec=24h, so the fleet never moves in lockstep and a
+mirror cannot count installs by the hour). Everything is fetched by
+apt through container U's client-only Tor (golden config:
+52onionhost-tor-updates + the shipped tor+http method). Nothing is
+ever fetched on the clearnet, and nothing via gateway A.
+
+Trust / anti-rollback rules (A6, DQ4, Y8):
+  * apt verifies the repo signature (project key) and Debian's; this
+    tool never passes --allow-downgrades or any insecure flag.
+  * A per-package HIGH-WATER MARK is persisted on the host
+    (/var/lib/onionhost/update/highwater.json). A candidate below the
+    mark - e.g. a mirror replaying an old, validly signed index - is
+    REFUSED and reported, never installed.
+  * Each signed onionhost package carries a security FLOOR
+    (/usr/share/onionhost/floor.json inside the .deb). The highest
+    floor ever seen is persisted and never decreases.
+  * After an install, the stack is restarted and health-checked
+    (onionhost-probe: the site must answer through the real onion
+    path). If the check fails, the previous version is restored -
+    but ONLY if it is at/above the floor. If it is below the floor,
+    the machine FAILS CLOSED (Y8): the gateway is stopped, the site
+    goes off, and the state is recorded for the Dashboard and
+    Maintenance. Serving on a below-floor stack to stay up is the
+    one outcome this tool exists to prevent.
+  * The health check's time budget is sized against MEASURED
+    republication latency, not optimism (rig battery part 4,
+    2026-10-14): across 10 stack restarts on real hardware the
+    median time back to a 200 was 91 s, but one restart took
+    324 s - beyond the probe's own ~3-4 minute envelope, so a
+    healthy update landing in that tail would have been rolled
+    back, and could have failed closed, for the sole reason
+    that Tor was slow to republish. health_ok() therefore runs
+    the probe up to HEALTH_ATTEMPTS times with a pause between
+    attempts (nominal budget ~6-9 minutes) before judging a
+    stack unhealthy. Only the budget changed: an update that
+    still does not answer after it rolls back / fails closed
+    exactly as before.
+  * The judgement is additionally preceded by a SETTLE drawn
+    per judgement from HEALTH_SETTLE_MIN..MAX (default 30 min
+    to 6 h) between the stack restart and the first probe run
+    (Repo Review 5 D-1): the probe's rendezvous to this box's
+    own onion is decoupled from the package fetch that began
+    the run, instead of following it within minutes. The probe
+    itself is executed argv-form, never through a shell
+    (Repo Review 5 F-P1-1).
+  * A later good update (at/above the floor) recovers the machine
+    from fail-closed automatically on the next run.
+  * The fail-closed state is persisted in a dedicated marker file
+    (fail-closed.marker, next to highwater.json/floors.json) and
+    the recovery duty keys on it - NOT on status.json, which is
+    the Dashboard's record of the last run's outcome. Only a
+    healthy outcome clears the marker; a run that merely failed
+    to fetch never overwrites a fail-closed record (Gate 4
+    follow-up, found by the A23 SMF recipe slice).
+
+Debian base packages ride the same run (same apt invocation config,
+same timing): apt-get upgrade after the managed packages, best
+effort - a Debian failure is logged but never blocks or rolls back
+the project package, and apt's own no-downgrade rules apply.
+
+State written for the Dashboard (status text only, no user action):
+/var/lib/onionhost/update/status.json - see wizard.py's mapping.
+
+Exit codes: 0 ok / nothing to do / recovered; 2 refused downgrade
+seen (state safe); 3 fetch failed (updates paused, site untouched);
+4 update failed but rolled back to a healthy legal version;
+5 FAIL-CLOSED.
+"""
+import json
+import os
+import random
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+STATE_DIR = os.environ.get("ONIONHOST_UPDATE_STATE",
+                           "/var/lib/onionhost/update")
+ARCHIVES = os.environ.get("ONIONHOST_APT_ARCHIVES",
+                          "/var/cache/apt/archives")
+# The managed set: the platform package plus any INSTALLED recipe
+# package (onionhost-recipe-*, A23). Recipes are independent
+# packages in the same signed repo with their own floors, so a
+# bundled app's security fix ships on its own cadence; the set is
+# discovered from dpkg rather than hardcoded, and a machine with
+# no recipe installed behaves exactly as the platform-only design.
+def _managed_packages():
+    out = ["onionhost"]
+    try:
+        listing = subprocess.run(
+            ["dpkg-query", "-W", "-f", "${Package}\n",
+             "onionhost-recipe-*"],
+            capture_output=True, text=True)
+        for name in sorted(listing.stdout.split()):
+            if name not in out:
+                out.append(name)
+    except OSError:
+        pass
+    return out
+
+
+MANAGED = _managed_packages()
+HEALTH_CMD = os.environ.get("ONIONHOST_HEALTH_CMD",
+                            "/usr/local/bin/onionhost-probe")
+STACKCTL = os.environ.get("ONIONHOST_STACKCTL", "")
+# Per-invocation cap for one probe run: the probe's own retry
+# envelope (10 attempts, 20 s socket timeouts, 20 s sleeps)
+# needs at most ~380 s; 600 leaves generous headroom.
+HEALTH_TIMEOUT = 600
+# Health-check budget (see the header): how many probe runs a
+# single health_ok() judgement may take, and the pause between
+# them. Two runs + the pause put the judgement at ~6-9 minutes
+# nominal - past the 324 s republication tail the rig battery
+# measured - without weakening the fail-closed rule that ends
+# the budget. Both are env-tunable for the state-machine tests.
+HEALTH_ATTEMPTS = int(os.environ.get("ONIONHOST_HEALTH_ATTEMPTS",
+                                     "2"))
+HEALTH_RETRY_DELAY = int(os.environ.get(
+    "ONIONHOST_HEALTH_RETRY_DELAY", "45"))
+# Post-restart settle (Repo Review 5 D-1): the wait between a
+# stack restart and the health judgement, drawn fresh per
+# judgement from [SETTLE_MIN, SETTLE_MAX]. It decouples the
+# self-probe from the update run that fetched the packages:
+# without it, every update is followed within minutes by a
+# client rendezvous to this box's own onion, and an observer
+# who could see both the mirror fetch and the onion's
+# introduction activity could correlate them. The verdict the
+# probe drives is unchanged - a failed probe still rolls back
+# or fails closed exactly as before; it is simply reached at a
+# scattered time. The restarted stack serves (or, for a broken
+# update, fails to serve) during the settle, just as it already
+# did during the republication budget. Env-tunable for the
+# state-machine tests.
+HEALTH_SETTLE_MIN = int(os.environ.get(
+    "ONIONHOST_HEALTH_SETTLE_MIN", "1800"))
+HEALTH_SETTLE_MAX = int(os.environ.get(
+    "ONIONHOST_HEALTH_SETTLE_MAX", "21600"))
+
+LOG_PATH = os.path.join(STATE_DIR, "update.log")
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg):
+    line = "%s onionhost-update: %s" % (now(), msg)
+    print(line, flush=True)
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# Golden files are never hand-edited on a healthy machine; force
+# dpkg's deterministic conffile handling so an unattended upgrade
+# can never stall on an interactive conffile prompt.
+DPKG_OPTS = ["-o", "Dpkg::Options::=--force-confdef",
+             "-o", "Dpkg::Options::=--force-confold"]
+
+PROJECT_SOURCES = os.environ.get(
+    "ONIONHOST_PROJECT_SOURCES",
+    "/etc/apt/sources.list.d/onionhost.sources")
+
+
+def apt_update_project():
+    """Refresh ONLY the project repository's lists.
+
+    The two update channels must fail independently (DESIGN-v3 A6:
+    Debian updates flow regardless of the project mirror, and vice
+    versa): a Debian mirror outage must not freeze the signed
+    project package - the channel that carries security floors -
+    and a project-repo outage must not block Debian's. So the
+    managed packages are judged on a project-only apt update;
+    the full Debian update runs afterwards, best-effort.
+    Returns True on success."""
+    parts = os.path.join(STATE_DIR, "apt-sourceparts")
+    os.makedirs(parts, exist_ok=True)
+    link = os.path.join(parts, "onionhost.sources")
+    try:
+        if os.path.islink(link) or os.path.exists(link):
+            os.unlink(link)
+        os.symlink(PROJECT_SOURCES, link)
+    except OSError as e:
+        log("cannot stage project source: %s" % e)
+        return False
+    log("apt-get update - project repository only (via container U)")
+    rc = run(["apt-get",
+              "-o", "Dir::Etc::sourceparts=%s" % parts,
+              "-o", "Dir::Etc::sourcelist=/dev/null",
+              "-o", "APT::Get::List-Cleanup=0",
+              "update"], timeout=1200)
+    return rc == 0
+
+
+def run(cmd, timeout=1800):
+    log("+ %s" % " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True,
+                          timeout=timeout)
+    for line in proc.stdout.splitlines():
+        log("  %s" % line)
+    return proc.returncode
+
+
+def dpkg_compare(a, op, b):
+    return subprocess.run(["dpkg", "--compare-versions", a, op, b]
+                          ).returncode == 0
+
+
+def installed_version(pkg):
+    proc = subprocess.run(["dpkg-query", "-W", "-f=${Version}",
+                           pkg], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True)
+    v = proc.stdout.strip()
+    return v if proc.returncode == 0 and v else None
+
+
+def repo_best_version(pkg):
+    """The best version the REPOSITORIES offer for pkg, or None.
+
+    This is NOT apt's candidate: apt never selects a downgrade, so
+    its candidate hides exactly the case the high-water mark exists
+    to catch - a replayed repository offering only old versions
+    shows candidate == installed and looks "current". apt-cache
+    madison lists every version per source; ignore the dpkg status
+    pseudo-source and take the max of what repos actually serve."""
+    proc = subprocess.run(["apt-cache", "madison", pkg],
+                          stdout=subprocess.PIPE, text=True)
+    best = None
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) != 3 or parts[2].endswith("status"):
+            continue
+        v = parts[1]
+        if best is None or dpkg_compare(v, "gt", best):
+            best = v
+    return best
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+
+
+def deb_floor(deb_path, pkg):
+    """Read the security floor for pkg from inside a .deb (the floor
+    file is part of the signed package contents)."""
+    try:
+        proc = subprocess.run(
+            ["dpkg-deb", "--fsys-tarfile", deb_path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        import io
+        import tarfile
+        tf = tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:*")
+        # The platform floor lives at usr/share/onionhost/
+        # floor.json; a recipe's at usr/share/onionhost/recipes/
+        # <id>/floor.json. Any floor.json member counts; the one
+        # naming pkg wins.
+        for name in tf.getnames():
+            if name.endswith("/floor.json"):
+                try:
+                    data = json.load(tf.extractfile(name))
+                except Exception:  # noqa: BLE001 - keep looking
+                    continue
+                if pkg in data:
+                    return data[pkg]
+        return None
+    except Exception as e:  # noqa: BLE001 - absent floor = no constraint
+        log("floor: could not read floor from %s: %s" % (deb_path, e))
+        return None
+
+
+def find_deb(pkg, version):
+    for name in sorted(os.listdir(ARCHIVES)):
+        if name.startswith(pkg + "_") and name.endswith(".deb"):
+            if (deb_version(os.path.join(ARCHIVES, name)) == version):
+                return os.path.join(ARCHIVES, name)
+    return None
+
+
+def deb_version(path):
+    proc = subprocess.run(["dpkg-deb", "-f", path, "Version"],
+                          stdout=subprocess.PIPE, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def stackctl(*args):
+    if STACKCTL:
+        return run([STACKCTL] + list(args))
+    units = ["onionhost-a.service", "onionhost-b.service",
+             "onionhost-app.service"]
+    action = args[0] if args else "restart"
+    rc = 0
+    for unit in units:
+        r = subprocess.run(["systemctl", action, unit],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL).returncode
+        if action == "stop" and r != 0:
+            rc = r
+    return rc
+
+
+def stop_gateway():
+    """Fail-closed action (Y8): the site goes OFF - gateway first,
+    then the site containers."""
+    if STACKCTL:
+        run([STACKCTL, "stop-gateway"])
+        run([STACKCTL, "stop"])
+        return
+    subprocess.run(["systemctl", "stop", "onionhost-a.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "stop", "onionhost-b.service",
+                    "onionhost-app.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _probe_once():
+    """One probe run against the stack: True iff the site
+    answered 200 through the onion path within the probe's own
+    retry envelope."""
+    # Argv-form exec (Repo Review 5 F-P1-1): HEALTH_CMD is split
+    # to a fixed argv and run WITHOUT a shell - a root updater
+    # should not route its health check through /bin/sh. The env
+    # override still names the command (tests stub it), but it
+    # can no longer smuggle shell syntax.
+    argv = shlex.split(HEALTH_CMD)
+    if not argv:
+        log("health: no probe command configured")
+        return False
+    try:
+        proc = subprocess.run(argv,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True,
+                              timeout=HEALTH_TIMEOUT)
+        lines = proc.stdout.splitlines()
+        for line in lines[-5:]:
+            log("  health: %s" % line)
+        if proc.returncode != 0:
+            return False
+        # onionhost-probe prints PROBE_OK for ANY HTTP response
+        # (slice 4); a health check needs the 200 specifically.
+        for line in lines:
+            if line.startswith("PROBE_OK"):
+                return " 200" in line
+        return True
+    except subprocess.TimeoutExpired:
+        log("health: timed out after %ds" % HEALTH_TIMEOUT)
+        return False
+    except OSError as e:
+        log("health: could not run %r: %s" % (argv[0], e))
+        return False
+
+
+def health_ok():
+    """Judge the (just restarted) stack healthy or not.
+
+    One probe run is NOT the whole budget: a restarted onion
+    service republishes on Tor's schedule, and the rig battery
+    measured a 324 s tail against a ~3-4 minute single-run
+    envelope. So a failed run is retried after a pause, up to
+    HEALTH_ATTEMPTS runs, before the stack is judged unhealthy
+    and the rollback / fail-closed machinery engages. The
+    judgement at the end of the budget is exactly as strict as
+    it always was."""
+    for attempt in range(1, HEALTH_ATTEMPTS + 1):
+        if _probe_once():
+            return True
+        if attempt < HEALTH_ATTEMPTS:
+            log("health: no healthy answer yet (attempt %d of "
+                "%d) - waiting %ds and checking again before "
+                "judging; a restarted onion service can take "
+                "minutes to republish"
+                % (attempt, HEALTH_ATTEMPTS, HEALTH_RETRY_DELAY))
+            time.sleep(HEALTH_RETRY_DELAY)
+    return False
+
+
+def _settle_seconds():
+    """Draw this judgement's post-restart settle (D-1)."""
+    lo = HEALTH_SETTLE_MIN
+    hi = max(HEALTH_SETTLE_MAX, lo)
+    if hi <= 0:
+        return 0
+    return random.SystemRandom().uniform(lo, hi)
+
+
+def health_ok_after_restart():
+    """health_ok() with the D-1 settle in front of it.
+
+    Every health judgement in main() follows a stack restart
+    this run performed (install, rollback, or fail-closed
+    recovery). The settle is the decoupling: the probe's
+    rendezvous to this box's own onion happens at a drawn,
+    scattered time instead of within minutes of the package
+    fetch that started the run. The judgement itself - and
+    every rollback / fail-closed consequence hanging off it -
+    is health_ok() unchanged."""
+    settle = _settle_seconds()
+    if settle > 0:
+        log("health: waiting %ds before judging (post-restart "
+            "settle, drawn per judgement - the self-probe is "
+            "decoupled from this update run)" % int(settle))
+        time.sleep(settle)
+    return health_ok()
+
+
+def write_status(state, detail, packages):
+    save_json(os.path.join(STATE_DIR, "status.json"),
+              {"state": state, "detail": detail, "checked_at": now(),
+               "packages": packages})
+
+
+MARKER_PATH = os.path.join(STATE_DIR, "fail-closed.marker")
+
+
+def marker_present():
+    return os.path.exists(MARKER_PATH)
+
+
+def write_marker(packages, floors):
+    """Record the fail-closed fact in its own state file.
+
+    Written whenever the machine fails closed (and once when a
+    legacy fail-closed status is adopted - see main); carries the
+    installed version and the standing floor per package, the
+    facts the recovery duty judges by."""
+    save_json(MARKER_PATH,
+              {"since": now(),
+               "packages": {pkg: {"installed": installed_version(pkg),
+                                  "floor": floors.get(pkg)}
+                            for pkg in packages}})
+
+
+def clear_marker():
+    try:
+        os.unlink(MARKER_PATH)
+    except OSError:
+        pass
+
+
+def disk_floor_for(pkg):
+    """The floor currently standing on disk for pkg: the platform
+    floor file, or any installed recipe's floor file."""
+    import glob
+    candidates = ["/usr/share/onionhost/floor.json"]
+    candidates += sorted(glob.glob(
+        "/usr/share/onionhost/recipes/*/floor.json"))
+    for path in candidates:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if pkg in data:
+                return data[pkg]
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
+    hw_path = os.path.join(STATE_DIR, "highwater.json")
+    fl_path = os.path.join(STATE_DIR, "floors.json")
+    highwater = load_json(hw_path, {})
+    floors = load_json(fl_path, {})
+    packages = {}
+    worst = 0
+
+    # Recovery duty: if the previous run failed CLOSED, the stack
+    # was deliberately stopped. A later run must not mistake
+    # "installed == candidate" for "all is well" and leave the site
+    # off forever - when the installed version is at/above the
+    # floor, this run restarts the stack and re-checks health even
+    # if there is nothing new to install.
+    prev_status = load_json(os.path.join(STATE_DIR, "status.json"), {})
+    # The duty keys on the marker; status.json is only the legacy
+    # carrier (a machine closed by an older updater has the status
+    # but no marker - it is adopted just below).
+    recovering = marker_present() or \
+        prev_status.get("state") == "fail-closed"
+
+    # Baseline: a factory install has no state files yet. The mark
+    # starts at whatever is installed (the ISO is the floor of
+    # history), the floor at the installed package's own floor file.
+    for pkg in MANAGED:
+        inst = installed_version(pkg)
+        if inst and pkg not in highwater:
+            highwater[pkg] = inst
+        disk_floor = disk_floor_for(pkg)
+        if disk_floor and pkg not in floors:
+            floors[pkg] = disk_floor
+        packages[pkg] = {"installed": inst}
+
+    if recovering and not marker_present():
+        log("adopting a legacy fail-closed status into the marker")
+        write_marker(packages, floors)
+
+    # Managed packages move only through this phase; clear any
+    # hold a previous run's Debian phase may have leaked (it
+    # holds the set across its generic upgrade - see there).
+    for pkg in MANAGED:
+        run(["apt-mark", "unhold", pkg])
+
+    if not apt_update_project():
+        if recovering:
+            # The site is OFF for safety; a fetch failure changes
+            # nothing about that and must not overwrite the
+            # fail-closed record with an "unaffected" one.
+            log("fetch failed while failed closed - updates pause; "
+                "the fail-closed state stands")
+            return 3
+        write_status("fetch-failed",
+                     "Update check could not reach the repository. "
+                     "Your site is unaffected.", packages)
+        log("fetch failed - updates pause, site untouched")
+        return 3
+
+    for pkg in MANAGED:
+        inst = installed_version(pkg)
+        # Decisions are driven by the best version the repositories
+        # offer, NOT apt's candidate (which can never be a downgrade
+        # and so can never trip the high-water refusal - see
+        # repo_best_version).
+        cand = repo_best_version(pkg)
+        packages[pkg] = {"installed": inst, "candidate": cand,
+                         "highwater": highwater.get(pkg),
+                         "floor": floors.get(pkg)}
+        if cand is None:
+            log("%s: no candidate in repository" % pkg)
+            continue
+        mark = highwater.get(pkg)
+        if mark and dpkg_compare(cand, "lt", mark):
+            log("REFUSED %s: repository's best version %s is below "
+                "the high-water mark %s - a replayed or rolled-back "
+                "repository cannot downgrade this machine"
+                % (pkg, cand, mark))
+            write_status("refused-downgrade",
+                         "An out-of-date update source was refused.",
+                         packages)
+            worst = max(worst, 2)
+            continue
+        if inst is not None and cand == inst:
+            if recovering:
+                floor = floors.get(pkg)
+                if floor is not None and dpkg_compare(inst, "lt",
+                                                      floor):
+                    log("%s: installed %s is below the floor %s - "
+                        "cannot recover on it; staying failed closed"
+                        % (pkg, inst, floor))
+                    return 5
+                log("%s: recovering from fail-closed - restarting "
+                    "the stack on the installed %s and re-checking "
+                    "health" % (pkg, inst))
+                stackctl("restart")
+                if health_ok_after_restart():
+                    log("%s: recovery healthy - site is back" % pkg)
+                    recovering = False
+                    # The installed version is now health-verified:
+                    # it becomes the high-water mark, exactly as if
+                    # this run had installed it.
+                    if dpkg_compare(inst, "gt",
+                                    highwater.get(pkg, "0")):
+                        highwater[pkg] = inst
+                        save_json(hw_path, highwater)
+                        packages[pkg].update({"highwater": inst})
+                    write_status("up-to-date",
+                                 "Everything is current.", packages)
+                    clear_marker()
+                    continue
+                log("%s: recovery health check failed - staying "
+                    "failed closed" % pkg)
+                stop_gateway()
+                stackctl("stop")
+                write_status(
+                    "fail-closed",
+                    "An update could not be applied safely, so your "
+                    "site was turned off rather than left running "
+                    "out-of-date software. It will come back "
+                    "automatically when a fixed update is available.",
+                    packages)
+                write_marker(packages, floors)
+                return 5
+            log("%s: %s is current" % (pkg, inst))
+            continue
+
+        # Learn the candidate's floor BEFORE installing: the floor
+        # travels inside the signed package, and Y8 judges the OLD
+        # version against the NEW package's floor.
+        if run(["apt-get", "install", "-y", "--download-only"] + DPKG_OPTS + [pkg],
+               timeout=1800) != 0:
+            if recovering:
+                log("%s: download failed while failed closed - "
+                    "the fail-closed state stands" % pkg)
+                return 3
+            write_status("fetch-failed",
+                         "Update download failed. Your site is "
+                         "unaffected.", packages)
+            return 3
+        cand_deb = find_deb(pkg, cand)
+        cand_floor = deb_floor(cand_deb, pkg) if cand_deb else None
+        if cand_floor:
+            if pkg not in floors or dpkg_compare(
+                    cand_floor, "gt", floors[pkg]):
+                floors[pkg] = cand_floor
+                save_json(fl_path, floors)
+            log("%s: floor from signed package: %s (floor on record: "
+                "%s)" % (pkg, cand_floor, floors[pkg]))
+
+        prev_version = inst
+        prev_deb = os.path.join(STATE_DIR, "prev", pkg + ".deb")
+        prev_saved = os.path.exists(prev_deb) and \
+            deb_version(prev_deb) == prev_version
+        if not prev_saved and prev_version:
+            # A version the updater did not itself install - the
+            # factory version from the ISO, say - has no rollback
+            # copy yet, so a failed FIRST update could only fail
+            # closed. Fetch that version's .deb from the (signed,
+            # already-fetched) repository now, before anything
+            # changes, and keep it as the rollback copy. If the
+            # repo no longer carries it, carry on without: the
+            # fail-closed fallback below remains the safe floor.
+            try:
+                subprocess.run(
+                    ["apt-get", "download",
+                     "%s=%s" % (pkg, prev_version)],
+                    cwd=ARCHIVES, capture_output=True, text=True,
+                    timeout=900)
+                old_deb = find_deb(pkg, prev_version)
+                if old_deb:
+                    subprocess.run(["cp", "-f", old_deb, prev_deb])
+                    prev_saved = deb_version(prev_deb) == \
+                        prev_version
+                    if prev_saved:
+                        log("%s: saved a rollback copy of the "
+                            "installed %s" % (pkg, prev_version))
+            except Exception as e:  # noqa: BLE001 - best effort
+                log("%s: could not fetch a rollback copy of %s: %s"
+                    % (pkg, prev_version, e))
+        log("installing %s %s -> %s" % (pkg, inst, cand))
+        rc = run(["apt-get", "install", "-y"] + DPKG_OPTS + [pkg], timeout=1800)
+        stackctl("restart")
+        healthy = (rc == 0) and health_ok_after_restart()
+        if healthy:
+            highwater[pkg] = cand
+            save_json(hw_path, highwater)
+            if cand_deb:
+                subprocess.run(["cp", "-f", cand_deb, prev_deb])
+                save_json(os.path.join(STATE_DIR, "prev",
+                                       pkg + ".version"),
+                          {"version": cand})
+            packages[pkg].update({"installed": cand,
+                                  "highwater": cand,
+                                  "floor": floors.get(pkg)})
+            log("%s: updated to %s and healthy" % (pkg, cand))
+            recovering = False  # a healthy install IS the recovery
+            write_status("updated", "Updated to %s." % cand, packages)
+            clear_marker()
+            continue
+
+        log("%s: update to %s FAILED its health check" % (pkg, cand))
+        floor = floors.get(pkg)
+        can_rollback = (prev_version and prev_saved and
+                        (floor is None or
+                         dpkg_compare(prev_version, "ge", floor)))
+        if can_rollback:
+            log("rolling back to %s (at/above floor %s)"
+                % (prev_version, floor))
+            run(["dpkg", "-i", prev_deb], timeout=600)
+            stackctl("restart")
+            if health_ok_after_restart():
+                packages[pkg].update({"installed": prev_version,
+                                      "floor": floor})
+                recovering = False  # healthy rollback is a recovery
+                write_status(
+                    "update-failed",
+                    "An update did not work and was undone. Your "
+                    "site is running the previous version.", packages)
+                clear_marker()
+                worst = max(worst, 4)
+                continue
+            log("rollback to %s is ALSO unhealthy" % prev_version)
+        else:
+            log("rollback target %s is below the security floor %s "
+                "or unavailable - failing closed" %
+                (prev_version, floor))
+        # Y8 fail-closed: never keep serving on a stack that is
+        # broken or below the floor. The site goes OFF - gateway
+        # first (the onion goes dark), then the stack itself.
+        stop_gateway()
+        stackctl("stop")
+        packages[pkg].update({"floor": floor})
+        write_status(
+            "fail-closed",
+            "An update could not be applied safely, so your site "
+            "was turned off rather than left running out-of-date "
+            "software. It will come back automatically when a fixed "
+            "update is available.", packages)
+        write_marker(packages, floors)
+        return 5
+
+    # Debian base packages: same Tor path, same run, best effort -
+    # a Debian mirror failure is logged and changes nothing about
+    # the project package's outcome above. The managed set is
+    # HELD across the generic upgrade: apt-get upgrade sees every
+    # configured source (the project repo included) and would
+    # otherwise happily re-install a version the managed phase
+    # has just rolled back for failing its health check -
+    # undoing the rollback before the run even ends (found by
+    # the WordPress recipe acceptance, 2026-10-14: a sabotaged
+    # recipe was rolled back cleanly and then re-upgraded by
+    # this phase in the same run). Holds are released at the end
+    # of the phase, and the managed phase unholds defensively on
+    # its way in (below), so a hold leaked by a killed run cannot
+    # wedge the next managed install.
+    log("apt-get update + upgrade (Debian base, same Tor path)")
+    held = [pkg for pkg in MANAGED
+            if run(["apt-mark", "hold", pkg]) == 0]
+    if run(["apt-get", "update"], timeout=1800) != 0:
+        log("Debian apt-get update failed for at least one source "
+            "- logged only; upgrading from whatever lists did "
+            "arrive (e.g. security), the rest retries next run")
+    rc = run(["apt-get", "-y"] + DPKG_OPTS + ["upgrade"],
+             timeout=3600)
+    for pkg in held:
+        run(["apt-mark", "unhold", pkg])
+    if rc != 0:
+        log("Debian upgrade returned %d - logged, project state "
+            "unaffected" % rc)
+
+    if recovering:
+        # Never reached a healthy state this run (e.g. the repo
+        # offered nothing installable): the site stays off and the
+        # status must keep saying so.
+        write_status(
+            "fail-closed",
+            "An update could not be applied safely, so your site "
+            "was turned off rather than left running out-of-date "
+            "software. It will come back automatically when a fixed "
+            "update is available.", packages)
+        write_marker(packages, floors)
+        log("done (exit 5) - still failed closed")
+        return 5
+    if worst == 0:
+        write_status("up-to-date", "Everything is current.", packages)
+    log("done (exit %d)" % worst)
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())

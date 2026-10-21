@@ -1,0 +1,89 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-maintenance: the Maintenance console menu (DESIGN-v3
+A3, WALKTHROUGH C4).
+
+Runs on tty1 inside onionhost-maintenance.target (reached from the
+"OnionHost Maintenance" GRUB entry, after the disk phrase has been
+typed; the target starts no site services and no networking). A
+menu, because Maintenance now holds more than one tool:
+
+    1. Restore this computer from a backup   (onionhost-restore)
+    2. Make a new disk passphrase            (onionhost-rekey)
+    3. Restart the computer
+
+A failed restore returns to this menu - the retry the design
+promises (a wrong phrase changes nothing and must not cost a
+reboot). Every session is recorded in
+/var/lib/onionhost/maintenance-log.txt and the journal.
+"""
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+MAINT_LOG = "/var/lib/onionhost/maintenance-log.txt"
+
+
+def _log_event(text):
+    line = "%s maintenance: %s\n" % (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        text)
+    try:
+        with open(MAINT_LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    subprocess.run(["logger", "-t", "onionhost-maintenance", text],
+                   capture_output=True)
+
+
+def main():
+    if os.geteuid() != 0:
+        print("maintenance: must run as root", file=sys.stderr)
+        return 1
+    _log_event("session opened")
+    print("")
+    print("OnionHost Maintenance")
+    print("=====================")
+    print("This computer's website is paused while you are here.")
+    while True:
+        print("")
+        print("  1. Restore this computer from a backup")
+        print("  2. Make a new disk passphrase")
+        print("  3. Restart the computer")
+        print("")
+        try:
+            choice = input("Type a number and press Enter: ")
+        except EOFError:
+            choice = "3"
+        choice = choice.strip()
+        if choice == "1":
+            _log_event("restore chosen")
+            proc = subprocess.run(
+                ["/usr/local/bin/onionhost-restore"])
+            if proc.returncode == 0:
+                _log_event("restore finished OK")
+            else:
+                _log_event("restore ended with code %d"
+                           % proc.returncode)
+            print("")
+            print("Back to the Maintenance menu. Choose 3 to "
+                  "restart the computer.")
+        elif choice == "2":
+            _log_event("re-key chosen")
+            proc = subprocess.run(
+                ["/usr/local/bin/onionhost-rekey", "--interactive"])
+            _log_event("re-key ended with code %d" % proc.returncode)
+            print("")
+            print("Back to the Maintenance menu. Choose 3 to "
+                  "restart the computer.")
+        elif choice == "3":
+            _log_event("session closed (restart chosen)")
+            return 0
+        else:
+            print("Type 1, 2 or 3.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

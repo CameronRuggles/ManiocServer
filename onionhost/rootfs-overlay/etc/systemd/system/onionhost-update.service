@@ -1,0 +1,16 @@
+[Unit]
+Description=OnionHost update check (via client Tor only)
+# Updates pause harmlessly if U is down: the updater reports
+# fetch-failed and exits; the site is never touched on that path.
+Wants=network-online.target
+After=network-online.target onionhost-config.service
+ConditionPathExists=/run/onionhost/client/socks/sock
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-update
+# 2 refused-downgrade seen (safe), 3 fetch failed (paused),
+# 4 update failed but rolled back healthy. 5 (fail-closed) stays a
+# failure so it shows up in systemctl status / journal alerts.
+SuccessExitStatus=2 3 4
+TimeoutStartSec=infinity

@@ -1,0 +1,5 @@
+// OnionHost: a grub-efi update can regenerate the ESP stub via
+// grub-install, silently dropping the passphrase retry loop.
+// Re-apply it after every package operation (the tool is a quick
+// no-op when the loop is already present).
+DPkg::Post-Invoke { "if [ -x /usr/local/bin/onionhost-grub-stub ]; then /usr/local/bin/onionhost-grub-stub >/dev/null 2>&1 || true; fi"; };

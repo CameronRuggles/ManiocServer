@@ -1,0 +1,62 @@
+{
+ "admin_note": "You sign in to WordPress with this name and password. WordPress cannot email you a password reset here (the site cannot send mail), so keep the password somewhere safe.",
+ "app": {
+  "license": "GPL-2.0-or-later",
+  "name": "WordPress",
+  "source": "Official release archive wordpress-7.1.3.zip from downloads.wordpress.org (the version wordpress.org's own version-check API names current). Provenance verified 2026-10-13, two independent ways: (1) every file the official per-file checksum API (api.wordpress.org/core/checksums/1.0) covers - 3,782 of 3,782 - matches the API's published MD5; (2) a second-source download of the GitHub mirror tag 7.1.3 (WordPress/WordPress) is byte-identical on all 3,735 files the two sources share (differences are structural only: the mirror carries legacy bundled themes the release zip no longer ships, and lacks Akismet's built assets, which the release zip adds).",
+  "version": "7.1.3"
+ },
+ "archive": {
+  "file": "wordpress-7.1.3.zip",
+  "sha256": "eb58a90ed55147f90f7bd55d0d3334960a69b7e8a4cc142c8ddfea8965218227",
+  "url": "https://downloads.wordpress.org/release/wordpress-7.1.3.zip"
+ },
+ "config_carryover": [
+  "wp-config.php"
+ ],
+ "config_file": "wp-config.php",
+ "config_renderer": "wp-config",
+ "config_template": "wp-config-sample.php",
+ "data_dirs": [
+  "wp-content/uploads"
+ ],
+ "db": {
+  "prefix": "wp_",
+  "required": true
+ },
+ "description": "Blog / website - pages, posts, comments and a media library (WordPress), set up for you.",
+ "extra_files": [
+  {
+   "dst": "wp-content/mu-plugins/onionhost-sealed.php",
+   "src": "files/wp-content/mu-plugins/onionhost-sealed.php"
+  }
+ ],
+ "id": "wordpress",
+ "install": {
+  "default_title": "My Website",
+  "fields": {
+   "admin_email": "{email}",
+   "admin_password": "{password}",
+   "admin_password2": "{password}",
+   "blog_public": "0",
+   "language": "",
+   "user_name": "{user}",
+   "weblog_title": "{title}"
+  },
+  "form_marker": "weblog_title",
+  "form_path": "/wp-admin/install.php?step=2",
+  "home_marker": "Hello world!",
+  "installed_marker": "Already Installed",
+  "probe_path": "/wp-admin/install.php",
+  "success_marker": "WordPress has been installed",
+  "type": "http-form"
+ },
+ "install_files": [
+  "wp-admin/install.php",
+  "wp-admin/upgrade.php"
+ ],
+ "name": "WordPress",
+ "normalize_exceptions_note": "wp-config.php holds the database password",
+ "runtime": "php",
+ "version": "7.1.3+oh.1"
+}

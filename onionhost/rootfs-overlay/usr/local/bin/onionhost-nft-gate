@@ -1,0 +1,39 @@
+#!/bin/bash
+# OnionHost firewall gate (DESIGN-v3 A8): compare the LIVE nftables
+# table against the GOLDEN table without text hashing.
+# Method (Stage 0 Gate 3, proven): load the golden ruleset into a
+# scratch network namespace, list both sides as JSON with the SAME nft
+# binary, canonicalise (strip handles/indexes/metainfo, sort set
+# elements, preserve rule order) and compare.
+# Exit codes: 0 = live matches golden, 1 = mismatch (callers must treat
+# as "do not start / stop the gateway"), 2 = gate itself could not run.
+set -u
+GOLDEN=/usr/lib/onionhost/golden/nft-golden.nft
+COMPARE=/usr/local/bin/onionhost-nft-compare.py
+TABLE_FAMILY=inet
+TABLE_NAME=onionhost
+WORK=$(mktemp -d /run/onionhost-nft-gate.XXXXXX) || exit 2
+trap 'rm -rf "$WORK"' EXIT
+
+# Reference: golden ruleset inside a throwaway netns.
+if ! unshare -n sh -c 'nft -f "$1" && nft -j list table "$2" "$3"' _ \
+        "$GOLDEN" "$TABLE_FAMILY" "$TABLE_NAME" > "$WORK/ref.json" 2> "$WORK/ref.err"; then
+    echo "onionhost-nft-gate: ERROR loading golden ruleset: $(cat "$WORK/ref.err")" >&2
+    exit 2
+fi
+# Live ruleset on the host.
+if ! nft -j list table "$TABLE_FAMILY" "$TABLE_NAME" > "$WORK/live.json" 2> "$WORK/live.err"; then
+    echo "onionhost-nft-gate: MISMATCH live table $TABLE_FAMILY $TABLE_NAME not present: $(cat "$WORK/live.err")" >&2
+    exit 1
+fi
+RESULT=$("$COMPARE" "$WORK/ref.json" "$WORK/live.json")
+RC=$?
+if [ $RC -eq 0 ]; then
+    echo "onionhost-nft-gate: OK live table matches golden"
+    exit 0
+elif [ $RC -eq 1 ]; then
+    echo "onionhost-nft-gate: MISMATCH live table differs from golden" >&2
+    exit 1
+fi
+echo "onionhost-nft-gate: ERROR comparing rulesets" >&2
+exit 2

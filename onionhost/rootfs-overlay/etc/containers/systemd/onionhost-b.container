@@ -1,0 +1,51 @@
+# OnionHost container B - the website (DESIGN-v3 A4/A5).
+# B has NO network: Network=none here AND runsc-wrap passes
+# --network=none with the bundle netns stripped. B only serves nginx
+# over a unix socket in /run/onionhost/web (rotation: b1.sock behind
+# the host-owned http.sock symlink - A8). Read-only rootfs; the site
+# content volume is mounted read-only.
+[Unit]
+Description=OnionHost B - website (no network)
+# Site-kind selection (slice 6B): when the owner has chosen an app
+# site, the marker exists and the combined app container serves
+# instead of this static one (both bind the same b1.sock edge name).
+ConditionPathExists=!/var/lib/onionhost/app-site
+Wants=onionhost-config.service onionhost-images.service
+After=onionhost-config.service onionhost-images.service
+
+[Container]
+Image=localhost/onionhost-web:latest
+ContainerName=onionhost-b
+PodmanArgs=--runtime=runsc-wrap
+Network=none
+# Fixed userns map, as in onionhost-a.container (container root is
+# always host uid 2300000).
+UIDMap=0:2300000:65536
+GIDMap=0:2300000:65536
+ReadOnly=true
+Tmpfs=/tmp
+Volume=/run/onionhost/web:/run/onionhost/web
+Volume=/var/lib/onionhost/site:/srv/site:ro
+Volume=/etc/onionhost/nginx.conf:/etc/nginx/nginx.conf:ro
+Exec=nginx -c /etc/nginx/nginx.conf -g "daemon off;"
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Repo Review 3 task 17 (finding S11): judge this container's
+# runtime the moment it starts, not at the timer's next run (up to
+# 5 minutes later). The check inspects every OnionHost container
+# and stops any unit not running runsc-wrap. The leading '-' keeps
+# a violation found in ANOTHER unit (or a gate error) from marking
+# THIS unit failed and restarting it; enforcement is the check's
+# own stop + latch, and the 5-minute timer keeps re-checking.
+ExecStartPost=-/usr/local/bin/onionhost-runtime-gate-check
+# nginx creates b1.sock with the process umask; A's tor (a different
+# userns uid) needs write permission on that socket to connect, so
+# the socket must be world-writable. The socket is not a privilege
+# boundary in this design (it serves the public site; the control
+# socket is the locked-down one).
+UMask=0000
+
+[Install]
+WantedBy=multi-user.target

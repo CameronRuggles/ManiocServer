@@ -1,0 +1,36 @@
+{
+ "admin_note": "You sign in to the forum with this name and password. Sign in once after setup - the forum strengthens your password the first time you use it.",
+ "app": {
+  "license": "BSD-3-Clause",
+  "name": "Simple Machines Forum",
+  "source": "GitHub release archive of SimpleMachines/SMF tag v2.1.7 (commit d49255b). The official download host (download.simplemachines.org) refuses this build venue (HTTP 403, Cloudflare), so the GitHub archive is vendored instead; its CONTENT was verified identical to a fresh second download of the same tag on 2026-10-13 (zip container bytes differ between GitHub generations; file contents do not). Substituting the official smf_2-1-7_install.zip once its checksum can be verified against simplemachines.org remains an open item (see ISO-BUILD-LOG, A23 RECIPE 1).",
+  "version": "2.1.7"
+ },
+ "archive": {
+  "file": "smf-2.1.7-github-release.zip",
+  "refetch_note": "KNOWN LIMITATION (Repo Review 2, B6; verified 2026-10-13 and again 2026-10-20): this URL is GitHub's auto-generated tag archive (the v2.1.7 release carries no uploaded assets). GitHub regenerates that zip's container bytes, so a fresh download's sha256 will NOT equal the pin (2026-10-20 generation: 733b9f16808b2097cebed4f0f6705887515c171ad4a3eb1f61ea675baed9d7fb) even though its extracted contents are byte-identical to the vendored archive (diff -r clean, 2026-10-20). The official host download.simplemachines.org returns HTTP 403 from every venue tried (sandbox, rig, 2026-10-20). The pin can therefore only be satisfied by the vendored archive, whose CONTENTS are the verified release contents; build/fetch-recipe-archives.sh verifies strictly and will refuse a fresh SMF download on hash mismatch - that refusal is this limitation surfacing, not a bug.",
+  "sha256": "5efdadf64d91082f59176c983af26dc0e6e3dff50b5d0b1d2eeb60300b3d257d",
+  "url": "https://github.com/SimpleMachines/SMF/archive/refs/tags/v2.1.7.zip"
+ },
+ "config_carryover": [
+  "Settings.php",
+  "Settings_bak.php"
+ ],
+ "config_file": "Settings.php",
+ "data_dirs": [
+  "attachments",
+  "custom_avatar",
+  "cache"
+ ],
+ "db": {
+  "prefix": "smf_",
+  "required": true
+ },
+ "description": "Forum - discussion boards with member accounts (SMF), set up for you.",
+ "id": "smf",
+ "name": "Forum (SMF)",
+ "runtime": "php",
+ "seed_sql": "install_2-1_mysql.sql",
+ "settings_template": "Settings.php",
+ "version": "2.1.7+oh.1"
+}

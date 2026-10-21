@@ -1,0 +1,45 @@
+#!/bin/sh
+# OnionHost app-data quota guard (slice 6B, DESIGN-v3 A12.3).
+#
+# The app-data volume is a plain directory tree on the encrypted
+# root (no separate filesystem in v1's layout), so the quota in
+# /etc/onionhost/app.conf is enforced by measurement: this runs
+# every few minutes from onionhost-appdata-guard.timer, and if the
+# app data has grown past its allowance it stops the app container
+# - a full disk must never be able to starve the host, the Tor
+# state, or the owner's own files (the failure the quota exists to
+# prevent). The breach is recorded in the maintenance log and in
+# the /var/lib/onionhost/appdata-overquota flag; the app starts
+# again once the owner frees space (the flag clears on the next
+# in-quota run, and onionhost-publish restarts the unit anyway).
+#
+# A hard filesystem quota (project quota on a dedicated app-data
+# volume) is the stronger form; it is an install-layout decision
+# recorded as deferred in the slice 6B build log.
+set -u
+APPDATA=/var/lib/onionhost/appdata
+CONF=/etc/onionhost/app.conf
+FLAG=/var/lib/onionhost/appdata-overquota
+LOG=/var/lib/onionhost/maintenance-log.txt
+QUOTA=21474836480
+if [ -f "$CONF" ]; then
+    v=$(sed -n 's/^APPDATA_QUOTA_BYTES=//p' "$CONF" | head -1)
+    case "$v" in ''|*[!0-9]*) ;; *) QUOTA=$v ;; esac
+fi
+[ -d "$APPDATA" ] || exit 0
+USED=$(du -s -B1 "$APPDATA" 2>/dev/null | cut -f1)
+case "$USED" in ''|*[!0-9]*) exit 0 ;; esac
+if [ "$USED" -gt "$QUOTA" ]; then
+    if [ ! -f "$FLAG" ]; then
+        touch "$FLAG"
+        logger -t onionhost-appdata-guard \
+            "app data over quota ($USED > $QUOTA bytes); stopping app container"
+        printf '%s appdata-guard: app data over quota (%s > %s bytes); app container stopped\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$USED" "$QUOTA" \
+            >> "$LOG" 2>/dev/null || true
+    fi
+    systemctl stop onionhost-app.service 2>/dev/null || true
+else
+    rm -f "$FLAG"
+fi
+exit 0

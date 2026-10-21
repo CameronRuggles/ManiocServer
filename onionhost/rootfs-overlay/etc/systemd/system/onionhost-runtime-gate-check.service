@@ -1,0 +1,7 @@
+[Unit]
+Description=OnionHost - periodic runtime gate check (stops units not running runsc-wrap)
+After=onionhost-config.service onionhost-images.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-runtime-gate-check

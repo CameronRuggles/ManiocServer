@@ -1,0 +1,13 @@
+# OnionHost project package repository (Gate 4 / DESIGN-v3 A6).
+# Rendered to /etc/apt/sources.list.d/onionhost.sources by
+# onionhost-generate-configs. The .onion below is the project's
+# repository service address - a public constant, like a mirror
+# hostname; its private key lives only in maintainer custody
+# (~/workspace/onionhost-maintainer/, never in any image).
+# Metadata is signed by the project release key; the public half is
+# /usr/share/keyrings/onionhost-archive-keyring.gpg in this package.
+Types: deb
+URIs: tor+http://tpt6oez5hqsmeifbd3ltjb7d4nnfys4dqyyu2mukh2v53eh5nd7fbfyd.onion/
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/onionhost-archive-keyring.gpg

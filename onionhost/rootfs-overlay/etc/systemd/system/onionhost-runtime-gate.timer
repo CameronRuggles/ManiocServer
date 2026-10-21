@@ -1,0 +1,15 @@
+[Unit]
+Description=OnionHost - re-run runtime gate check every 5 minutes (Repo Review 2 task 20)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Points at the CHECK unit, like the nft gate timer: the check
+# re-executes the inspection and stops offending units itself.
+# The runtime gate is a postcondition (it inspects running
+# containers), so there is no RemainAfterExit boot unit for
+# containers to BindsTo= the way A binds to the nft gate.
+Unit=onionhost-runtime-gate-check.service
+
+[Install]
+WantedBy=timers.target

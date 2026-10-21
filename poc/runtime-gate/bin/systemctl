@@ -1,0 +1,26 @@
+#!/bin/bash
+echo "$*" >> "${SYSTEMCTL_LOG:?}"
+# Stopping a Quadlet unit removes its container: mirror that.
+# Invocation may be `stop <unit>` or `--no-block stop <unit>`
+# (Repo Review 4 task 13: the check now records its latch
+# first, then stops with --no-block).
+unit=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "stop" ]; then
+    unit=$arg
+  fi
+  prev=$arg
+done
+if [ -n "$unit" ]; then
+  n=${unit%.service}
+  rm -f "${PODMAN_STUB_DIR:?}/$n.runtime"
+  # S14 harness case: when the stub dir carries a kill_on_stop
+  # flag, simulate the ExecStartPost self-stop - systemd
+  # stopping the unit kills the check process, which is this
+  # stub's parent, before the check can do anything further.
+  if [ -e "${PODMAN_STUB_DIR:?}/kill_on_stop" ]; then
+    kill -KILL "$PPID" 2>/dev/null || true
+  fi
+fi
+exit 0

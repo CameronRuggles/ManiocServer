@@ -1,0 +1,12 @@
+[Unit]
+Description=OnionHost - import container images into rootful Podman storage
+After=local-fs.target
+Before=onionhost-a.service onionhost-b.service onionhost-u.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-import-images
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

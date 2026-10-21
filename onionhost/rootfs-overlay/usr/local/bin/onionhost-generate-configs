@@ -1,0 +1,293 @@
+#!/bin/sh
+# OnionHost config generation: render the golden templates into
+# /etc/onionhost/. Runs at boot before the container units
+# (onionhost-config.service) and is idempotent - golden configs are
+# always regenerated from the shipped templates, never hand-edited
+# (ISO-BUILD-PLAN step 3: nothing in the image the gate can't
+# regenerate). Also (re)creates the rotation symlink http.sock ->
+# b1.sock in the shared socket directory (DESIGN-v3 A8: host-owned
+# symlink, atomically replaced at rotation; skeleton has one B).
+set -eu
+GOLDEN=/usr/lib/onionhost/golden
+OUT=/etc/onionhost
+mkdir -p "$OUT"
+for name in torrc client-torrc nginx.conf; do
+    case "$name" in
+        torrc)       src="$GOLDEN/torrc.tmpl" ;;
+        client-torrc) src="$GOLDEN/client-torrc.tmpl" ;;
+        nginx.conf)  src="$GOLDEN/nginx.conf.tmpl" ;;
+    esac
+    tmp="$OUT/.$name.tmp"
+    cp "$src" "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$OUT/$name"
+done
+# Tor state directories: guard state and the onion identity live here
+# and must persist across container rebuilds (A17.1: never mint fresh
+# guard state at rotation). Ownership: each container's root is a
+# FIXED host uid via the Quadlet UIDMap (A=2100000, U=2200000,
+# B=2300000); the state dirs are owned by it so tor/nginx (running as
+# container root in their user namespaces) can actually use them -
+# host-root-owned 0700 dirs are "nobody" inside the userns and tor
+# refuses them ("cannot be read: Permission denied", measured).
+mkdir -p /var/lib/onionhost/tor/data /var/lib/onionhost/tor/hs
+mkdir -p /var/lib/onionhost/client/data
+mkdir -p /var/lib/onionhost/site
+chown -R 2100000:2100000 /var/lib/onionhost/tor
+chmod 0700 /var/lib/onionhost/tor /var/lib/onionhost/tor/hs /var/lib/onionhost/tor/data
+chown -R 2200000:2200000 /var/lib/onionhost/client
+chmod 0700 /var/lib/onionhost/client /var/lib/onionhost/client/data
+chown 2300000:2300000 /var/lib/onionhost/site
+chmod 0755 /var/lib/onionhost/site
+# Content releases (slice 4): nginx roots at site/current ->
+# releases/<n>, swapped atomically by onionhost-publish. If the
+# symlink is somehow missing, point it at the newest release so
+# the site never 404s for a plumbing reason.
+# B's nginx worker must be able to traverse and read the whole
+# release tree regardless of the modes the overlay shipped with
+# (a 0770 releases dir and a 0640 seed page made the site answer
+# 403 - slice 4). The publisher sets modes explicitly on new
+# releases; this net covers the shipped seed.
+if [ -d /var/lib/onionhost/site ]; then
+    find /var/lib/onionhost/site -type d -exec chmod 0755 {} +
+    find /var/lib/onionhost/site -type f -exec chmod 0644 {} +
+fi
+if [ ! -L /var/lib/onionhost/site/current ] && \
+   [ -d /var/lib/onionhost/site/releases ]; then
+    newest=$(ls /var/lib/onionhost/site/releases | grep -E '^[0-9]+$' \
+             | sort -n | tail -1)
+    if [ -n "$newest" ]; then
+        ln -sfn "releases/$newest" /var/lib/onionhost/site/current.tmp
+        mv /var/lib/onionhost/site/current.tmp \
+           /var/lib/onionhost/site/current
+    fi
+fi
+# Socket directory plumbing (tmpfiles.d also creates these; the symlink
+# is ours). Point http.sock at the single skeleton B instance. The
+# tor-bound socket dirs are (re)asserted to their container owners:
+# tor refuses listener directories owned by anyone else.
+mkdir -p /run/onionhost/web /run/onionhost/client/socks /run/onionhost/control
+chown 2100000:2100000 /run/onionhost/control; chmod 0700 /run/onionhost/control
+chown 2200000:2200000 /run/onionhost/client/socks; chmod 0700 /run/onionhost/client/socks
+# The web socket exchange dir must be writable by B's nginx (userns
+# uid 2300000+) - asserted here because a root-owned 0755 dir left
+# nginx with "bind() to unix:.../b1.sock failed (13: Permission
+# denied)" even though tmpfiles.d also declares 0777.
+chmod 0777 /run/onionhost/web
+if [ ! -e /run/onionhost/web/http.sock ]; then
+    ln -sfn b1.sock /run/onionhost/web/http.sock.tmp
+    mv /run/onionhost/web/http.sock.tmp /run/onionhost/web/http.sock
+fi
+# App tier (slice 6B): when the site kind is "app" (marker written by
+# onionhost-app-provision / onionhost-publish), render the combined
+# app container's configs from the golden templates. The runtime
+# (php | native) is a one-word file next to the marker; the rendered
+# files are what the onionhost-app Quadlet unit mounts read-only.
+if [ -f /var/lib/onionhost/app-site ]; then
+    # A container bind-mount of the not-yet-created credentials
+    # file can leave a DIRECTORY at its path (podman creates
+    # missing bind sources); the credentials record is a file,
+    # and an empty directory there would break provisioning.
+    if [ -d "$OUT/app-db.env" ]; then
+        rmdir "$OUT/app-db.env" 2>/dev/null || true
+    fi
+    runtime=php
+    if [ -f /var/lib/onionhost/app-runtime ]; then
+        runtime=$(cat /var/lib/onionhost/app-runtime)
+    fi
+    case "$runtime" in php|native) ;; *) runtime=php ;; esac
+    case "$runtime" in
+        php)    ngsrc="$GOLDEN/nginx-app-php.conf.tmpl" ;;
+        native) ngsrc="$GOLDEN/nginx-app-native.conf.tmpl" ;;
+    esac
+    # A native recipe may declare that its application serves
+    # TCP on the sandbox loopback instead of the platform unix
+    # socket (manifest "native_serve": {"type": "tcp", "port":
+    # N} - an application that binds TCP only; A23 recipe 5).
+    # The manifest is the single source of truth for that fact
+    # (named by the recipe selection file), so this render
+    # follows it on every boot and after every restore, with
+    # nothing extra stamped into the site marker.
+    if [ "$runtime" = "native" ] && \
+       [ -f "$OUT/recipe-selection" ]; then
+        sel=$(head -1 "$OUT/recipe-selection" 2>/dev/null \
+              | tr -cd 'a-z0-9-' || true)
+        mfest="/usr/share/onionhost/recipes/$sel/manifest.json"
+        if [ -n "$sel" ] && [ -f "$mfest" ]; then
+            port=$(python3 -c "import json,sys
+try:
+    m=json.load(open(sys.argv[1]))
+    s=m.get('native_serve') or {}
+    p=s.get('port')
+    print(p if s.get('type')=='tcp' and isinstance(p,int) \
+        and 1<=p<=65535 else '')
+except Exception:
+    print('')" "$mfest" 2>/dev/null || true)
+            if [ -n "$port" ]; then
+                sed "s/__APP_TCP_PORT__/$port/g" \
+                    "$GOLDEN/nginx-app-native-tcp.conf.tmpl" \
+                    > "$OUT/.nginx-app-tcp.rendered"
+                chmod 0644 "$OUT/.nginx-app-tcp.rendered"
+                ngsrc="$OUT/.nginx-app-tcp.rendered"
+            fi
+        fi
+    fi
+    for pair in "nginx-app.conf:$ngsrc" \
+                "php-fpm-app.conf:$GOLDEN/php-fpm-app.conf.tmpl" \
+                "my-app.cnf:$GOLDEN/my-app.cnf.tmpl"; do
+        name=${pair%%:*}; src=${pair#*:}
+        tmp="$OUT/.$name.tmp"
+        cp "$src" "$tmp"
+        chmod 0644 "$tmp"
+        mv "$tmp" "$OUT/$name"
+    done
+    tmp="$OUT/.app-init.sh.tmp"
+    cp "$GOLDEN/app-init.sh" "$tmp"
+    chmod 0755 "$tmp"
+    mv "$tmp" "$OUT/app-init.sh"
+    # Recipe seams (A23): the nginx/FPM configs include these two
+    # overlay files. Render them into existence exactly once -
+    # a comment-only placeholder - and NEVER overwrite them
+    # afterwards: if a future packaged recipe ships an overlay,
+    # its file is the one that must survive re-renders.
+    # (The FPM file gets a ';' comment: PHP-FPM's config parser
+    # does not accept '#' comments in included files - measured
+    # in the slice 6B acceptance, FPM refused to start.)
+    if [ ! -f "$OUT/nginx-app-extra.conf" ]; then
+        printf '# OnionHost app overlay (A23 recipe seam) - empty.\n' \
+            > "$OUT/nginx-app-extra.conf"
+        chmod 0644 "$OUT/nginx-app-extra.conf"
+    fi
+    if [ ! -f "$OUT/php-fpm-app-extra.conf" ]; then
+        printf '; OnionHost app overlay (A23 recipe seam) - empty.\n' \
+            > "$OUT/php-fpm-app-extra.conf"
+        chmod 0644 "$OUT/php-fpm-app-extra.conf"
+    fi
+    # Same render-once rule for the permission-normaliser's
+    # exception list (slice 6B flag 1): a recipe may replace its
+    # contents (onionhost-recipe does, at apply time); the file
+    # must exist so the app unit's read-only mount of it always
+    # has a real file to bind (podman would otherwise create a
+    # directory at the source path - the app-db.env trap).
+    if [ ! -f "$OUT/normalize-exceptions" ]; then
+        printf '# OnionHost normaliser exceptions (A23) - empty.\n' \
+            > "$OUT/normalize-exceptions"
+        chmod 0644 "$OUT/normalize-exceptions"
+    fi
+    tmp="$OUT/.app-runtime.env.tmp"
+    printf 'ONIONHOST_RUNTIME=%s\n' "$runtime" > "$tmp"
+    # The database choice rides along (stamped into the app-site
+    # marker by onionhost-app-provision): the app init skips
+    # the database entirely for a database-less site (a
+    # flat-file packaged recipe - A23 recipes 3+4) and starts
+    # PostgreSQL instead of MariaDB for a site whose marker
+    # says db=postgres (a native recipe whose manifest declares
+    # the engine - A23 recipe 5). Markers written before the
+    # db line existed mean a MariaDB database, the historical
+    # shape; an unrecognised value fails safe to it too.
+    dbmode=required
+    rawdb=$(sed -n 's/^db=//p' /var/lib/onionhost/app-site \
+            | head -1)
+    case "$rawdb" in
+        none|postgres|required) dbmode=$rawdb ;;
+    esac
+    printf 'ONIONHOST_APP_DB=%s\n' "$dbmode" >> "$tmp"
+    # The owner's group id (written by onionhost-app-provision)
+    # rides along: the app init uses it to keep the app folder
+    # shared between the application and the owner's desktop.
+    if [ -f "$OUT/app-owner.env" ]; then
+        cat "$OUT/app-owner.env" >> "$tmp"
+    fi
+    chmod 0644 "$tmp"
+    mv "$tmp" "$OUT/app-runtime.env"
+    # The app unit bind-mounts $OUT/app-db.env unconditionally,
+    # but a database-less site (db=none - a native recipe, a
+    # flat-file PHP recipe) never gets credentials written:
+    # onionhost-app-provision only writes the file for a site
+    # WITH a database. Podman refuses to start a container
+    # whose bind source does not exist, so a native recipe
+    # could never go live at all (rig battery 2026-10-14,
+    # defect D4). Guarantee the bind source the same way the
+    # recipe seams above are guaranteed: an empty placeholder,
+    # owned by the container's root mapping like the real
+    # record. Nothing reads it (the init skips MariaDB for
+    # db=none; the native runtime never looks), and if the
+    # site ever gains a database, provisioning's atomic write
+    # replaces it with the real credentials.
+    OH_BASE=${ONIONHOST_CONTAINER_UID_BASE:-2300000}
+    OH_WWW=$((OH_BASE + 33))
+    if [ "$dbmode" = "none" ] && [ ! -f "$OUT/app-db.env" ]; then
+        tmp="$OUT/.app-db.env.tmp"
+        printf '%s\n' '# OnionHost: this site has no application' \
+            '# database (db=none), so there are no database' \
+            '# credentials. This placeholder exists because the' \
+            '# app container unit bind-mounts this path; see' \
+            '# onionhost-generate-configs.' > "$tmp"
+        chown "$OH_BASE:$OH_BASE" "$tmp"
+        chmod 0400 "$tmp"
+        mv "$tmp" "$OUT/app-db.env"
+    fi
+    # App-data volume skeleton (A12.3): www = the docroot owners
+    # fill, db = MariaDB's datadir (the container's init chowns it
+    # to the mysql user), native = the native-binary slot. Only
+    # freshly created dirs get container ownership here -
+    # onionhost-app-provision manages the owner's access modes and
+    # they must survive re-renders.
+    #
+    # The two app-writable roots (www, native) are born in the
+    # SAME end state provision asserts: owned by the www-data
+    # mapping, uid AND group, mode 02775. The group must be a
+    # mapped id: a directory whose group is outside the
+    # container's gid map refuses every create through the
+    # gVisor stack (D7/D8 - the native root was born with the
+    # container root's uid and later the desktop owner's group,
+    # and a fresh native install died at first boot both times).
+    # (The id base is env-overridable for test venues only, as
+    # in onionhost-app-provision; production never sets it.)
+    for d in /var/lib/onionhost/appdata /var/lib/onionhost/appdata/db; do
+        if [ ! -d "$d" ]; then
+            mkdir -p "$d"
+            chown "$OH_BASE:$OH_BASE" "$d"
+            chmod 0755 "$d"
+        fi
+    done
+    for d in /var/lib/onionhost/appdata/www \
+             /var/lib/onionhost/appdata/native; do
+        if [ ! -d "$d" ]; then
+            mkdir -p "$d"
+            chown "$OH_WWW:$OH_WWW" "$d"
+            chmod 02775 "$d"
+        fi
+    done
+    if [ ! -f "$OUT/app.conf" ]; then
+        printf 'APPDATA_QUOTA_BYTES=21474836480\n' > "$OUT/app.conf"
+        chmod 0644 "$OUT/app.conf"
+    fi
+    echo "onionhost-generate-configs: app site (runtime=$runtime):" \
+         "rendered nginx-app.conf, php-fpm-app.conf, my-app.cnf," \
+         "app-init.sh"
+fi
+# Update channel (Gate 4): the apt sources are golden config too.
+# Both the project repo and Debian ride tor+http through container U
+# (see /etc/apt/apt.conf.d/52onionhost-tor-updates). Render them into
+# sources.list.d, and retire any legacy clearnet /etc/apt/sources.list
+# the installer wrote - exactly once, keeping a .bak for forensics.
+# After this runs, the only way apt can fetch anything is Tor.
+mkdir -p /etc/apt/sources.list.d
+for name in onionhost debian; do
+    tmp="/etc/apt/sources.list.d/.$name.sources.tmp"
+    cp "$GOLDEN/apt-$name.sources.tmpl" "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "/etc/apt/sources.list.d/$name.sources"
+done
+if [ -f /etc/apt/sources.list ] && \
+   grep -Eq '^[[:space:]]*deb' /etc/apt/sources.list && \
+   ! grep -q 'tor+http' /etc/apt/sources.list; then
+    mv /etc/apt/sources.list /etc/apt/sources.list.onionhost.bak
+    printf '%s\n' '# Retired by onionhost-generate-configs (Gate 4):' \
+        '# all update sources are the tor+http files in' \
+        '# /etc/apt/sources.list.d/. Original kept as' \
+        '# /etc/apt/sources.list.onionhost.bak.' \
+        > /etc/apt/sources.list
+fi
+echo "onionhost-generate-configs: rendered torrc, client-torrc, nginx.conf, apt sources"

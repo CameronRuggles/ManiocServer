@@ -1,0 +1,85 @@
+# OnionHost app container - the dynamic tier's website (slice 6B,
+# DESIGN-v3 A12/A20; gate round POC-RESULTS "SLICE 6 GATE ROUND").
+#
+# This is container B's successor for "app" sites: ONE combined
+# gVisor sandbox running nginx + the app runtime (PHP-FPM, or an
+# owner-supplied native program) + MariaDB as processes, started by
+# /etc/onionhost/app-init.sh. Like B it has NO network (Network=none
+# here AND runsc-wrap forces --network=none for app-init bundles).
+# The PHP-FPM and MariaDB sockets are sandbox-internal; the only
+# socket that crosses the boundary is the nginx edge listener on
+# b1.sock in /run/onionhost/web - the same name the static B uses,
+# behind the same host-owned http.sock symlink container A targets.
+# A, the torrc and the firewall story are unchanged.
+#
+# Selection by site kind: this unit starts only when the app-site
+# marker exists (onionhost-publish / onionhost-app-provision write
+# it when the owner chooses an app site; the static B carries the
+# negated condition). Read-only rootfs; everything writable lives
+# on the app-data volume (/srv/appdata: www/ the docroot owners
+# fill, db/ MariaDB's datadir, native/ the native slot).
+[Unit]
+Description=OnionHost app - dynamic website (no network)
+ConditionPathExists=/var/lib/onionhost/app-site
+Wants=onionhost-config.service onionhost-images.service
+After=onionhost-config.service onionhost-images.service
+
+[Container]
+Image=localhost/onionhost-app:latest
+ContainerName=onionhost-app
+PodmanArgs=--runtime=runsc-wrap
+Network=none
+# Same fixed userns map as B (container root is always host uid
+# 2300000): the app container occupies B's slot in the design.
+UIDMap=0:2300000:65536
+GIDMap=0:2300000:65536
+ReadOnly=true
+Tmpfs=/tmp
+# The sandbox-internal service sockets (MariaDB, PHP-FPM, the
+# native app) live in /run; it must be a writable tmpfs (the app
+# init loosens it to 1777 - socket files there are per-service
+# owned and never leave the sandbox).
+Tmpfs=/run
+EnvironmentFile=/etc/onionhost/app-runtime.env
+Volume=/run/onionhost/web:/run/onionhost/web
+Volume=/var/lib/onionhost/appdata:/srv/appdata
+Volume=/etc/onionhost/nginx-app.conf:/etc/onionhost/nginx-app.conf:ro
+Volume=/etc/onionhost/php-fpm-app.conf:/etc/onionhost/php-fpm-app.conf:ro
+Volume=/etc/onionhost/my-app.cnf:/etc/onionhost/my-app.cnf:ro
+Volume=/etc/onionhost/app-init.sh:/etc/onionhost/app-init.sh:ro
+Volume=/etc/onionhost/app-db.env:/etc/onionhost/app-db.env:ro
+# The A23 recipe seams: the golden configs include these files
+# (nginx-app-extra.conf inside the server block, the FPM fragment
+# in the pool), and the app init reads the normaliser exception
+# list - all three must be mounted or the includes fail and the
+# sandbox never starts. generate-configs renders comment-only
+# placeholders before first start so the bind sources are always
+# real files; onionhost-recipe replaces their contents for sites
+# that use a packaged recipe.
+Volume=/etc/onionhost/nginx-app-extra.conf:/etc/onionhost/nginx-app-extra.conf:ro
+Volume=/etc/onionhost/php-fpm-app-extra.conf:/etc/onionhost/php-fpm-app-extra.conf:ro
+Volume=/etc/onionhost/normalize-exceptions:/etc/onionhost/normalize-exceptions:ro
+Exec=/bin/sh /etc/onionhost/app-init.sh
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Repo Review 3 task 17 (finding S11): judge this container's
+# runtime the moment it starts, not at the timer's next run (up to
+# 5 minutes later). The check inspects every OnionHost container
+# and stops any unit not running runsc-wrap. The leading '-' keeps
+# a violation found in ANOTHER unit (or a gate error) from marking
+# THIS unit failed and restarting it; enforcement is the check's
+# own stop + latch, and the 5-minute timer keeps re-checking.
+ExecStartPost=-/usr/local/bin/onionhost-runtime-gate-check
+# Same socket reasoning as B: A's tor (a different userns uid) must
+# be able to connect to the edge socket nginx creates here.
+UMask=0000
+# Ceilings (A5): the app sandbox is the fat one (DB + PHP + the
+# owner's code). The bounds keep a runaway or compromised app from
+# starving Tor and the host; sized for the A13 floor machine.
+MemoryMax=3G
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

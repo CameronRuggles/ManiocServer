@@ -1,0 +1,15 @@
+[Unit]
+Description=OnionHost update schedule (DESIGN-v3 A6/Y7)
+
+[Timer]
+# Midnight UTC + up to 24h of per-machine random delay: every
+# install checks at its own scattered time, A rebuilds/republishes
+# never happen fleet-wide in lockstep, and the repo mirror cannot
+# count the fleet by the hour.
+OnCalendar=*-*-* 00:00:00 UTC
+RandomizedDelaySec=24h
+Persistent=true
+Unit=onionhost-update.service
+
+[Install]
+WantedBy=timers.target

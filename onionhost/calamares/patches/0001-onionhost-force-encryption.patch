@@ -1,0 +1,176 @@
+--- a/src/modules/partition/gui/ChoicePage.cpp
++++ b/src/modules/partition/gui/ChoicePage.cpp
+@@ -507,7 +507,7 @@
+         PartitionActions::Choices::AutoPartitionOptions options { gs->value( "defaultPartitionTableType" ).toString(),
+                                                                   m_config->eraseFsType(),
+                                                                   m_config->luksFileSystemType(),
+-                                                                  m_encryptWidget->passphrase(),
++                                                                  effectiveLuksPassphrase(),
+                                                                   gs->value( "efiSystemPartition" ).toString(),
+                                                                   Calamares::GiBtoBytes(
+                                                                       gs->value( "requiredStorageGiB" ).toDouble() ),
+@@ -656,6 +656,38 @@
+     updateNextEnabled();
+ }
+ 
++// === OnionHost patch: forced encryption ==========================
++// The OnionHost phrase step runs before this page and stores the
++// generated disk phrase, obscured, in GlobalStorage under
++// "onionhostGeneratedPhrase". While that key is present, the
++// generated phrase is the ONLY passphrase an automated install may
++// use: layouts are queued with it regardless of the encrypt
++// widget's state, the widget's own passphrase fields are ignored
++// (and kept hidden, see EncryptWidget), and onLeave() does not
++// overwrite the stored value. Without the key, this module behaves
++// exactly like stock Calamares 3.3.14.
++bool
++ChoicePage::onionhostPhraseDriven() const
++{
++    auto* gs = Calamares::JobQueue::instance()->globalStorage();
++    return gs && gs->contains( QStringLiteral( "onionhostGeneratedPhrase" ) )
++        && !gs->value( QStringLiteral( "onionhostGeneratedPhrase" ) ).toString().isEmpty();
++}
++
++QString
++ChoicePage::effectiveLuksPassphrase() const
++{
++    if ( onionhostPhraseDriven() )
++    {
++        auto* gs = Calamares::JobQueue::instance()->globalStorage();
++        // Calamares::String::obscure() is its own inverse: applying
++        // it to the stored (obscured) value yields the plain phrase.
++        return Calamares::String::obscure(
++            gs->value( QStringLiteral( "onionhostGeneratedPhrase" ) ).toString() );
++    }
++    return m_encryptWidget->passphrase();
++}
++
+ void
+ ChoicePage::onEncryptWidgetStateChanged()
+ {
+@@ -693,8 +725,13 @@
+ {
+     Calamares::GlobalStorage* gs = Calamares::JobQueue::instance()->globalStorage();
+     const bool useLuksPassphrase = ( m_encryptWidget->state() == EncryptWidget::Encryption::Confirmed );
++    // OnionHost patch: in the generated-phrase flow, keep the phrase
++    // step's stored value (already obscured). The widget's state must
++    // never overwrite it with an empty or user-typed value.
+     const QString storedLuksPassphrase
+-        = useLuksPassphrase ? Calamares::String::obscure( m_encryptWidget->passphrase() ) : QString();
++        = onionhostPhraseDriven()
++        ? gs->value( QStringLiteral( "onionhostGeneratedPhrase" ) ).toString()
++        : ( useLuksPassphrase ? Calamares::String::obscure( effectiveLuksPassphrase() ) : QString() );
+     gs->insert( "luksPassphrase", storedLuksPassphrase );
+ 
+     if ( m_config->installChoice() == InstallChoice::Alongside )
+@@ -788,7 +825,7 @@
+                                  newLastSector + 2,
+                                  oldLastSector,
+                                  m_config->luksFileSystemType(),
+-                                 m_encryptWidget->passphrase(),
++                                 effectiveLuksPassphrase(),
+                                  candidate->parent(),
+                                  candidate->roles() );
+             m_core->dumpQueue();
+@@ -861,7 +898,7 @@
+                                          selectedPartition->firstSector(),
+                                          selectedPartition->lastSector(),
+                                          m_config->luksFileSystemType(),
+-                                         m_encryptWidget->passphrase(),
++                                         effectiveLuksPassphrase(),
+                                          newParent,
+                                          newRoles );
+                 }
+@@ -896,7 +933,7 @@
+                                                               { gs->value( "defaultPartitionType" ).toString(),
+                                                                 m_config->replaceModeFilesystem(),
+                                                                 m_config->luksFileSystemType(),
+-                                                                m_encryptWidget->passphrase() } );
++                                                                effectiveLuksPassphrase() } );
+                         Partition* homePartition = findPartitionByPath( { selectedDevice() }, *homePartitionPath );
+ 
+                         if ( homePartition && doReuseHomePartition )
+@@ -1054,6 +1091,7 @@
+         if ( m_enableEncryptionWidget )
+         {
+             m_encryptWidget->show();
++            m_encryptWidget->setPassphraseFieldsSuppressed( onionhostPhraseDriven() );
+             if ( m_config->preCheckEncryption() && !m_preCheckActivated )
+             {
+                 m_encryptWidget->setEncryptionCheckbox( true );
+@@ -1114,6 +1152,7 @@
+         if ( shouldShowEncryptWidget( choice ) )
+         {
+             m_encryptWidget->show();
++            m_encryptWidget->setPassphraseFieldsSuppressed( onionhostPhraseDriven() );
+             if ( m_config->preCheckEncryption() && !m_preCheckActivated )
+             {
+                 m_encryptWidget->setEncryptionCheckbox( true );
+@@ -1539,7 +1578,7 @@
+ 
+     // You can have an invisible encryption checkbox, which is
+     // still checked -- then do the encryption.
+-    if ( m_config->installChoice() != InstallChoice::Manual
++    if ( m_config->installChoice() != InstallChoice::Manual && !onionhostPhraseDriven()
+          && ( m_encryptWidget->isVisible() || m_encryptWidget->isEncryptionCheckboxChecked() ) )
+     {
+         switch ( m_encryptWidget->state() )
+--- a/src/modules/partition/gui/ChoicePage.h
++++ b/src/modules/partition/gui/ChoicePage.h
+@@ -109,6 +109,9 @@
+ 
+ private:
+     bool calculateNextEnabled() const;
++    // OnionHost patch: generated-phrase flow (see ChoicePage.cpp).
++    bool onionhostPhraseDriven() const;
++    QString effectiveLuksPassphrase() const;
+     void updateNextEnabled();
+     void setupChoices();
+     void checkInstallChoiceRadioButton( Config::InstallChoice choice );  ///< Sets the chosen button to "on"
+--- a/src/modules/partition/gui/EncryptWidget.cpp
++++ b/src/modules/partition/gui/EncryptWidget.cpp
+@@ -84,6 +84,12 @@
+ }
+ 
+ void
++EncryptWidget::setPassphraseFieldsSuppressed( bool suppress )
++{
++    m_suppressPassphraseFields = suppress;
++}
++
++void
+ EncryptWidget::reset( bool checkVisible )
+ {
+     m_ui->m_passphraseLineEdit->clear();
+@@ -206,7 +212,7 @@
+ void
+ EncryptWidget::onCheckBoxStateChanged( Calamares::checkBoxStateType checked )
+ {
+-    const bool visible = ( checked != Calamares::checkBoxUncheckedValue );
++    const bool visible = ( checked != Calamares::checkBoxUncheckedValue ) && !m_suppressPassphraseFields;
+     m_ui->m_passphraseLineEdit->setVisible( visible );
+     m_ui->m_confirmLineEdit->setVisible( visible );
+     m_ui->m_iconLabel->setVisible( visible );
+--- a/src/modules/partition/gui/EncryptWidget.h
++++ b/src/modules/partition/gui/EncryptWidget.h
+@@ -41,6 +41,12 @@
+     void setEncryptionCheckbox( bool preCheckEncrypt = false );
+     void reset( bool checkVisible = true );
+ 
++    // OnionHost patch: when set, ticking the checkbox never reveals
++    // the passphrase fields (set by ChoicePage in the
++    // generated-phrase flow, where the passphrase comes from
++    // GlobalStorage, not from anything typed into this widget).
++    void setPassphraseFieldsSuppressed( bool suppress );
++
+     bool isEncryptionCheckboxChecked();
+     Encryption state() const;
+     void setText( const QString& text );
+@@ -65,6 +71,7 @@
+ 
+     Ui::EncryptWidget* m_ui;
+     Encryption m_state;
++    bool m_suppressPassphraseFields = false;
+ 
+     FileSystem::Type m_filesystem;
+ };

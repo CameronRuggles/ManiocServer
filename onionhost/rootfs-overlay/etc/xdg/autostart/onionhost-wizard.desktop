@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Manioc Server Setup
+Comment=Resume Manioc Server first-run setup (no-op once setup is complete)
+Exec=/usr/bin/python3 /usr/lib/onionhost/wizard.py
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

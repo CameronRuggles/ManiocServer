@@ -1,0 +1,6 @@
+---
+type:       "job"
+name:       "onionhostgrubstub"
+interface:  "python"
+script:     "main.py"
+weight:     0.5

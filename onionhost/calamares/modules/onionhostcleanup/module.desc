@@ -1,0 +1,6 @@
+---
+type:       "job"
+name:       "onionhostcleanup"
+interface:  "python"
+script:     "main.py"
+weight:     1.0

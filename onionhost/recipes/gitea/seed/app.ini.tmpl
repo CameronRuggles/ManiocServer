@@ -1,0 +1,82 @@
+; Gitea configuration - OnionHost packaged recipe (A23).
+;
+; This file is RENDERED by onionhost-recipe at first install
+; with this machine's own values: the site's onion address,
+; the owner's site title, and the secret keys below, which are
+; generated on this machine at install time - the bracketed
+; tokens are substituted by the applier and the rendered file
+; exists only on this machine (and in its encrypted backups).
+; After first install the file is the site's own state: the
+; recipe never renders it again, and the owner (or Gitea's
+; admin panel) may change anything in it.
+;
+; The shape is the sealed room's: Gitea listens ONLY on the
+; app slot's unix socket (the platform's nginx edge proxies
+; it), SSH git access is off (the socket is the only door),
+; the mailer is off (the site cannot send mail), mirroring is
+; off (it would fetch from the internet), and registration
+; starts closed - the owner can open it in the admin panel.
+
+APP_NAME = __SITE_TITLE__
+RUN_MODE = prod
+
+[server]
+; http+unix: HTTP served over the unix socket the native
+; slot's contract names ($ONIONHOST_APP_SOCKET's path).
+PROTOCOL = http+unix
+HTTP_ADDR = /run/app.sock
+DOMAIN = __ONION__
+ROOT_URL = http://__ONION__/
+; The edge is the only way in and its Host is always the
+; onion: never derive public URLs from request headers.
+PUBLIC_URL_DETECTION = never
+; Git over SSH is not offered: the sealed design has exactly
+; one door (the onion service to the edge socket), and clone /
+; push ride HTTPS through it.
+DISABLE_SSH = true
+
+[database]
+; Gitea's own store is a single SQLite file on the app-data
+; volume - no database server is involved (the platform
+; provisions this site with no MariaDB credentials at all).
+DB_TYPE = sqlite3
+PATH = /srv/appdata/native/data/gitea.db
+
+[security]
+; The web installer stays locked off, permanently: the
+; recipe's first-boot step creates the administrator with
+; Gitea's own CLI, and an unlockable installer page would be
+; an open door with the same power.
+INSTALL_LOCK = true
+SECRET_KEY = __SECRET_KEY__
+INTERNAL_TOKEN = __INTERNAL_TOKEN__
+
+[service]
+; Accounts are the owner's to open: registration starts
+; disabled; the admin panel can enable it (members then
+; register through the site like any Gitea instance - their
+; confirmation mail cannot leave, so the admin creates or
+; approves accounts with that in mind).
+DISABLE_REGISTRATION = true
+
+[mailer]
+; No mail leaves the sealed room (there is no MTA and no
+; network for one); notifications and password mail are off
+; at the source rather than failing one by one.
+ENABLED = false
+
+[picture]
+; Gravatar would put a hash of every member's email address
+; into pages for visitors' browsers to fetch - off. Members
+; can upload avatars, which are served locally.
+DISABLE_GRAVATAR = true
+
+[mirror]
+; Mirrors fetch from (and push to) the internet: off entirely,
+; for existing and new mirrors alike.
+ENABLED = false
+
+[log]
+; Logs go to the container's console, where the platform's
+; journal keeps them - not to files in the data volume.
+MODE = console

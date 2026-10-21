@@ -1,0 +1,23 @@
+#!/bin/bash
+# Stub podman driven by $PODMAN_STUB_DIR: <name>.runtime file = present
+# container with that OCIRuntime; flag files broken / fail_inspect_<n> /
+# fail_exists_<n> / garbage_<n> simulate error classes.
+D=${PODMAN_STUB_DIR:?}
+if [ "$1" = "--version" ]; then
+  [ -e "$D/broken" ] && exit 1
+  echo "podman version 5.2.0"; exit 0
+fi
+if [ "$1" = "container" ] && [ "$2" = "exists" ]; then
+  n=$3
+  [ -e "$D/fail_exists_$n" ] && exit 125
+  [ -e "$D/$n.runtime" ] && exit 0
+  exit 1
+fi
+if [ "$1" = "inspect" ]; then
+  n=$2
+  [ -e "$D/fail_inspect_$n" ] && { echo "Error: storage lock timeout" >&2; exit 125; }
+  [ -e "$D/$n.runtime" ] || { echo "Error: no such container" >&2; exit 125; }
+  [ -e "$D/garbage_$n" ] && { echo "not-json"; exit 0; }
+  printf '[{"OCIRuntime": "%s"}]\n' "$(cat "$D/$n.runtime")"; exit 0
+fi
+echo "stub podman: unhandled $*" >&2; exit 125

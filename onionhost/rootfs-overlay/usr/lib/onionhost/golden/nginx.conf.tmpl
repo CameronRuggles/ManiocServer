@@ -1,0 +1,39 @@
+# OnionHost golden nginx config for container B (the website).
+# Rendered to /etc/onionhost/nginx.conf by onionhost-generate-configs.
+# B has NO network (Quadlet Network=none + runsc --network=none): it only
+# listens on a unix socket in the shared /run/onionhost/web directory.
+# Rotation (DESIGN-v3 A8): instances listen on b1.sock / b2.sock; tor
+# targets the fixed host-owned symlink http.sock. This skeleton runs a
+# single instance on b1.sock.
+# Content (slice 4): the docroot is /srv/site/current, a host-owned
+# symlink into /srv/site/releases/<n>. onionhost-publish builds a
+# complete new release tree and atomically renames the symlink; the
+# running nginx resolves the symlink per request (verified on the
+# installed stack: swaps, new files and in-place edits under the
+# mount are all visible without a restart), so a visitor sees either
+# the whole old release or the whole new one, never a half-written
+# tree.
+load_module /usr/lib/nginx/modules/ngx_http_headers_more_filter_module.so;
+user www-data;
+pid /tmp/nginx.pid;
+error_log /dev/stderr notice;
+worker_processes 1;
+events { worker_connections 256; }
+http {
+    access_log off;
+    server_tokens off;
+    more_clear_headers Date;
+    sendfile on;
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+    server {
+        listen unix:/run/onionhost/web/b1.sock;
+        root /srv/site/current;
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+}

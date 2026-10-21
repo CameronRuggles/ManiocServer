@@ -1,0 +1,49 @@
+# OnionHost container A - Tor onion-service gateway (DESIGN-v3 A4/A5).
+# Rootful Podman + Quadlet + runsc via the runsc-wrap runtime (A18).
+# A holds the onion private key (in /var/lib/onionhost/tor) and is the
+# only container with real egress. It attaches to the dedicated
+# onionhost bridge network (see onionhost.network): gVisor cannot
+# join the host netns from inside the --userns=auto user namespace
+# (measured on the installed system; A18's host-net recipe predates
+# userns=auto on A). Outbound-only is all an onion gateway needs.
+# The nft gate binds: if the live firewall table differs from golden,
+# this unit must not start (A8 fail-closed).
+[Unit]
+Description=OnionHost A - Tor gateway
+Wants=network-online.target onionhost-config.service onionhost-images.service onionhost-nft-load.service onionhost-network.service
+After=network-online.target onionhost-config.service onionhost-images.service onionhost-nft-load.service onionhost-network.service
+BindsTo=onionhost-nft-gate.service
+After=onionhost-nft-gate.service
+
+[Container]
+Image=localhost/onionhost-tor:latest
+ContainerName=onionhost-a
+PodmanArgs=--runtime=runsc-wrap
+Network=onionhost
+# Private user namespace with a FIXED map (refines A5's userns=auto):
+# container root is always host uid 2100000, so the state volumes can
+# be deterministically owned by it (see onionhost-generate-configs).
+# Auto allocation made volume ownership a lottery per recreate.
+UIDMap=0:2100000:65536
+GIDMap=0:2100000:65536
+ReadOnly=true
+Volume=/var/lib/onionhost/tor:/var/lib/onionhost/tor
+Volume=/run/onionhost/web:/run/onionhost/web
+Volume=/run/onionhost/control:/run/onionhost/control
+Volume=/etc/onionhost/torrc:/etc/tor/torrc:ro
+Exec=tor -f /etc/tor/torrc
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Repo Review 3 task 17 (finding S11): judge this container's
+# runtime the moment it starts, not at the timer's next run (up to
+# 5 minutes later). The check inspects every OnionHost container
+# and stops any unit not running runsc-wrap. The leading '-' keeps
+# a violation found in ANOTHER unit (or a gate error) from marking
+# THIS unit failed and restarting it; enforcement is the check's
+# own stop + latch, and the 5-minute timer keeps re-checking.
+ExecStartPost=-/usr/local/bin/onionhost-runtime-gate-check
+
+[Install]
+WantedBy=multi-user.target

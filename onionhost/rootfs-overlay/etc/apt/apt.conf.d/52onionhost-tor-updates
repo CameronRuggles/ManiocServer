@@ -1,0 +1,27 @@
+// OnionHost Gate 4: ALL apt traffic goes through container U's
+// client-only Tor, and only through it (DESIGN-v3 A4/A6).
+//
+// - tor+http:// sources are served by the method shipped in the
+//   onionhost package (/usr/lib/apt/methods/tor+http), which speaks
+//   SOCKS5 over U's unix socket. The stock method cannot address a
+//   unix socket (measured: it silently falls back to a direct dial),
+//   which is why the platform ships its own.
+// - The plain http/https methods are disabled outright, following
+//   the apt-transport-tor hardening guidance: a source added without
+//   tor+ fails closed instead of leaking onto the clearnet.
+// - No apt traffic ever goes via gateway A (it has SocksPort 0 and
+//   carries the site's identity; update fetches must not touch it).
+Acquire::tor::Proxy "unix:///run/onionhost/client/socks/sock";
+// U's socket directory is 0700, owned by U's uid - deliberately:
+// only root and U may touch it (the same reason the Dashboard probe
+// goes through the root wizard-helper). apt's download sandbox user
+// (_apt) could not even traverse that directory, so fetches run as
+// root inside the root-owned updater. The method only ever writes
+// into apt's own cache directories.
+APT::Sandbox::User "root";
+Dir::Bin::Methods::http "false";
+Dir::Bin::Methods::https "false";
+// Update fetches need no translations; skipping them halves Tor
+// traffic and leaks nothing about the owner's languages.
+Acquire::Languages "none";
+Acquire::Retries "3";

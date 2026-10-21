@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-grub-stub: re-apply the passphrase retry loop to the
+ESP GRUB stub on the RUNNING system.
+
+The installer applies the loop once (Calamares job
+onionhostgrubstub). A grub-efi package update can regenerate the
+stub via grub-install and silently drop the loop; this tool exists
+so the change can be re-applied (an apt Post-Invoke hook calls it
+after package operations, and Maintenance can run it by hand).
+Keep the transformation in sync with the installer job.
+
+Root only. Exit 0 if the loop is present afterwards, 1 otherwise.
+"""
+import os
+import re
+import sys
+
+MARKER = "OnionHost passphrase retry loop"
+STUB_CANDIDATES = ["/boot/efi/EFI/debian/grub.cfg",
+                   "/boot/efi/EFI/BOOT/grub.cfg"]
+
+
+def loopify(stub_text):
+    if MARKER in stub_text:
+        return stub_text, False
+    lines = stub_text.splitlines()
+    idx = None
+    for i, line in enumerate(lines):
+        if re.match(r"\s*cryptomount\b", line):
+            idx = i
+            break
+    if idx is None:
+        return None, "no cryptomount line found in the GRUB stub"
+    cmd = lines[idx].strip()
+    block = [
+        "# %s: a wrong passphrase re-prompts here instead of" % MARKER,
+        "# dropping to a rescue shell. The loop is indefinite on",
+        "# purpose - the PBKDF2 delay (~9 s) is the rate limit, and a",
+        "# cap could strand the owner (mistakes, stuck keys, layout",
+        "# changes).",
+        'echo "This computer is locked with a passphrase."',
+        'echo "Type the passphrase from your paper copy, then press Enter."',
+        'echo "The screen stays blank while you type - that is normal."',
+        cmd,
+        "while [ $? != 0 ]; do",
+        '    echo ""',
+        '    echo "That passphrase was not accepted."',
+        '    echo "Check that Caps Lock is off, then try again."',
+        "    " + cmd,
+        "done",
+    ]
+    lines[idx:idx + 1] = block
+    return "\n".join(lines) + "\n", True
+
+
+def main():
+    if os.geteuid() != 0:
+        print("onionhost-grub-stub: must run as root", file=sys.stderr)
+        return 1
+    for cand in STUB_CANDIDATES:
+        if os.path.exists(cand):
+            with open(cand) as f:
+                text = f.read()
+            new_text, changed = loopify(text)
+            if new_text is None:
+                print("onionhost-grub-stub: %s" % changed,
+                      file=sys.stderr)
+                return 1
+            if changed:
+                with open(cand, "w") as f:
+                    f.write(new_text)
+                fd = os.open(cand, os.O_RDONLY)
+                os.fsync(fd)
+                os.close(fd)
+                print("onionhost-grub-stub: retry loop applied to %s"
+                      % cand)
+            else:
+                print("onionhost-grub-stub: loop already present in %s"
+                      % cand)
+            return 0
+    print("onionhost-grub-stub: no GRUB stub found", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

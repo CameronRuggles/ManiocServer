@@ -1,0 +1,122 @@
+{
+ "admin_note": "You sign in to your marketplace with this name and password, and it makes you the marketplace's administrator (you approve sellers and look after reports under Moderation). The name must be 3-24 characters: lowercase letters, numbers, _ or -. The password needs at least 12 characters and must not be a common one. Your marketplace starts on Monero's stagenet - test coins, no real money - and stays there; moving to real funds is a separate decision the software itself makes you confirm in writing.",
+ "admin_password_min": 12,
+ "admin_user_max": 24,
+ "app": {
+  "license": "AGPL-3.0-or-later",
+  "name": "Polyculture Markets",
+  "source": "Cameron's Monero marketplace (spec v2, Stage 10 tree - the MVP-complete candidate frozen 2026-10-16), built from source for this recipe. Two binaries ship: marketplace-app (the server) and its media-worker helper, staged beside it. The application never migrates its own database: its migrations 0001-0009 ship in this recipe and are applied by the recipe's migrate step inside the app container, the same marker-ledger way the project's own deploy tooling applies them. Provenance: built from the public companion repository (https://github.com/CameronRuggles/polyculture-markets) at the pinned commit recorded in source_build below - the frozen Stage 10 tree (gate 487 passed / 0 failed); release build in the recipe venue; the .deb manifest carries the binary's sha256.",
+  "version": "0.1.0"
+ },
+ "archive": {
+  "file": "marketplace-app-0.1.0-linux-amd64",
+  "format": "file",
+  "sha256": "f56191a01a07a1cf3acff5b9cc2c066fb8630438e58b5451139a4891dd0b0f25",
+  "url": "https://github.com/CameronRuggles/polyculture-markets"
+ },
+ "db": {
+  "engine": "postgres",
+  "required": true
+ },
+ "default_title": "My Marketplace",
+ "description": "Your own marketplace - sellers list goods, buyers pay them directly in Monero (no escrow, no funds through this computer), and messages stay encrypted between the people in them.",
+ "first_boot": true,
+ "id": "marketplace",
+ "name": "Marketplace (Polyculture Markets)",
+ "native_config": {
+  "dst": "app.env",
+  "src": "seed/app.env.tmpl"
+ },
+ "native_files": [
+  {
+   "dst": "media-worker",
+   "mode": "0755",
+   "sha256": "90d33c5131ad8b561aaec67787c7aa5ad182a80bb7fd4e1536bbb496e49b75f8",
+   "src": "files/media-worker"
+  },
+  {
+   "dst": "first-boot.sh",
+   "mode": "0755",
+   "sha256": "7e2434f0b218470b6816d795e9b66fae63811280fa87373546e59f50183e408a",
+   "src": "files/first-boot.sh"
+  },
+  {
+   "dst": "migrate.sh",
+   "mode": "0755",
+   "sha256": "57e77bde98ddd87c3c9daa660cbab3456c69303504df3c7aa20e35a672da3797",
+   "src": "files/migrate.sh"
+  },
+  {
+   "dst": "migrations/0001_initial.sql",
+   "mode": "0644",
+   "sha256": "b60101a6f0f5131908176874685bc50bcc77209b57f458fc6fc15578766bb043",
+   "src": "files/migrations/0001_initial.sql"
+  },
+  {
+   "dst": "migrations/0002_session_csrf.sql",
+   "mode": "0644",
+   "sha256": "7a8afe4f88300064aad05630d028d5a857d99990af15d2009065bc7b4c3464c2",
+   "src": "files/migrations/0002_session_csrf.sql"
+  },
+  {
+   "dst": "migrations/0003_listing_category.sql",
+   "mode": "0644",
+   "sha256": "42a2eae3b6cd49d5c5e81506d9a773dddebfe41da0820b7dcdb48346b815f894",
+   "src": "files/migrations/0003_listing_category.sql"
+  },
+  {
+   "dst": "migrations/0004_profile_text.sql",
+   "mode": "0644",
+   "sha256": "adcd140a6fa2f96b3139aff7c9cb6293d635495b3e6a138f3a683f97d6062e11",
+   "src": "files/migrations/0004_profile_text.sql"
+  },
+  {
+   "dst": "migrations/0005_listing_terms.sql",
+   "mode": "0644",
+   "sha256": "a510c636803c38ceca34c1cc4cafa28f7af018215c8d0fa6c791c6bb701c06e2",
+   "src": "files/migrations/0005_listing_terms.sql"
+  },
+  {
+   "dst": "migrations/0006_conversation_key_sightings.sql",
+   "mode": "0644",
+   "sha256": "dfca651315e3f92d741a0e95b008c2db1679241843fabcb4f9a05a18bdfa736c",
+   "src": "files/migrations/0006_conversation_key_sightings.sql"
+  },
+  {
+   "dst": "migrations/0007_unify_key_sightings.sql",
+   "mode": "0644",
+   "sha256": "ac6ffab78ca761b66b9442df94be11cf82349f32292d5f923af83a78c4ac56ed",
+   "src": "files/migrations/0007_unify_key_sightings.sql"
+  },
+  {
+   "dst": "migrations/0008_direct_payments_v1.sql",
+   "mode": "0644",
+   "sha256": "abb5db8b50a99da407b53fa458fe6b44ded8c4aeec540b74e9c722868d33d4e1",
+   "src": "files/migrations/0008_direct_payments_v1.sql"
+  },
+  {
+   "dst": "migrations/0009_stage9.sql",
+   "mode": "0644",
+   "sha256": "e965ea47d07513510f319b02af0f733e03f8c24e6a46d6bff83a9548999dbe5b",
+   "src": "files/migrations/0009_stage9.sql"
+  }
+ ],
+ "native_serve": {
+  "port": 8080,
+  "type": "tcp"
+ },
+ "runtime": "native",
+ "source_build": {
+  "build_command": "cd marketplace && cargo build --release --locked -p app -p media-worker",
+  "commit": "22a1eb587c4c587365b0816cb8a1db4e21b1e55f",
+  "commit_note": "The recipe was built 2026-10-17 from the frozen Stage 10 tree (MVP complete, frozen 2026-10-16) plus the 2026-10-17 fix batch, in a local workspace; that tree is recorded publicly as this commit (the companion repo's initial public commit, 'spec v2 MVP (stages 0-10) + Direct Payments v1 + 2026-10-17 fix batch'). Content match verified 2026-10-20: the nine shipped migrations are byte-identical to marketplace/migrations/ at this commit, and this commit's migration set is exactly 0001-0009 (0010+ arrived later). The two binaries are NOT byte-verifiable against the commit: Rust release builds are not byte-reproducible, so the archive.sha256 / native_files sha256 pins in this file are the record of what was built and shipped.",
+  "outputs": {
+   "marketplace-app": "target/release/marketplace-app -> archive/marketplace-app-0.1.0-linux-amd64",
+   "media-worker": "target/release/media-worker -> files/media-worker"
+  },
+  "repo": "https://github.com/CameronRuggles/polyculture-markets",
+  "source_license": "AGPL-3.0-or-later - source for the shipped binaries is the repo above at the pinned commit",
+  "toolchain": "Rust 1.99.0 (pinned by marketplace/rust-toolchain.toml at the commit above)"
+ },
+ "version": "0.1.0+oh.1"
+}

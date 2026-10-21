@@ -1,0 +1,92 @@
+# Manioc Server repo .gitignore — prepared 2026-10-20, installed BEFORE
+# git init (same discipline as the Polyculture Markets scrub pass).
+# Principle: source, build scripts, docs and reports in; bulk binaries,
+# extracted OS/container trees, evidence captures and release images out.
+# Everything excluded here still lives on disk locally — this repo is a
+# public mirror, not the archive of record.
+
+# Release images (GitHub's file limit is 100 MB; ISOs ship as Release assets)
+releases/
+*.iso
+*.img
+*.qcow2
+
+# Vendored upstream archives and built binaries inside recipes
+onionhost/recipes/*/archive/
+
+# PoC laboratory: extracted app installs, container/runtime rigs, test
+# data, stock package downloads. The recipe source of truth is
+# onionhost/recipes/; from poc/ only the results write-up and the build
+# scripts are kept.
+poc/*
+!poc/POC-RESULTS.md
+!poc/scripts/
+!poc/runtime-gate/
+!poc/backup-proof/
+!poc/runsc-wrap/
+
+# Security-audit working bulk (the audit reports at audit/*.md stay in)
+audit/iso/
+audit/rootfs/
+audit/repo/
+audit/raw/
+
+# Evidence captures from rig/VM runs (screenshots, logs; the reports stay in)
+*-evidence/
+
+# Screenshot folders from rig/VM runs (Review 4, P15): the tracked
+# build/shots/ set stays tracked — these patterns only cover NEW
+# sibling folders following the shots-* convention, at the repo root
+# or beside build/shots/.
+/shots-*/
+build/shots-*/
+
+# Secrets and key material — never in history
+*.key
+*.pem
+*.gpg
+!onionhost/rootfs-overlay/usr/share/keyrings/onionhost-archive-keyring.gpg
+id_rsa
+id_ecdsa
+id_ed25519
+.env
+*.env
+hs_ed25519_*
+crypto_keyfile.bin
+*.age
+# Age identity files (secret keys — *.age above covers encrypted
+# files, not identities) and binary key exports / keyboxes under
+# names the *.gpg rule does not cover (Review 4, P15)
+*.agekey
+age-identity*
+*.pgp
+*.kbx
+# Cloud credential files (Review 4, P15)
+application_default_credentials.json
+*-credentials.json
+
+# Backups, database dumps and packet captures — never in history
+*.onionhost-backup
+*.sql.gz
+*.dump
+*.pcap
+*.pcapng
+
+# Disk images and package/archive bulk (beyond the release images above)
+*.vmdk
+*.vdi
+*.raw
+*.deb
+*.tar
+
+# Python / build scratch
+__pycache__/
+build/tmp/
+onionhost/calamares/modules/*/*.so
+
+# Editor and OS litter
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

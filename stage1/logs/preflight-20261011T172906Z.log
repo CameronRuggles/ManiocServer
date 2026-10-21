@@ -1,0 +1,18 @@
+=== OnionHost Stage 1 rig preflight — 20261011T172906Z (UTC) ===
+host: htch-runtime · kernel: 7.0.0-39-generic · os: Ubuntu 24.04.5 LTS
+FAIL    device-mapper: no /dev/mapper (Gate R would be environment-blocked, as in Stage 0)
+MISSING bin:cryptsetup absent (Gate R LUKS2 format/open/addkey)
+FAIL    /dev/kvm absent (nested virtualisation not enabled on this VM)
+FAIL    no vmx/svm flag in /proc/cpuinfo
+MISSING bin:qemu-system-x86_64 absent (KVM/QEMU guest for ISO tests)
+MISSING bin:podman absent (Gate 1 rootful-vs-rootless comparison (A5 data clause))
+PASS    bin:runsc present (gVisor runtime — MUST be the official binary, not Ubuntu's stale 2023 package)
+INFO    runsc version: runsc version 0.0~20230807.0
+INFO    PoC used official release-20251006.0 (sha512-verified). If this says 0.0~20230807, replace it before trusting any gate result.
+PASS    cgroup2 subtree_control reachable (fork-bomb / memory ceiling tests can be honest)
+MISSING bin:tor absent (Gate 1 A-in-gVisor egress + Gate 5 PoW calibration)
+PASS    bin:nft present (Gate 2b back-stop against a live drifted B; Gate 3 production table)
+PASS    bin:curl present (over-Tor fetch checks)
+INFO    cpu cores: 2 · mem: 7.7Gi · disk free on /: 7.3G
+=== preflight done — log: /home/hatch/workspace/onion-host-os/stage1/logs/preflight-20261011T172906Z.log ===
+Preflight only. Re-run with --install to apt-install the toolset.

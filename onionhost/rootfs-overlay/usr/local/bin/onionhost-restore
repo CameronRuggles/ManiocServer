@@ -1,0 +1,910 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-restore: restore an OnionHost backup (DESIGN-v3 A3,
+WALKTHROUGH C3/C4).
+
+Run as root, normally from the Maintenance console (the only
+surface that offers it: pre-login, after the disk is unlocked, no
+site services, no networking). The owner supplies:
+
+  * the backup file (found on an attached stick/drive, or --file),
+  * the DISK PASSPHRASE OF THE COMPUTER THE BACKUP WAS MADE ON,
+    typed at the console. The age identity is re-derived from
+    phrase + the salt stored in the backup's plain metadata and is
+    held only in a shredded-on-exit tmpfs file. Nothing is stored.
+
+Order of operations is the safety story:
+  1. read metadata, 2. derive + decrypt (a wrong phrase fails
+  HERE, before anything on the system has been touched),
+  3. verify the decrypted payload against its manifest (sha256 of
+  every file; the onion address recomputed from the restored
+  public key must match the manifest, the metadata and the
+  bundled hostname), 4. only then swap content, published trees
+  and the onion identity into place (each a rename swap, so a
+  failure leaves either the old or the new state, never a mix).
+
+What a restore deliberately does NOT touch (see onionhost-backup's
+header): account credentials - this install's own login words
+stand; this install's backup key record - future backups here open
+with THIS install's phrase; Tor guard state - a restored machine
+is a new network location and mints fresh guards.
+
+Wizard state after a successful restore: S1/S2 stay/become S2. At
+S0 (setup never finished) the state is left alone and a marker
+(/var/lib/onionhost/restored) tells the first-boot wizard to skip
+straight to "Your website is back" once login words are set.
+
+App sites (slice 6B, backup format 2): the app section installs
+the app-data trees (www/, native/) by the same rename swaps, the
+database credentials become this machine's /etc/onionhost/
+app-db.env, the site-kind marker + runtime are written, configs
+are re-rendered, and the database dump is staged on the app-data
+volume as db-import.sql.gz - the app container's init imports it
+into a fresh database on its next start (Maintenance runs no
+containers, so the import rides the proven boot path instead of
+being attempted here). A static backup restored onto a machine
+currently set up as an app site deselects the app slot again (the
+app data itself is left on disk, untouched); an app backup does
+the reverse.
+
+Backup formats: 1 (slice 5B, static only) and 2 (slice 6B) are
+both accepted; the install steps branch on the manifest's
+siteKind, which format 1 does not carry (absent = static).
+
+Every outcome is appended to /var/lib/onionhost/maintenance-log.txt
+and sent to the journal (WALKTHROUGH C4: Maintenance use is
+logged).
+
+Exit codes: 0 restored; 2 no backup found; 3 the phrase did not
+open the backup; 4 the backup is damaged or invalid; 1 other.
+"""
+import glob
+import hashlib
+import io
+import json
+import os
+import pwd
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/usr/lib/onionhost")
+import backupkeys  # noqa: E402
+
+SITE_DIR = "/var/lib/onionhost/site"
+RELEASES = os.path.join(SITE_DIR, "releases")
+CURRENT = os.path.join(SITE_DIR, "current")
+TOR_DIR = "/var/lib/onionhost/tor"
+HS_DIR = os.path.join(TOR_DIR, "hs")
+STATE_FILE = "/var/lib/onionhost/state"
+MARKER = "/var/lib/onionhost/restored"
+MAINT_LOG = "/var/lib/onionhost/maintenance-log.txt"
+TOR_UID = 2100000  # container A's root (Quadlet UIDMap, fixed)
+# The app container's id base is env-overridable for the
+# unit-test venues only, as in onionhost-recipe; production
+# never sets it.
+APP_UID = int(os.environ.get(
+    "ONIONHOST_CONTAINER_UID_BASE", "2300000"))
+APP_WWW_UID = APP_UID + 33  # www-data in the same map
+APP_WWW_GID = APP_UID + 33
+APPDATA = "/var/lib/onionhost/appdata"
+APP_DB_ENV = "/etc/onionhost/app-db.env"
+RECIPE_SELECTION = "/etc/onionhost/recipe-selection"
+APP_MARKER = "/var/lib/onionhost/app-site"
+APP_RUNTIME = "/var/lib/onionhost/app-runtime"
+MAX_PAYLOAD = 1 << 30
+ALLOWED_PREFIXES = ("content/", "site/", "onion/", "system/",
+                    "app/")
+
+
+def _log_event(text):
+    line = "%s restore: %s\n" % (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        text)
+    try:
+        with open(MAINT_LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    subprocess.run(["logger", "-t", "onionhost-restore", text],
+                   capture_output=True)
+
+
+def _say(msg):
+    print(msg, flush=True)
+
+
+def _shred(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "wb") as f:
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _owner_user(override):
+    if override:
+        return override
+    candidates = []
+    for entry in pwd.getpwall():
+        if entry.pw_uid >= 1000 and \
+                entry.pw_shell not in ("/usr/sbin/nologin",
+                                       "/bin/false") and \
+                os.path.isdir(entry.pw_dir):
+            candidates.append(entry.pw_name)
+    if len(candidates) == 1:
+        return candidates[0]
+    with_cfg = [u for u in candidates
+                if os.path.isdir(os.path.join(
+                    pwd.getpwnam(u).pw_dir, ".config", "onionhost"))]
+    if len(with_cfg) == 1:
+        return with_cfg[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise SystemExit("restore: cannot tell which account owns the "
+                     "website; run with --user NAME")
+
+
+# ------------------------------------------------------------------
+# Finding the backup file
+# ------------------------------------------------------------------
+
+def _root_disk_prefix():
+    """Parent disk of the running root (e.g. 'vda'), to exclude from
+    the stick scan. Falls back to excluding nothing on error."""
+    try:
+        with open("/etc/onionhost/luks-roles.json") as f:
+            device = json.load(f).get("device", "")
+    except (OSError, ValueError):
+        return None
+    base = os.path.basename(device)
+    parent = "".join(ch for ch in base if not ch.isdigit())
+    return parent or None
+
+
+def _scan_dir(base, depth=2):
+    hits = []
+    base = base.rstrip("/")
+    for root, _dirs, files in os.walk(base):
+        level = root[len(base):].count(os.sep)
+        if level > depth:
+            continue
+        for name in files:
+            if name.endswith(".onionhost-backup"):
+                hits.append(os.path.join(root, name))
+    return hits
+
+
+def find_backup():
+    """Return a path to a backup file, asking the owner when there
+    are several. Mounts candidate sticks read-only under
+    /run/onionhost-restore-mnt; mounts are the caller's to clean
+    (returns (path, mountpoint-or-None))."""
+    mounted_hits = []
+    for base in ("/media", "/run/media"):
+        if os.path.isdir(base):
+            mounted_hits += _scan_dir(base)
+    if len(mounted_hits) == 1:
+        return mounted_hits[0], None
+    if len(mounted_hits) > 1:
+        return _choose(mounted_hits), None
+
+    exclude = _root_disk_prefix()
+    mnt = "/run/onionhost-restore-mnt"
+    os.makedirs(mnt, exist_ok=True)
+    # Partitions AND whole devices: some sticks carry their filesystem
+    # with no partition table at all (a "superfloppy"), and such a
+    # stick presents as /dev/sda with no /dev/sda1. A whole device
+    # that has no filesystem (a partitioned stick, the LUKS disk)
+    # simply fails to mount and is skipped. (Battery finding,
+    # 2026-10-13: the first restore attempt missed a superfloppy
+    # stick entirely.)
+    parts = sorted(glob.glob("/dev/sd*[0-9]") +
+                   glob.glob("/dev/vd*[0-9]") +
+                   glob.glob("/dev/nvme*n*p[0-9]") +
+                   glob.glob("/dev/mmcblk*p[0-9]") +
+                   glob.glob("/dev/sd?") +
+                   glob.glob("/dev/vd?") +
+                   glob.glob("/dev/nvme*n?") +
+                   glob.glob("/dev/mmcblk?"))
+    mounted = set()
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                mounted.add(line.split()[0])
+    except OSError:
+        pass
+    for part in parts:
+        if part in mounted:
+            continue
+        if exclude and os.path.basename(part).startswith(exclude):
+            continue
+        proc = subprocess.run(
+            ["mount", "-o", "ro,nosuid,nodev,noexec", part, mnt],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            continue
+        hits = _scan_dir(mnt)
+        if hits:
+            rel = [os.path.relpath(h, mnt) for h in hits]
+            if len(rel) == 1:
+                return os.path.join(mnt, rel[0]), mnt
+            return os.path.join(mnt, _choose(rel)), mnt
+        subprocess.run(["umount", mnt], capture_output=True)
+    return None, None
+
+
+def _choose(options):
+    _say("More than one backup file was found:")
+    for i, path in enumerate(options, 1):
+        _say("  %d. %s" % (i, path))
+    while True:
+        answer = input("Which one? Type its number: ").strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return options[int(answer) - 1]
+        _say("Type a number from the list.")
+
+
+# ------------------------------------------------------------------
+# Decrypt + verify
+# ------------------------------------------------------------------
+
+class RestoreError(Exception):
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def _read_wrapper(path):
+    try:
+        with tarfile.open(path, "r:*") as tar:
+            names = tar.getnames()
+            if names != ["meta.json", "payload.age"] and \
+                    set(names) != {"meta.json", "payload.age"}:
+                raise RestoreError(
+                    "This file is not an OnionHost backup "
+                    "(unexpected contents). Nothing was changed.", 4)
+            meta = json.loads(
+                tar.extractfile("meta.json").read().decode("utf-8"))
+            payload_age = tar.extractfile("payload.age").read()
+    except RestoreError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise RestoreError(
+            "This file could not be read as an OnionHost backup. "
+            "Nothing was changed.", 4)
+    if meta.get("format") not in (1, 2) or \
+            meta.get("kind") != "onionhost-backup":
+        raise RestoreError(
+            "This backup was made by a different version and "
+            "cannot be restored here. Nothing was changed.", 4)
+    return meta, payload_age
+
+
+def _decrypt(meta, payload_age, workdir):
+    import getpass
+    salts = meta.get("salts") or {}
+    salt_list = []
+    value = salts.get("main")
+    if value:
+        try:
+            salt_list.append(bytes.fromhex(value))
+        except ValueError:
+            raise RestoreError(
+                "This backup's stored key information is "
+                "damaged. Nothing was changed.", 4)
+    if not salt_list:
+        raise RestoreError(
+            "This backup carries no key information. Nothing was "
+            "changed.", 4)
+    phrase = getpass.getpass(
+        "Type the disk passphrase from the OLD computer's paper "
+        "(the 7 words of the computer this backup was made on): ")
+    if not phrase.strip():
+        raise RestoreError("No passphrase was typed. Nothing was "
+                           "changed.", 3)
+    ident_dir = tempfile.mkdtemp(prefix="onionhost-restore-id-",
+                                 dir="/dev/shm")
+    os.chmod(ident_dir, 0o700)
+    ident_file = os.path.join(ident_dir, "identities.txt")
+    try:
+        lines = []
+        for salt in salt_list:
+            lines.append(backupkeys.derive_identity(phrase, salt))
+        phrase = None
+        with open(ident_file, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(ident_file, 0o600)
+        src = os.path.join(workdir, "payload.age")
+        with open(src, "wb") as f:
+            f.write(payload_age)
+        out = os.path.join(workdir, "payload.tar.gz")
+        proc = subprocess.run(
+            ["age", "-d", "-i", ident_file, "-o", out, src],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RestoreError(
+                "That passphrase did not open this backup. Nothing "
+                "was changed. Check the words on the paper and "
+                "try again.", 3)
+        if os.path.getsize(out) > MAX_PAYLOAD:
+            raise RestoreError(
+                "This backup is far larger than any website this "
+                "system makes. Nothing was changed.", 4)
+        return out
+    finally:
+        _shred(ident_file)
+        try:
+            os.rmdir(ident_dir)
+        except OSError:
+            pass
+
+
+def _verify(payload_tar_gz, stage):
+    """Extract into stage/ and verify against the manifest.
+    Returns the manifest dict."""
+    try:
+        with tarfile.open(payload_tar_gz, "r:gz") as tar:
+            members = tar.getmembers()
+            for member in members:
+                if member.name.startswith("/") or \
+                        ".." in member.name.split("/"):
+                    raise RestoreError(
+                        "This backup contains an unsafe path. "
+                        "Nothing was changed.", 4)
+            tar.extractall(stage, filter="data")
+    except RestoreError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise RestoreError(
+            "This backup is damaged and could not be unpacked. "
+            "Nothing was changed.", 4)
+    try:
+        with open(os.path.join(stage, "manifest.json")) as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        raise RestoreError(
+            "This backup has no readable checklist inside. Nothing "
+            "was changed.", 4)
+    if manifest.get("format") not in (1, 2):
+        raise RestoreError(
+            "This backup's checklist is from a different version. "
+            "Nothing was changed.", 4)
+    listed = set()
+    for entry in manifest.get("entries", []):
+        rel = entry.get("path", "")
+        if not rel.startswith(ALLOWED_PREFIXES) or \
+                ".." in rel.split("/"):
+            raise RestoreError(
+                "This backup lists a file in an unexpected place "
+                "(%s). Nothing was changed." % rel, 4)
+        path = os.path.join(stage, rel)
+        if not os.path.isfile(path):
+            raise RestoreError(
+                "This backup is incomplete (a file is missing). "
+                "Nothing was changed.", 4)
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != entry.get("sha256") or \
+                os.path.getsize(path) != entry.get("size"):
+            raise RestoreError(
+                "This backup is damaged (a file does not match "
+                "its checklist). Nothing was changed.", 4)
+        listed.add(rel)
+    on_disk = set()
+    for root, _dirs, files in os.walk(stage):
+        for name in files:
+            rel = os.path.relpath(os.path.join(root, name), stage)
+            on_disk.add(rel.replace(os.sep, "/"))
+    extra = on_disk - listed - {"manifest.json"}
+    if extra:
+        raise RestoreError(
+            "This backup contains files that are not on its "
+            "checklist. Nothing was changed.", 4)
+    # The onion identity must agree four ways: metadata, manifest,
+    # the bundled hostname file, and the address recomputed from
+    # the bundled public key.
+    pub_path = os.path.join(stage, "onion/hs_ed25519_public_key")
+    with open(pub_path, "rb") as f:
+        pubdata = f.read()
+    pubkey = pubdata[32:64] if len(pubdata) >= 64 else pubdata
+    if len(pubkey) != 32:
+        raise RestoreError(
+            "This backup's website identity is damaged. Nothing "
+            "was changed.", 4)
+    address = backupkeys.onion_address_from_pubkey(pubkey)
+    with open(os.path.join(stage, "onion/hostname")) as f:
+        hostname = f.read().strip()
+    if hostname != address + ".onion" or \
+            manifest.get("onion") != hostname:
+        raise RestoreError(
+            "This backup's website identity does not check out. "
+            "Nothing was changed.", 4)
+    if manifest.get("siteKind") == "app":
+        # App section sanity: the runtime record must exist and
+        # be one of the two runtimes; a database dump is only
+        # meaningful with the credentials it belongs to, and a
+        # php site's credentials without any database content
+        # are fine (an application the owner has not installed
+        # yet has an empty database by definition - the dump is
+        # the part that may legitimately be absent... but a php
+        # backup made by onionhost-backup always carries one, so
+        # credentials present + runtime php requires the dump).
+        runtime = None
+        rt_path = os.path.join(stage, "app/runtime.txt")
+        if os.path.isfile(rt_path):
+            with open(rt_path) as f:
+                runtime = f.read().strip()
+        if runtime not in ("php", "native"):
+            raise RestoreError(
+                "This backup's application record is damaged. "
+                "Nothing was changed.", 4)
+        manifest["appRuntime"] = runtime
+        paths = {e.get("path") for e in manifest.get("entries", [])}
+        has_dump = "app/db-dump.sql.gz" in paths
+        has_creds = "app/db-credentials.env" in paths
+        if has_dump and not has_creds:
+            raise RestoreError(
+                "This backup has a database but not its "
+                "credentials. Nothing was changed.", 4)
+        if runtime == "php" and has_creds and not has_dump:
+            raise RestoreError(
+                "This backup's application database is missing. "
+                "Nothing was changed.", 4)
+    else:
+        cur_path = os.path.join(stage, "site/current.txt")
+        with open(cur_path) as f:
+            cur_seq = f.read().strip()
+        if not cur_seq.isdigit() or not os.path.isdir(
+                os.path.join(stage, "site/releases", cur_seq)):
+            raise RestoreError(
+                "This backup's published website is incomplete. "
+                "Nothing was changed.", 4)
+    return manifest
+
+
+# ------------------------------------------------------------------
+# Install (rename swaps only; runs after all verification passed)
+# ------------------------------------------------------------------
+
+def _swap_dir(staged, target, tag):
+    """Replace directory `target` with `staged` by rename swap.
+    The target may not exist yet - on a fresh install that has
+    never booted its services there is no hidden-service dir to
+    replace (battery finding, 2026-10-13)."""
+    if not os.path.isdir(target):
+        os.rename(staged, target)
+        _fsync_dir(os.path.dirname(target))
+        return
+    old = "%s.pre-restore-%s" % (target, tag)
+    shutil.rmtree(old, ignore_errors=True)
+    os.rename(target, old)
+    try:
+        os.rename(staged, target)
+    except BaseException:
+        os.rename(old, target)
+        raise
+    _fsync_dir(os.path.dirname(target))
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _sweep_stale(*bases):
+    """Remove staging dirs left by an interrupted earlier restore,
+    so a retry starts clean."""
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        for name in os.listdir(base):
+            if "-restore-" in name:
+                path = os.path.join(base, name)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+
+
+def _deselect_app_slot():
+    """A static restore onto an app-shaped machine: hand the site
+    back to the static container. The app data stays on disk."""
+    for path in (APP_MARKER, APP_RUNTIME, RECIPE_SELECTION):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    subprocess.run(["/usr/local/bin/onionhost-generate-configs"],
+                   capture_output=True)
+
+
+def _write_recipe_selection(stage):
+    """Reinstate /etc/onionhost/recipe-selection from the
+    restored site model (the backup's content/site.json, which
+    _install puts in place before the app section installs).
+
+    The selection is what generate-configs reads to render
+    per-recipe config variants (a native recipe whose manifest
+    declares native_serve tcp gets the TCP nginx variant) and
+    what the recipe packages' postinst checks on update.
+    Backups never captured the file itself, and a restore that
+    left it absent rendered the unix variant for a TCP-serve
+    recipe: the restored marketplace answered 502 behind a
+    healthy application until the next publish rewrote the
+    selection (measured in the marketplace recipe venue; the
+    unix-serve recipes render identically without it, which is
+    why four earlier restores never showed this). A model with
+    no recipe clears any stale selection, matching publish."""
+    recipe = None
+    try:
+        with open(os.path.join(stage, "content",
+                               "site.json")) as f:
+            recipe = json.load(f).get("recipe")
+    except (OSError, ValueError):
+        recipe = None
+    if recipe:
+        tmp = RECIPE_SELECTION + ".restore-tmp"
+        with open(tmp, "w") as f:
+            f.write(str(recipe) + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, RECIPE_SELECTION)
+        _fsync_file(RECIPE_SELECTION)
+    else:
+        try:
+            os.unlink(RECIPE_SELECTION)
+        except FileNotFoundError:
+            pass
+
+
+def _grant_owner_acl(path, owner_uid):
+    """Give the desktop owner rwx on a restored app tree root
+    via a named-user POSIX ACL (plus a default ACL so entries
+    created later inherit it) - the same grant
+    onionhost-app-provision makes, written directly as the
+    xattr wire format. Best-effort: provision re-asserts it
+    at the next publish regardless."""
+    def blob(owner_p, group_p, other_p):
+        out = struct.pack("<I", 2)
+        out += struct.pack("<HHI", 1, owner_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 2, 7, owner_uid)
+        out += struct.pack("<HHI", 4, group_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 16, group_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 32, other_p, 0xFFFFFFFF)
+        return out
+    try:
+        mode = os.stat(path).st_mode
+        data = blob((mode >> 6) & 7, (mode >> 3) & 7, mode & 7)
+        os.setxattr(path, "system.posix_acl_access", data)
+        os.setxattr(path, "system.posix_acl_default", data)
+    except OSError:
+        pass
+
+
+def _install_app(stage, pw, tag):
+    """Install a backup's app section (slice 6B): trees by rename
+    swap, credentials + runtime + marker as atomic file replaces,
+    the database dump staged for the app container's init."""
+    app_src = os.path.join(stage, "app")
+    os.makedirs(APPDATA, exist_ok=True)
+    os.chown(APPDATA, APP_UID, APP_UID)
+    os.chmod(APPDATA, 0o755)
+    for sub in ("www", "native"):
+        src = os.path.join(app_src, sub)
+        if not os.path.isdir(src):
+            continue
+        staging = os.path.join(APPDATA, ".%s-restore-%s"
+                               % (sub, tag))
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.copytree(src, staging)
+        # Both app trees come back owned by the www-data
+        # mapping, uid AND group, roots included (D7 + D8):
+        # the native root is the app process's working
+        # directory and its restored data directories are
+        # written by the app directly; the www tree's data
+        # directories are written the same way. Restoring
+        # either tree under the container-root mapping or the
+        # desktop owner's group recreates the refused-create
+        # state (the owner's group is outside the container's
+        # gid map, and a directory with an unmapped group
+        # refuses every create through the gVisor stack).
+        # The owner's desktop access to the restored trees
+        # rides the named-user ACL granted on the roots below
+        # (and re-asserted by provision at the next publish).
+        owner_uid = APP_WWW_UID
+        for root, _dirs, files in os.walk(staging):
+            os.chown(root, owner_uid, APP_WWW_GID)
+            os.chmod(root, 0o2775)
+            for name in files:
+                os.chown(os.path.join(root, name),
+                         owner_uid, APP_WWW_GID)
+                os.chmod(os.path.join(root, name), 0o644)
+        os.chown(staging, owner_uid, APP_WWW_GID)
+        os.chmod(staging, 0o2775)
+        _grant_owner_acl(staging, pw.pw_uid)
+        dst = os.path.join(APPDATA, sub)
+        if os.path.isdir(dst):
+            _swap_dir(staging, dst, tag)
+        else:
+            os.rename(staging, dst)
+        _fsync_dir(APPDATA)
+    dbdir = os.path.join(APPDATA, "db")
+    os.makedirs(dbdir, exist_ok=True)
+    os.chown(dbdir, APP_UID, APP_UID)
+    os.chmod(dbdir, 0o750)
+    dump = os.path.join(app_src, "db-dump.sql.gz")
+    if os.path.isfile(dump):
+        dst = os.path.join(APPDATA, "db-import.sql.gz")
+        tmp = dst + ".restore-tmp"
+        shutil.copyfile(dump, tmp)
+        os.chown(tmp, APP_UID, APP_UID)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dst)
+        _fsync_file(dst)
+    creds = os.path.join(app_src, "db-credentials.env")
+    if os.path.isfile(creds):
+        tmp = APP_DB_ENV + ".restore-tmp"
+        shutil.copyfile(creds, tmp)
+        os.chown(tmp, APP_UID, APP_UID)
+        os.chmod(tmp, 0o400)
+        os.replace(tmp, APP_DB_ENV)
+        _fsync_file(APP_DB_ENV)
+    with open(os.path.join(app_src, "runtime.txt")) as f:
+        runtime = f.read().strip()
+    # The marker's db line (A23 recipes 3+4): a PHP backup that
+    # carries credentials had a database; one without - a
+    # flat-file recipe's - did not. The restored machine's
+    # provisioning facts must say so, or its app init would try
+    # to start a database the site never had. A native backup
+    # carrying BOTH credentials and a dump is a PostgreSQL
+    # site (A23 recipe 5) - the only native shape that has
+    # either - and its marker must say db=postgres or the
+    # restored site would start with no database at all.
+    if runtime == "php" and os.path.isfile(creds):
+        db_mode = "required"
+    elif runtime == "native" and os.path.isfile(creds) \
+            and os.path.isfile(dump):
+        db_mode = "postgres"
+    else:
+        db_mode = "none"
+    for path, data in ((APP_RUNTIME, runtime + "\n"),
+                       (APP_MARKER, "runtime=%s\ndb=%s\n"
+                        % (runtime, db_mode))):
+        tmp = path + ".restore-tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        _fsync_file(path)
+    # Before the render: the config variants follow the recipe
+    # selection (see _write_recipe_selection).
+    _write_recipe_selection(stage)
+    subprocess.run(["/usr/local/bin/onionhost-generate-configs"],
+                   capture_output=True)
+
+
+def _install(stage, user):
+    pw = pwd.getpwnam(user)
+    home = pw.pw_dir
+    tag = str(os.getpid())
+    _sweep_stale(os.path.join(home, ".config", "onionhost"),
+                 SITE_DIR, TOR_DIR, APPDATA)
+
+    # 1. Content store (owner's home): media swapped as a unit,
+    #    JSON files replaced atomically.
+    cfg_src = os.path.join(stage, "content")
+    cfg_dst = os.path.join(home, ".config", "onionhost")
+    os.makedirs(cfg_dst, exist_ok=True)
+    # On a fresh install the owner has never logged in, so the
+    # makedirs above may have created ~/.config itself as root -
+    # which then breaks the owner's first desktop session
+    # (xfconfd cannot run). The whole config chain is the owner's.
+    os.chown(os.path.join(home, ".config"), pw.pw_uid, pw.pw_gid)
+    os.chown(cfg_dst, pw.pw_uid, pw.pw_gid)
+    media_src = os.path.join(cfg_src, "media")
+    if os.path.isdir(media_src):
+        media_stage = os.path.join(cfg_dst, ".media-restore-" + tag)
+        shutil.copytree(media_src, media_stage)
+        for root, dirs, files in os.walk(media_stage):
+            os.chown(root, pw.pw_uid, pw.pw_gid)
+            for name in files:
+                os.chown(os.path.join(root, name),
+                         pw.pw_uid, pw.pw_gid)
+        media_dst = os.path.join(cfg_dst, "media")
+        if os.path.isdir(media_dst):
+            _swap_dir(media_stage, media_dst, tag)
+        else:
+            os.rename(media_stage, media_dst)
+    for name in ("site.json", "wizard-progress.json"):
+        src = os.path.join(cfg_src, name)
+        if os.path.isfile(src):
+            dst = os.path.join(cfg_dst, name)
+            tmp = dst + ".restore-tmp"
+            shutil.copyfile(src, tmp)
+            os.chown(tmp, pw.pw_uid, pw.pw_gid)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dst)
+    os.chown(cfg_dst, pw.pw_uid, pw.pw_gid)
+    _fsync_dir(cfg_dst)
+
+    # 2. Published trees: swap the whole releases dir, repoint
+    #    `current` at the restored release. (Static backups only;
+    #    an app backup carries no published trees - its section
+    #    installs in step 2b instead.)
+    if os.path.isdir(os.path.join(stage, "site", "releases")):
+        rel_stage = os.path.join(SITE_DIR,
+                                 ".releases-restore-" + tag)
+        shutil.rmtree(rel_stage, ignore_errors=True)
+        shutil.copytree(os.path.join(stage, "site/releases"),
+                        rel_stage)
+        for root, dirs, files in os.walk(rel_stage):
+            os.chmod(root, 0o755)
+            for name in files:
+                os.chmod(os.path.join(root, name), 0o644)
+        with open(os.path.join(stage, "site/current.txt")) as f:
+            cur_seq = f.read().strip()
+        _swap_dir(rel_stage, RELEASES, tag)
+        tmp_link = os.path.join(SITE_DIR, ".current-restore-" + tag)
+        try:
+            os.unlink(tmp_link)
+        except FileNotFoundError:
+            pass
+        os.symlink("releases/%s" % cur_seq, tmp_link)
+        os.replace(tmp_link, CURRENT)
+        _fsync_dir(SITE_DIR)
+
+    # 2b. App section (slice 6B): the app-data trees, credentials,
+    #     runtime marker and staged database import - or, for a
+    #     static backup landing on an app-shaped machine, handing
+    #     the slot back to the static container.
+    if os.path.isdir(os.path.join(stage, "app")):
+        _install_app(stage, pw, tag)
+    elif os.path.exists(APP_MARKER):
+        _deselect_app_slot()
+
+    # 3. Onion identity: swap the hidden-service directory inside
+    #    /var/lib/onionhost/tor (guard state in data/ untouched).
+    hs_stage = os.path.join(TOR_DIR, ".hs-restore-" + tag)
+    shutil.rmtree(hs_stage, ignore_errors=True)
+    os.makedirs(hs_stage)
+    for name, mode in (("hostname", 0o644),
+                       ("hs_ed25519_public_key", 0o644),
+                       ("hs_ed25519_secret_key", 0o600)):
+        dst = os.path.join(hs_stage, name)
+        shutil.copyfile(os.path.join(stage, "onion", name), dst)
+        os.chmod(dst, mode)
+        os.chown(dst, TOR_UID, TOR_UID)
+    os.chmod(hs_stage, 0o700)
+    os.chown(hs_stage, TOR_UID, TOR_UID)
+    _swap_dir(hs_stage, HS_DIR, tag)
+    os.chown(TOR_DIR, TOR_UID, TOR_UID)
+    os.chmod(TOR_DIR, 0o700)
+
+    # 4. Wizard state: live systems stay/become S2; an unfinished
+    #    setup (S0) keeps its state and gets the restored marker.
+    state = None
+    try:
+        with open(STATE_FILE) as f:
+            state = f.read().strip()
+    except OSError:
+        pass
+    if state != "S0":
+        tmp = STATE_FILE + ".restore-tmp"
+        with open(tmp, "w") as f:
+            f.write("S2\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_FILE)
+        _fsync_file(STATE_FILE)
+        _fsync_dir(os.path.dirname(STATE_FILE))
+        try:
+            os.unlink(MARKER)
+        except FileNotFoundError:
+            pass
+    else:
+        with open(os.path.join(stage, "onion/hostname")) as f:
+            onion = f.read().strip()
+        tmp = MARKER + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(onion + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, MARKER)
+        _fsync_file(MARKER)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(prog="onionhost-restore")
+    ap.add_argument("--file", help="path to the backup file "
+                                   "(default: find it on a stick)")
+    ap.add_argument("--user", help="the website owner's account")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        print("restore: must run as root", file=sys.stderr)
+        return 1
+    user = _owner_user(args.user)
+
+    mountpoint = None
+    path = args.file
+    if not path:
+        _say("Looking for your backup file...")
+        path, mountpoint = find_backup()
+        if not path:
+            _say("No backup file was found. Plug in the stick or "
+                 "drive with the backup on it, then try again. "
+                 "Nothing was changed.")
+            _log_event("no backup file found; nothing changed "
+                       "(user %s)" % user)
+            return 2
+    _say("Backup file: %s" % path)
+    try:
+        meta, payload_age = _read_wrapper(path)
+        work = tempfile.mkdtemp(prefix="onionhost-restore-",
+                                 dir="/var/lib/onionhost")
+        try:
+            payload = _decrypt(meta, payload_age, work)
+            stage = os.path.join(work, "stage")
+            os.makedirs(stage)
+            manifest = _verify(payload, stage)
+            _say("The backup opened and checks out: \"%s\" "
+                 "(%s)." % (manifest.get("siteTitle", ""),
+                            manifest.get("onion", "")))
+            _install(stage, user)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    except RestoreError as e:
+        _say(str(e))
+        _log_event("FAILED (%s) file=%s: %s"
+                   % (e.code, os.path.basename(path), e))
+        return e.code
+    except Exception:
+        # A crash mid-install must still fail plainly, be logged
+        # with its traceback, and leave the menu able to retry;
+        # the swaps are idempotent, so a retry converges.
+        import traceback
+        _log_event("FAILED (1) file=%s: unexpected error\n%s"
+                   % (os.path.basename(path),
+                      traceback.format_exc()))
+        _say("Something went wrong and the restore did not "
+             "finish. You can try again from this menu.")
+        return 1
+    finally:
+        if mountpoint:
+            subprocess.run(["umount", mountpoint],
+                           capture_output=True)
+    onion = meta.get("onion", "")
+    _log_event("backup restored: %s from file %s (user %s)"
+               % (onion, os.path.basename(path), user))
+    _say("")
+    _say("Your website is restored. Restart the computer and it "
+         "will be live at its usual address:")
+    _say("    %s" % onion)
+    if subprocess.run(["systemctl", "is-active", "--quiet",
+                       "onionhost-a"],
+                      capture_output=True).returncode == 0:
+        _say("(The site service is running right now; the restart "
+             "is what brings the restored address up.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,326 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-app-provision: set up the dynamic tier's app slot
+(slice 6B, DESIGN-v3 A12/A20).
+
+Runs as root (via onionhost-publish's app branch, or directly when
+the site kind is chosen). Idempotent: safe to run at every publish.
+It creates, once:
+
+  * the site-kind marker /var/lib/onionhost/app-site and the
+    runtime file /var/lib/onionhost/app-runtime (php | native) -
+    these select the app container over the static B at boot
+    (Quadlet conditions) and tell onionhost-generate-configs which
+    golden templates to render;
+  * the app-data volume skeleton /var/lib/onionhost/appdata/
+    {www,db,native} (A12.3's reserved writable, quota'd class):
+    www/ is the docroot the owner fills with their application's
+    files, native/ holds an owner-supplied program for the native
+    runtime, db/ is MariaDB's datadir and is container-only;
+  * for the PHP runtime WITH a database (the default; a
+    packaged recipe whose manifest declares db.required=false -
+    a flat-file app like DokuWiki - is provisioned with
+    --db none instead, and no credentials are created), the
+    per-install database credentials in
+    /etc/onionhost/app-db.env - generated here, stored readable
+    ONLY by host root and the app container's root (mode 0400,
+    owned by the container's fixed userns root uid), mounted
+    read-only into the container, where the init creates the
+    database + user from them. The file also carries the
+    MariaDB ROOT password (DB_ROOT_PASSWORD): the init and the
+    backup tool authenticate as root with it, because root's
+    unix_socket peer-credential auth is not honoured under
+    gVisor (rig battery defect D2 - ERROR 1698 on every root
+    call). The root password is platform-internal: the owner's
+    GUI shows only the application credentials
+    (onionhost-wizard-helper app-info filters the keys it
+    prints) and it is never written anywhere else. The
+    application itself keeps its own copy of ITS credentials
+    in its own config (e.g. a forum's Settings.php inside
+    www/), which is the owner's file in the owner's volume.
+    The same credentials record serves the PostgreSQL engine
+    (db=postgres - a native recipe whose manifest declares
+    db.engine "postgres", A23 recipe 5): the init creates
+    the database + role from the same fields, and
+    DB_ROOT_PASSWORD is the database SUPERUSER's password
+    for whichever engine the site runs (PostgreSQL's
+    `postgres` role authenticates with it over the sandbox
+    loopback - peer/socket credentials are no more honoured
+    for it under gVisor than MariaDB's were, defect D2).
+    The db choice is stamped into the app-site marker
+    (db=required | db=postgres | db=none);
+    onionhost-generate-configs passes
+    it to the app container's init, which skips MariaDB
+    entirely for a database-less site, and onionhost-backup
+    keys its database leg on the same manifest fact;
+  * the quota record /etc/onionhost/app.conf (the guard timer
+    enforces it; see onionhost-appdata-guard).
+
+Owner file access: www/ and native/ belong to the app user's
+mapping (uid AND group inside the container's user-namespace
+map, setgid, 2775), and the desktop owner's access rides a
+named-user POSIX ACL (rwx, plus a default ACL so files the
+application creates inherit it). The owner's own group can
+NOT be the sharing group: it is not in the container's gid
+map, and a directory whose group is unmapped refuses EVERY
+create through the gVisor stack - that was defects D7 and D8
+(see ISO-BUILD-LOG "D8 INVESTIGATION + FIX"). The app unit
+runs with UMask=0000, so files the application creates stay
+manageable from the owner's desktop, and files the owner
+drops in are readable by the application.
+
+Prints: APP_PROVISION_OK runtime=<r> db=<created|existing|none>
+"""
+import argparse
+import os
+import pwd
+
+import secrets
+import struct
+import subprocess
+import sys
+
+APPDATA = "/var/lib/onionhost/appdata"
+MARKER = "/var/lib/onionhost/app-site"
+RUNTIME_FILE = "/var/lib/onionhost/app-runtime"
+DB_ENV = "/etc/onionhost/app-db.env"
+APP_CONF = "/etc/onionhost/app.conf"
+# The app container's fixed user-namespace base (the Quadlet
+# unit's UIDMap/GIDMap 0:2300000:65536). Env-overridable for
+# the unit-test venues only, exactly as in onionhost-recipe;
+# production never sets it.
+CONTAINER_UID = int(os.environ.get(
+    "ONIONHOST_CONTAINER_UID_BASE", "2300000"))
+CONTAINER_WWW_UID = CONTAINER_UID + 33  # www-data in the same map
+CONTAINER_WWW_GID = CONTAINER_UID + 33
+DEFAULT_QUOTA = 20 * 1024 * 1024 * 1024  # 20 GiB
+
+
+def _grant_owner_acl(path, owner_uid, is_dir=True):
+    """Give the desktop owner rwx on a platform-managed app
+    tree root via a named-user POSIX ACL (and, for a
+    directory, a default ACL so entries created later inherit
+    the same grant). Written directly as the xattr wire
+    format: the grant is load-bearing (it replaces the
+    owner-group sharing D8 removed), so it must not depend on
+    an external setfacl binary existing. Best-effort: a
+    filesystem without ACL support leaves the mode/group
+    state, which still satisfies the app - only the owner's
+    desktop write access degrades, and the caller warns."""
+    def blob(named_uid, owner_p, group_p, other_p):
+        out = struct.pack("<I", 2)
+        out += struct.pack("<HHI", 1, owner_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 2, 7, named_uid)
+        out += struct.pack("<HHI", 4, group_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 16, group_p, 0xFFFFFFFF)
+        out += struct.pack("<HHI", 32, other_p, 0xFFFFFFFF)
+        return out
+    try:
+        st = os.stat(path)
+        mode = st.st_mode
+        data = blob(owner_uid, (mode >> 6) & 7, (mode >> 3) & 7,
+                    mode & 7)
+        os.setxattr(path, "system.posix_acl_access", data)
+        if is_dir:
+            os.setxattr(path, "system.posix_acl_default", data)
+        return True
+    except OSError:
+        return False
+
+
+def _atomic_write(path, data, mode=0o644, uid=0, gid=0):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chown(tmp, uid, gid)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def provision(user, runtime, db_mode=None):
+    pw = pwd.getpwnam(user)
+    if db_mode is None:
+        db_mode = "required" if runtime == "php" else "none"
+    os.makedirs(APPDATA, exist_ok=True)
+    for name in ("www", "db", "native"):
+        os.makedirs(os.path.join(APPDATA, name), exist_ok=True)
+    os.chown(APPDATA, CONTAINER_UID, CONTAINER_UID)
+    os.chmod(APPDATA, 0o755)
+    dbdir = os.path.join(APPDATA, "db")
+    os.chown(dbdir, CONTAINER_UID, CONTAINER_UID)
+    os.chmod(dbdir, 0o750)
+    # Owner-managed dirs: owned by the app user's mapping -
+    # uid AND group (setgid so new entries inherit the group).
+    #
+    # The two dirs differ in WHO creates new entries directly
+    # inside them at runtime. In www, the application writes
+    # in recipe-declared data directories and occasionally at
+    # the top (a forum's error log file); the native root IS
+    # the native app's working directory
+    # ($ONIONHOST_APP_DATA): the app process (www-data)
+    # creates its data directory and files directly in it.
+    #
+    # Until the D8 fix these roots carried the DESKTOP OWNER's
+    # group for desktop sharing. That group is not in the
+    # container's gid map - and through the production engine
+    # (rootful Podman + runsc), a create inside a directory
+    # whose group is unmapped in the container's user
+    # namespace is refused for EVERYONE: the app user (D7,
+    # when the root was container-root-owned), the app user
+    # again after the D7 fix moved only the uid (D8), and the
+    # container's own root alike. The in-container normalise
+    # pass cannot repair it either (changing the state of an
+    # inode whose ids are unmapped is refused inside the
+    # namespace). So the roots now belong fully to the
+    # www-data mapping - the same end state the recipe
+    # applier produces for the www tree - and the owner's
+    # desktop access rides the named-user ACL granted below,
+    # which the group slot used to provide. These chowns are
+    # unconditional, so re-provision at any later publish
+    # also heals a root an older build created.
+    for name in ("www", "native"):
+        path = os.path.join(APPDATA, name)
+        os.chown(path, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+        os.chmod(path, 0o2775)
+        if not _grant_owner_acl(path, pw.pw_uid):
+            print("app-provision: WARNING: could not grant "
+                  "the owner an ACL on %s; desktop write "
+                  "access to the app folder may be limited"
+                  % path, file=sys.stderr)
+    # L1 healer (D8): a directory anywhere under the two
+    # owner-managed trees whose uid or gid sits OUTSIDE the
+    # container's id map - dropped there by the owner's file
+    # manager, or left by an older build - refuses every
+    # create the application attempts inside it, and nothing
+    # in the container can repair it (see above). Re-own such
+    # directories (only directories, only when an id is
+    # unmapped) to the app user's mapping. Directories the
+    # platform or the application made carry mapped ids and
+    # are untouched.
+    for name in ("www", "native"):
+        base = os.path.join(APPDATA, name)
+        for dirpath, _dirnames, _filenames in os.walk(base):
+            st = os.lstat(dirpath)
+            if not (CONTAINER_UID <= st.st_uid
+                    < CONTAINER_UID + 65536) or \
+               not (CONTAINER_UID <= st.st_gid
+                    < CONTAINER_UID + 65536):
+                os.chown(dirpath, CONTAINER_WWW_UID,
+                         CONTAINER_WWW_GID)
+
+    _atomic_write(RUNTIME_FILE, runtime + "\n")
+    _atomic_write(MARKER, "runtime=%s\ndb=%s\n" % (runtime,
+                                                   db_mode))
+    # The owner's ids, folded into the container's environment
+    # by onionhost-generate-configs: the app init normalises
+    # the app folder to www-data:<owner group, in-container>
+    # so the application can write what the owner copied in,
+    # and host-side tools (onionhost-recipe) read the uid to
+    # re-assert the owner's ACL on the trees they manage.
+    _atomic_write("/etc/onionhost/app-owner.env",
+                  "ONIONHOST_OWNER_UID=%d\n"
+                  "ONIONHOST_OWNER_GID=%d\n"
+                  % (pw.pw_uid, pw.pw_gid))
+
+    db_status = "none"
+    if db_mode == "postgres" or \
+            (runtime == "php" and db_mode == "required"):
+        if os.path.isdir(DB_ENV):
+            # A container bind-mount created a directory at the
+            # credentials path (see onionhost-generate-configs);
+            # the record is a file.
+            try:
+                os.rmdir(DB_ENV)
+            except OSError:
+                pass
+        existing = ""
+        try:
+            with open(DB_ENV) as f:
+                existing = f.read()
+        except OSError:
+            pass
+        if "DB_PASSWORD=" in existing and \
+                existing.split("DB_PASSWORD=")[1].strip():
+            db_status = "existing"
+            if "DB_ROOT_PASSWORD=" not in existing:
+                # A credentials record written before the root
+                # password existed (D2): add one, preserving the
+                # application credentials the site already runs
+                # on. The app init's bridge adopts it into the
+                # database at the next container start.
+                if not existing.endswith("\n"):
+                    existing += "\n"
+                _atomic_write(
+                    DB_ENV,
+                    existing + "DB_ROOT_PASSWORD=%s\n"
+                    % secrets.token_hex(24),
+                    mode=0o400, uid=CONTAINER_UID,
+                    gid=CONTAINER_UID)
+        else:
+            password = secrets.token_hex(24)
+            _atomic_write(
+                DB_ENV,
+                "# OnionHost application database credentials\n"
+                "# (generated at provisioning; readable only by\n"
+                "# root and the app container - see\n"
+                "# onionhost-app-provision). The application keeps\n"
+                "# its own copy in its own config inside the app\n"
+                "# folder. Included in backups (encrypted) so a\n"
+                "# restored site keeps working.\n"
+                "DB_NAME=onionhost_app\n"
+                "DB_USER=onionhost\n"
+                "DB_PASSWORD=%s\n"
+                "DB_ROOT_PASSWORD=%s\n"
+                % (password, secrets.token_hex(24)),
+                mode=0o400, uid=CONTAINER_UID, gid=CONTAINER_UID)
+            db_status = "created"
+
+    if not os.path.exists(APP_CONF):
+        _atomic_write(APP_CONF,
+                      "APPDATA_QUOTA_BYTES=%d\n" % DEFAULT_QUOTA)
+
+    proc = subprocess.run(["/usr/local/bin/onionhost-generate-configs"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print("app-provision: config generation failed: %s"
+              % proc.stderr.strip()[:200], file=sys.stderr)
+        return 1
+    print("APP_PROVISION_OK runtime=%s db=%s appdata=%s"
+          % (runtime, db_status, APPDATA))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="onionhost-app-provision")
+    ap.add_argument("--user", required=True)
+    ap.add_argument("--runtime", choices=("php", "native"),
+                    default="php")
+    ap.add_argument("--db", choices=("required", "postgres",
+                                     "none"),
+                    default=None,
+                    help="whether the site has an application "
+                         "database, and which engine (default: "
+                         "required - MariaDB - for php, none for "
+                         "native; a packaged recipe's manifest "
+                         "decides - see onionhost-publish)")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        print("app-provision: must run as root", file=sys.stderr)
+        return 1
+    try:
+        return provision(args.user, args.runtime, args.db)
+    except KeyError:
+        print("app-provision: unknown user %r" % args.user,
+              file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

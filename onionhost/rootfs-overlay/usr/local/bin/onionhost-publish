@@ -1,0 +1,361 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-publish: the ONLY writer of the served content tree.
+
+Runs as root (via onionhost-wizard-helper's `publish` subcommand).
+Reads the owner's site model + scrubbed media store from their
+home, renders a fresh static tree, re-scrubs every image (the
+user-space store is untrusted input to a root process), stamps
+content-derived mtimes (DESIGN-v3 A8), fsyncs, and atomically
+swaps the tree into the location B serves:
+
+    /var/lib/onionhost/site/
+        releases/<n>/     one complete tree per publish
+        current           symlink -> releases/<n>  (atomic rename)
+
+B's nginx roots at /srv/site/current. The swap is a single rename
+of a symlink in the same directory: a visitor either resolves the
+old release or the new one, never a half-written tree. Old
+releases are pruned to the current + previous pair.
+
+App sites (slice 6B) publish differently: there is nothing to
+render - the owner's application in the app-data volume IS the
+site. Publishing an app site provisions the slot (idempotently),
+renders the app container's configs, and selects/restarts the
+combined app container; publishing a static site after an app
+site deselects the app container again. The application files
+are never touched by the publisher.
+
+Prints one line: PUBLISH_OK release=<n> files=<count>
+(or, for an app site: PUBLISH_OK app runtime=<php|native>)
+Exits non-zero (old release untouched) on any validation failure.
+"""
+import argparse
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, "/usr/lib/onionhost")
+import sitegen  # noqa: E402
+
+SITE_DIR = "/var/lib/onionhost/site"
+RELEASES = os.path.join(SITE_DIR, "releases")
+CURRENT = os.path.join(SITE_DIR, "current")
+APP_MARKER = "/var/lib/onionhost/app-site"
+APP_RUNTIME = "/var/lib/onionhost/app-runtime"
+EDGE_SOCK = "/run/onionhost/web/b1.sock"
+
+
+def _systemctl(*args):
+    return subprocess.run(["systemctl"] + list(args),
+                          capture_output=True, text=True)
+
+
+def _unit_active(unit):
+    return _systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def _recipe_db_mode(recipe, runtime):
+    """Whether the site has an application database, and which
+    engine, from the recipe manifest when the site is
+    recipe-backed (a flat-file app declares db.required=false
+    and is provisioned without database credentials or a
+    database leg anywhere downstream; a PostgreSQL app - a
+    native recipe, A23 recipe 5 - declares db.engine
+    "postgres" and is provisioned WITH the shared credentials
+    record, for the PostgreSQL server the app init runs);
+    hand-installed apps keep the runtime default (php = a
+    MariaDB database is provisioned, native = none). A
+    manifest that cannot be read leaves the default - the
+    recipe apply that follows will fail on the missing
+    payload anyway."""
+    if recipe:
+        try:
+            with open("/usr/share/onionhost/recipes/%s/"
+                      "manifest.json" % recipe) as f:
+                manifest = json.load(f)
+            db = manifest.get("db", {})
+            if not db.get("required", True):
+                return "none"
+            if db.get("engine") == "postgres":
+                return "postgres"
+        except (OSError, ValueError):
+            pass
+    return "required" if runtime == "php" else "none"
+
+
+def publish_app(user, model):
+    """Provision + select the combined app container (slice 6B)."""
+    runtime = model.get("runtime", "php")
+    # The recipe selection is written BEFORE provisioning:
+    # provisioning ends by rendering the golden configs, and
+    # the render reads the selection to pick per-recipe
+    # variants (a native recipe whose manifest declares
+    # native_serve tcp gets the TCP nginx variant). Written
+    # after provisioning - as this originally was - the first
+    # publish of such a recipe started the stack behind the
+    # wrong nginx variant and the site answered 502 while the
+    # application was healthy (measured in the marketplace
+    # recipe venue: the first TCP-serve recipe is the first to
+    # expose the ordering; unix-serve recipes render
+    # identically either way). The selection file is also the
+    # marker the recipe package's own postinst checks before
+    # applying an update on this machine; a hand-installed app
+    # site has no selection and recipe updates never touch it.
+    recipe = model.get("recipe")
+    selection = "/etc/onionhost/recipe-selection"
+    if recipe:
+        with open(selection, "w") as f:
+            f.write(recipe + "\n")
+    elif os.path.exists(selection):
+        os.unlink(selection)
+    proc = subprocess.run(
+        ["/usr/local/bin/onionhost-app-provision",
+         "--user", user, "--runtime", runtime,
+         "--db", _recipe_db_mode(model.get("recipe"), runtime)],
+        capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        print("publish: app provisioning failed", file=sys.stderr)
+        return 1
+    # Recipe-backed app site (A23): the model names a packaged
+    # recipe - apply it now (payload into the docroot, database
+    # seed staged for the container's first start, config overlays
+    # written) BEFORE the container starts, so first boot already
+    # serves the finished site. (The selection was written above,
+    # before provisioning - see there for why the order matters.)
+    if recipe:
+        proc = subprocess.run(
+            ["/usr/local/bin/onionhost-recipe", "apply", recipe],
+            capture_output=True, text=True)
+        sys.stdout.write(proc.stdout)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            print("publish: recipe %s could not be applied"
+                  % recipe, file=sys.stderr)
+            return 1
+    # Boot conditions normally keep the two website containers
+    # exclusive; enforce it here too, since both bind b1.sock.
+    if _unit_active("onionhost-b.service"):
+        _systemctl("stop", "onionhost-b.service")
+    if _unit_active("onionhost-app.service"):
+        proc = _systemctl("restart", "onionhost-app.service")
+    else:
+        proc = _systemctl("start", "onionhost-app.service")
+    if proc.returncode != 0:
+        print("publish: the app container would not start: %s"
+              % proc.stderr.strip()[:200], file=sys.stderr)
+        return 1
+    # First boot initialises MariaDB (seconds); wait for the edge
+    # socket so Go Live only reports success once serving is real.
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if os.path.exists(EDGE_SOCK):
+            if recipe:
+                # A recipe with an install hook (manifest
+                # "install") seeds itself now, driving the app's
+                # own installer over this socket; recipes without
+                # one no-op inside the applier. A hook failure
+                # fails the publish - the site is up but not
+                # honestly "live" until its first install has run
+                # - and retrying the publish retries the hook,
+                # which is idempotent.
+                hook = subprocess.run(
+                    ["/usr/local/bin/onionhost-recipe",
+                     "install-hook", recipe],
+                    capture_output=True, text=True)
+                sys.stdout.write(hook.stdout)
+                if hook.returncode != 0:
+                    sys.stderr.write(hook.stderr)
+                    print("publish: recipe %s install step "
+                          "failed" % recipe, file=sys.stderr)
+                    return 1
+                # A native recipe's first-boot step (the app
+                # creating its administrator with its own CLI,
+                # inside the container, before the app started):
+                # the edge socket existing means it already ran;
+                # confirm its done marker (and shred the staged
+                # administrator env) before calling this live.
+                # No-ops for recipes without one.
+                fb = subprocess.run(
+                    ["/usr/local/bin/onionhost-recipe",
+                     "await-first-boot", recipe],
+                    capture_output=True, text=True)
+                sys.stdout.write(fb.stdout)
+                if fb.returncode != 0:
+                    sys.stderr.write(fb.stderr)
+                    print("publish: recipe %s first-boot step "
+                          "did not complete" % recipe,
+                          file=sys.stderr)
+                    return 1
+            print("PUBLISH_OK app runtime=%s" % runtime)
+            return 0
+        if not _unit_active("onionhost-app.service"):
+            print("publish: the app container stopped while "
+                  "starting; its log is in the journal "
+                  "(onionhost-app)", file=sys.stderr)
+            return 1
+        time.sleep(1)
+    print("publish: the app container is still starting (no edge "
+          "socket after 180 s)", file=sys.stderr)
+    return 1
+
+
+def deselect_app():
+    """Static publish after an app site: hand the edge socket back
+    to the static B. The app-data volume is left untouched - the
+    owner's application and its data survive a switch away and a
+    later switch back."""
+    if not os.path.exists(APP_MARKER):
+        return
+    if _unit_active("onionhost-app.service"):
+        _systemctl("stop", "onionhost-app.service")
+    for path in (APP_MARKER, APP_RUNTIME):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    subprocess.run(["/usr/local/bin/onionhost-generate-configs"],
+                   capture_output=True)
+    if not _unit_active("onionhost-b.service"):
+        _systemctl("start", "onionhost-b.service")
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _next_seq():
+    seqs = []
+    if os.path.isdir(RELEASES):
+        for name in os.listdir(RELEASES):
+            if name.isdigit():
+                seqs.append(int(name))
+    return (max(seqs) + 1) if seqs else 1
+
+
+def _current_seq():
+    try:
+        target = os.readlink(CURRENT)
+    except OSError:
+        return None
+    base = os.path.basename(target.rstrip("/"))
+    return int(base) if base.isdigit() else None
+
+
+def publish(user):
+    home = pwd.getpwnam(user).pw_dir
+    model_file = sitegen.model_path(home)
+    if not os.path.exists(model_file):
+        print("publish: no site yet for user %s" % user,
+              file=sys.stderr)
+        return 1
+    try:
+        model = sitegen.load_model(model_file)
+    except (ValueError, OSError) as e:
+        print("publish: bad site model: %s" % e, file=sys.stderr)
+        return 1
+    if model["tier"] == "app":
+        return publish_app(user, model)
+    deselect_app()
+    mdir = sitegen.media_dir(home)
+    os.makedirs(RELEASES, exist_ok=True)
+    seq = _next_seq()
+    build = os.path.join(RELEASES, ".build-%d" % os.getpid())
+    final = os.path.join(RELEASES, str(seq))
+    shutil.rmtree(build, ignore_errors=True)
+    os.makedirs(build)
+    try:
+        written = sitegen.render_site(model, mdir, build)
+        # Re-scrub every image in the rendered tree: re-encoding
+        # here means even a hand-planted file in the media store
+        # cannot carry metadata (or a polyglot payload) into the
+        # served tree. A decode failure aborts the publish.
+        for rel in written:
+            if rel.startswith("media/"):
+                path = os.path.join(build, rel)
+                data, ext = sitegen.scrub_image_bytes(path)
+                if not rel.endswith("." + ext):
+                    print("publish: media %s re-encodes to %s; "
+                          "refusing" % (rel, ext), file=sys.stderr)
+                    return 1
+                with open(path, "wb") as f:
+                    f.write(data)
+        # Content-derived mtimes for every file (A8); directories
+        # get the fixed epoch (not observable over HTTP). Modes are
+        # set EXPLICITLY: B's nginx worker must traverse every
+        # directory and read every file, and the process umask is
+        # not a contract (a 0770 release dir in the first slice-4
+        # build made nginx answer 403 for the whole site).
+        for root, dirs, files in os.walk(build):
+            for name in files:
+                path = os.path.join(root, name)
+                os.chmod(path, 0o644)
+                with open(path, "rb") as f:
+                    data = f.read()
+                ts = sitegen.content_mtime(data)
+                os.utime(path, (ts, ts))
+                _fsync_file(path)
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o755)
+                os.utime(os.path.join(root, name),
+                         (sitegen.FIXED_EPOCH, sitegen.FIXED_EPOCH))
+            os.chmod(root, 0o755)
+            _fsync_dir(root)
+        os.rename(build, final)
+        _fsync_dir(RELEASES)
+    except Exception as e:  # noqa: BLE001 - fail closed, keep old
+        shutil.rmtree(build, ignore_errors=True)
+        print("publish: failed: %s" % e, file=sys.stderr)
+        return 1
+
+    # Atomic swap: build the new symlink next to the old, rename.
+    tmp_link = os.path.join(SITE_DIR, ".current-%d" % os.getpid())
+    try:
+        os.unlink(tmp_link)
+    except FileNotFoundError:
+        pass
+    os.symlink("releases/%d" % seq, tmp_link)
+    os.replace(tmp_link, CURRENT)
+    _fsync_dir(SITE_DIR)
+
+    # Prune: keep current + previous release only.
+    keep = {seq, seq - 1}
+    for name in os.listdir(RELEASES):
+        if name.isdigit() and int(name) not in keep:
+            shutil.rmtree(os.path.join(RELEASES, name),
+                          ignore_errors=True)
+    _fsync_dir(RELEASES)
+    print("PUBLISH_OK release=%d files=%d" % (seq, len(written)))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--user", required=True)
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        print("publish: must run as root", file=sys.stderr)
+        return 1
+    return publish(args.user)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

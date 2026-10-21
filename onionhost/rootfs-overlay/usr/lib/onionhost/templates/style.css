@@ -1,0 +1,20 @@
+/* OnionHost static tiers: one fixed stylesheet, no external
+   resources, no JavaScript. */
+body {
+  font-family: sans-serif;
+  line-height: 1.55;
+  color: #1a1a1a;
+  background: #fdfdfa;
+  max-width: 42em;
+  margin: 2em auto;
+  padding: 0 1em;
+}
+h1 { font-size: 1.7em; line-height: 1.25; }
+h2 { font-size: 1.3em; }
+a { color: #4b2e83; }
+img { max-width: 100%; height: auto; }
+ul.pages, ul.entries { list-style: none; padding-left: 0; }
+ul.pages li, ul.entries li { margin: 0.6em 0; font-size: 1.1em; }
+.date { color: #666; font-size: 0.85em; margin-left: 0.5em; }
+p.meta { color: #666; }
+footer { margin-top: 3em; color: #888; font-size: 0.85em; }

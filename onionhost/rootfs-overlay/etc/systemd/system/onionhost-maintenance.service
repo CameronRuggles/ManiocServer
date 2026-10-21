@@ -1,0 +1,24 @@
+[Unit]
+Description=OnionHost maintenance console (restore / re-key menu)
+After=local-fs.target
+ConditionPathExists=/etc/onionhost/luks-roles.json
+
+[Service]
+Type=idle
+# The reboot prompt lives INSIDE the ExecStart chain on purpose:
+# ExecStartPost runs concurrently with ExecStart (it is a post-START
+# hook, not post-exit), so its `read` raced the menu for the console
+# and rebooted the machine seconds into the session (found in the
+# slice-5B battery, guest B journal 2026-10-13). Sequential in one
+# shell, the prompt can only appear after the menu has exited.
+ExecStart=/bin/sh -c '/usr/local/bin/onionhost-maintenance; printf "\nMaintenance finished. Press Enter to restart the computer."; read _dummy; exec /bin/systemctl reboot'
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty1
+
+[Install]
+WantedBy=onionhost-maintenance.target

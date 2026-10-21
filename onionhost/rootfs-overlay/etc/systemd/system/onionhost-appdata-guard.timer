@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the OnionHost app-data quota guard every few minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=onionhost-appdata-guard.service
+
+[Install]
+WantedBy=timers.target

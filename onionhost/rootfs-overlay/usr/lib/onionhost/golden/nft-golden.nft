@@ -1,0 +1,102 @@
+# OnionHost golden nftables table - PRODUCTION policy (step-3 slice 3).
+#
+# PROVENANCE: replaces the Stage 0 PoC miniature. Implements DESIGN-v2
+# section 6 + DESIGN-v3 A8/DQ9 (egress by identity) for the topology
+# that actually shipped in slice 1: containers A (Tor gateway) and U
+# (client Tor) on the dedicated Podman bridge network "onionhost"
+# (10.89.77.0/24), B on no network at all, and this table policing the
+# HOST's own traffic plus the bridge's forwarded traffic. The gate
+# mechanics are unchanged (A8: load this file into a scratch netns,
+# canonicalise both sides' JSON listings with the same nft binary,
+# compare) - only the rules are production now.
+#
+# Model: every base chain defaults to DROP. A packet is allowed only
+# by an explicit rule below. Netavark keeps its own tables for the
+# bridge NAT plumbing; because a forwarded packet must be accepted by
+# EVERY filter chain on its hook, this table can only ever narrow
+# what the engine allows, never widen it (DESIGN-v2 M3).
+#
+# Identity notes (measured on the installed system, slice 3):
+#   - There is NO stub resolver in this image: systemd-resolved is
+#     inactive and NetworkManager writes /etc/resolv.conf directly at
+#     the upstream. DNS egress is therefore policed per sending user
+#     (port 53 rules in the output chain) - that is the DQ9
+#     enforcement point in the system as built.
+#   - The Podman bridge INTERFACE is named by podman ("podman1" on
+#     the slice-3 install), NOT after the network: the network is
+#     called "onionhost" but `ip link` shows the bridge as podman1.
+#     A first cut of this policy matched iifname "onionhost" and so
+#     silently dropped ALL container egress (A stuck at 5%
+#     bootstrap) - caught by the slice-3 acceptance battery. The
+#     forward chain therefore matches on the dedicated container
+#     SUBNET, which is the design's real invariant; only packets
+#     routed from that subnet can be forwarded at all (host-local
+#     processes traverse the output chain, never forward).
+#   - Users referenced by name: root (host administration, apt
+#     driver, NetworkManager), _apt (apt's download sandbox), and
+#     _chrony (time daemon; NTS-KE is TCP 4460, NTP is UDP 123).
+
+table inet onionhost {
+    # Destinations the containers may never be aimed at: this host's
+    # own networks. A compromised gateway must not become a LAN
+    # attack platform (design: egress is to the internet, only).
+    set private_dst {
+        type ipv4_addr
+        flags interval
+        elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10,
+                     127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12,
+                     192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4,
+                     240.0.0.0/4 }
+    }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        # DHCP lease renewals (NetworkManager); the initial lease is
+        # negotiated before this table loads.
+        udp sport 67 udp dport 68 accept
+        # Nothing else is offered inbound - ever. Tor is outbound
+        # only; there is no listener to protect because there is no
+        # listener, and unsolicited packets die here.
+    }
+
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+        # DHCP client (NetworkManager runs as root).
+        meta skuid root udp sport 68 udp dport 67 accept
+        # DNS egress, by identity only (DQ9): root, apt's sandbox
+        # and chrony may resolve names. The desktop user may not -
+        # and with no other egress rule for that user either, the
+        # desktop has no network at all (DESIGN-v3 DQ7 consequence:
+        # desktop user gets ZERO egress).
+        meta skuid { root, _apt, _chrony } udp dport 53 accept
+        meta skuid { root, _apt, _chrony } tcp dport 53 accept
+        # Host package updates over HTTPS (DESIGN-v2 section 7: host
+        # apt is clearnet HTTPS; the signature is the gate).
+        meta skuid { root, _apt } tcp dport { 80, 443 } accept
+        # Time: NTS only (DQ10). NTS-KE handshake on TCP 4460, the
+        # secured NTP exchange itself on UDP 123, both as _chrony
+        # (root is covered for chronyd's pre-drop-privilege start).
+        meta skuid { root, _chrony } udp dport 123 accept
+        meta skuid { root, _chrony } tcp dport 4460 accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        # Container egress (A's Tor and U's Tor): TCP out to public
+        # addresses, any port (guards live on arbitrary ports - A8),
+        # sourced from the dedicated container subnet (see the
+        # bridge-name note in the header). UDP from containers is
+        # dropped outright (DESIGN-v2 section 6: TCP-out only, UDP
+        # dropped) - Tor needs none, and B has no interface to send
+        # from in the first place. Traffic between containers stays
+        # on the bridge (never routed, so never seen here); traffic
+        # from a container to any private/reserved address dies
+        # against the daddr rule.
+        ip saddr 10.89.77.0/24 ip daddr != @private_dst meta l4proto tcp accept
+    }
+}

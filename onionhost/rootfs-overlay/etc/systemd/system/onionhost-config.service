@@ -1,0 +1,12 @@
+[Unit]
+Description=OnionHost - render golden configs
+After=local-fs.target
+Before=onionhost-a.service onionhost-b.service onionhost-u.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-generate-configs
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

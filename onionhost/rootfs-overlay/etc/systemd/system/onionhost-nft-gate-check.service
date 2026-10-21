@@ -1,0 +1,8 @@
+[Unit]
+Description=OnionHost - periodic firewall gate check (stops A on mismatch)
+After=onionhost-nft-load.service
+Requires=onionhost-nft-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-nft-gate-check

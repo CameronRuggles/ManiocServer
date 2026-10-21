@@ -1,0 +1,11 @@
+# SMF recipe: permission-normaliser exceptions (slice 6B flag 1).
+# Read by the app container's init after its uniform pass; format:
+#   <octal mode> <path relative to the app-data volume>
+# Settings.php and its backup hold the database password. The
+# uniform pass would leave them group-shared at 0664; the recipe
+# keeps them at 0660 - still writable by the application (SMF's
+# admin panel edits Settings.php) and manageable by the owner
+# through the owner group, but never readable by other accounts
+# on the host.
+0660 www/Settings.php
+0660 www/Settings_bak.php

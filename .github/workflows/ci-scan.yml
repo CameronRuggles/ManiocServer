@@ -1,0 +1,14 @@
+name: ci-scan
+# Publication guard (Review 2, task 2): fails on private-key headers,
+# non-allowlisted public IPv4 addresses, /home/<user>/ paths, and ELF
+# binaries outside archive/. Logic lives in build/ci-scan.sh so the
+# same check can run as a pre-push hook.
+on:
+  push:
+  pull_request:
+jobs:
+  ci-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: ./build/ci-scan.sh

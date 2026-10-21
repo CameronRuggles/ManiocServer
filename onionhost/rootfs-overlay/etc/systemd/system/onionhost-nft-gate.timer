@@ -1,0 +1,14 @@
+[Unit]
+Description=OnionHost - re-run firewall gate check every 5 minutes (DESIGN-v3 A8)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Points at the CHECK unit, not the boot gate unit: the boot gate is
+# RemainAfterExit (so A can BindsTo= it), and timers cannot re-run an
+# already-active unit. The check unit re-executes the comparison and
+# stops A itself on mismatch.
+Unit=onionhost-nft-gate-check.service
+
+[Install]
+WantedBy=timers.target

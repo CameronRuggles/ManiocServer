@@ -1,0 +1,16 @@
+[Unit]
+Description=OnionHost - load golden nftables table
+After=local-fs.target
+Before=onionhost-nft-gate.service onionhost-a.service
+
+[Service]
+Type=oneshot
+# Idempotent load: `nft -f` over an already-loaded table would append
+# duplicate rules and the gate would (correctly) report a mismatch
+# forever. Deleting first makes a reload converge to exactly the
+# golden table - this delete+load pair is also what a "Repair" does.
+ExecStart=/bin/sh -c 'nft delete table inet onionhost 2>/dev/null || true; exec nft -f /usr/lib/onionhost/golden/nft-golden.nft'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

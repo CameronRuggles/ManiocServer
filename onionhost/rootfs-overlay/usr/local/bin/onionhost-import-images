@@ -1,0 +1,27 @@
+#!/bin/sh
+# OnionHost image import: the ISO ships container rootfs tarballs under
+# /usr/lib/onionhost/images/ (built locally by the ISO build from signed
+# Debian packages - DESIGN-v3 A6: podman import, no registry is ever
+# contacted). This oneshot imports them into rootful Podman storage
+# once (marker file) so the Quadlet units can reference stable tags.
+set -eu
+MARKER=/var/lib/onionhost/.images-imported
+IMGDIR=/usr/lib/onionhost/images
+if [ -f "$MARKER" ]; then
+    exit 0
+fi
+mkdir -p /var/lib/onionhost
+if [ -f "$IMGDIR/onionhost-tor.tar" ]; then
+    podman import --change 'CMD ["tor","-f","/etc/tor/torrc"]' \
+        "$IMGDIR/onionhost-tor.tar" localhost/onionhost-tor:latest
+fi
+if [ -f "$IMGDIR/onionhost-web.tar" ]; then
+    podman import --change 'CMD ["nginx","-c","/etc/nginx/nginx.conf","-g","daemon off;"]' \
+        "$IMGDIR/onionhost-web.tar" localhost/onionhost-web:latest
+fi
+if [ -f "$IMGDIR/onionhost-app.tar" ]; then
+    podman import --change 'CMD ["/bin/sh","/etc/onionhost/app-init.sh"]' \
+        "$IMGDIR/onionhost-app.tar" localhost/onionhost-app:latest
+fi
+touch "$MARKER"
+echo "onionhost-import-images: done"

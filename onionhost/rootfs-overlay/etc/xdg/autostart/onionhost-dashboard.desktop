@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Manioc Server
+Comment=Your Manioc Server website: status and editing (opens only after setup is complete)
+Exec=/usr/bin/python3 /usr/lib/onionhost/wizard.py --dashboard
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

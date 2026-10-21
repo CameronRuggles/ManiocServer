@@ -1,0 +1,12 @@
+[Unit]
+Description=OnionHost - firewall gate (live table must match golden)
+After=onionhost-nft-load.service
+Requires=onionhost-nft-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-nft-gate
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

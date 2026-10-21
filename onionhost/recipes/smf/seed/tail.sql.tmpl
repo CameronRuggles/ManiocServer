@@ -1,0 +1,58 @@
+-- OnionHost SMF recipe: seed tail (A23). Appended by
+-- onionhost-recipe to SMF's own install SQL (already prefix- and
+-- path-substituted) to form the one-shot database seed the app
+-- container's init imports on first start. Tokens __LIKE_THIS__
+-- are substituted by the applier; the administrator values come
+-- from the owner's own choices at setup time (staged root-only by
+-- onionhost-wizard-helper recipe-setup, shredded after use) -
+-- the recipe never invents credentials.
+
+-- Sealed-world settings (gate round P3 findings). The main SQL
+-- already carries registration_method = 0 (immediate registration:
+-- email activation can never work here - there is no mail out)
+-- and mail_type = 0 (PHP mail(); with no MTA in the image every
+-- attempt fails immediately and cleanly instead of queueing).
+-- Remote avatars: the server must never fetch avatar URLs.
+-- avatar_download_external is already off by default; killing
+-- the size limits removes the url_image_size() fetch SMF would
+-- otherwise make when a member saves an external avatar URL, and
+-- gravatar integration is switched off (it would hand member
+-- email hashes to a third party and cannot be fetched anyway).
+UPDATE __PREFIX__settings SET value = '0' WHERE variable = 'avatar_download_png';
+UPDATE __PREFIX__settings SET value = '0' WHERE variable = 'avatar_max_width_external';
+UPDATE __PREFIX__settings SET value = '0' WHERE variable = 'avatar_max_height_external';
+UPDATE __PREFIX__settings SET value = '0' WHERE variable = 'gravatarEnabled';
+
+-- Version checks: SMF's admin panel fetches these files from
+-- simplemachines.org server-side and logs an error every time
+-- when they cannot be retrieved - which, in a sealed room, is
+-- always. The rows are the fetch list; removing them removes
+-- the noise at the root. (The version data they feed cannot be
+-- shown here regardless.)
+DELETE FROM __PREFIX__admin_info_files;
+
+-- The forum administrator, created with the account details the
+-- owner chose at setup time. Column set mirrors SMF's own
+-- installer exactly. The password is stored in SMF's legacy
+-- 40-char sha1 form (sha1 of lowercased name + password): SMF
+-- 2.1's login accepts it and upgrades the row to bcrypt on the
+-- administrator's first successful login (Sources/LogInOut.php).
+-- Seeding bcrypt directly would need a PHP runtime on the host
+-- at provision time; the host has none by design.
+INSERT INTO __PREFIX__members
+	(member_name, real_name, passwd, email_address, id_group,
+	 posts, date_registered, password_salt, lngfile,
+	 personal_text, avatar, member_ip, member_ip2, buddy_list,
+	 pm_ignore_list, website_title, website_url, signature,
+	 usertitle, secret_question, additional_groups, ignore_boards)
+VALUES
+	('__ADMIN_USER__', '__ADMIN_USER__', '__ADMIN_PASS_SHA1__',
+	 '__ADMIN_EMAIL__', 1, 0, __NOW__, '__ADMIN_SALT__', '', '',
+	 '', '', '', '', '', '', '', '', '', '', '', '');
+
+-- Member statistics the installer would have maintained.
+UPDATE __PREFIX__settings SET value = '1' WHERE variable = 'totalMembers';
+INSERT INTO __PREFIX__settings (variable, value)
+	VALUES ('latestMember', '1'),
+	       ('latestRealName', '__ADMIN_USER__')
+	ON DUPLICATE KEY UPDATE value = VALUES(value);

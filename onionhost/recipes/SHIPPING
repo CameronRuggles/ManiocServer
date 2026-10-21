@@ -1,0 +1,21 @@
+# Manioc Server — release recipe ship list (Repo Review 3 task 10, B9).
+#
+# A release build (build/build-iso.sh) fetches, verifies and packages
+# EXACTLY the recipes named in this file — one recipe id per line,
+# blank lines and #-comments ignored. Both the fetch step
+# (build/fetch-recipe-archives.sh) and the factory-package loop in
+# build/build-iso.sh honour this list, so what is fetched is what
+# ships, and nothing else in recipes/ can enter a release image.
+#
+# marketplace is EXCLUDED from this list until owner decision 3 is
+# met — i.e. until the marketplace recipe is rebuildable from a
+# pinned public commit. Do not add it before then: a release build
+# must be incapable of including it.
+#
+# A different set may be built ONLY as a clearly-marked non-release
+# build (OH_RECIPES + OH_NONRELEASE_BUILD=1 — see the top-level
+# README.md). The override never changes this file or the default.
+smf
+wordpress
+dokuwiki
+gitea

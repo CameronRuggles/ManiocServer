@@ -1,0 +1,7 @@
+<entry>
+<title>%%HEADING%%</title>
+<id>urn:onionhost:entry:%%ID%%</id>
+<link href="entry-%%ID%%.html"/>
+<updated>%%UPDATED%%</updated>
+<summary>%%SUMMARY%%</summary>
+</entry>

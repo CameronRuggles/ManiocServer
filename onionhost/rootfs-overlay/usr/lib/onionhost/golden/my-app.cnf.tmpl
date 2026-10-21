@@ -1,0 +1,24 @@
+# OnionHost golden MariaDB config for the APP container (slice 6B).
+# Rendered to /etc/onionhost/my-app.cnf by onionhost-generate-configs
+# when the site kind is "app" (PHP runtime).
+#
+# Gate P1 finding: NO gVisor-specific deltas are required - io_uring
+# and native AIO probes fail with ENOSYS under runsc and InnoDB falls
+# back automatically with zero error lines. innodb_use_native_aio is
+# preset to 0 only to silence the probing. Socket-only, no networking
+# at all: the database is reachable solely by processes inside this
+# sandbox (PHP-FPM, and mariadb-dump/mariadb driven by the host's
+# backup/restore through `podman exec`).
+[mysqld]
+user = mysql
+datadir = /srv/appdata/db
+socket = /run/mysqld/mysqld.sock
+pid-file = /tmp/mysqld.pid
+skip-networking = 1
+innodb_use_native_aio = 0
+innodb_buffer_pool_size = 256M
+log_error = /dev/stderr
+tmpdir = /tmp
+
+[client]
+socket = /run/mysqld/mysqld.sock

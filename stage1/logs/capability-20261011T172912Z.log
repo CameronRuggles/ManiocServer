@@ -1,0 +1,8 @@
+### Deferred-item capability roll-call — 20261011T172912Z
+A-in-gVisor egress:      needs runsc + tor + outbound TCP — runsc: /usr/bin/runsc, tor: MISSING
+Podman rootful/rootless: needs podman + a pullable/local image — podman: MISSING
+Resource ceilings:       needs writable cgroup2 subtree_control — writable: yes
+Gate 2b live back-stop:  needs nft + a drifted B with real egress — nft: /usr/sbin/nft
+Gate 3 production table: needs nft with conntrack (ct state) — test on rig: nft add rule in a scratch netns
+Gate 5 PoW calibration:  needs A running in gVisor with real egress + a second client tor (see ../poc/scripts/gate5-load.sh)
+Golden configs carried over from Stage 0: /home/hatch/workspace/onion-host-os/poc/configs/ (torrc.golden, runsc.golden — runsc.golden REQUIRES --host-uds=create)

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""OnionHost podman runtime wrapper around runsc (DESIGN-v3 A18).
+
+Registered in /etc/containers/containers.conf as the "runsc-wrap"
+runtime and, since Repo Review 2 task 20, also the engine DEFAULT:
+plain crun/runsc are no longer registered, so a unit that loses its
+PodmanArgs=--runtime=runsc-wrap line still lands here, and the
+runtime gate (onionhost-runtime-gate) checks the result.
+
+Why this exists (all measured on the Stage 1 rig, POC-RESULTS "Stage 1 rig
+run"; DESIGN-v3-amendments A18):
+  * Podman runtime entries take no arguments, and BOTH a plain runsc
+    runtime and OCI annotations fail SILENTLY to make container unix
+    sockets host-visible. The wrapper therefore injects a --host-uds
+    mode per bundle class (below).
+  * Networking (REVISED in step-3 slice 1, measured on the installed
+    system with podman 5): A/U no longer use the host network at all.
+    gVisor CANNOT join the host netns from inside the mandatory
+    --userns=auto user namespace ("cannot run with network enabled
+    in root network namespace" at runsc start); A18's strip+host
+    recipe predates userns=auto on A and podman 4.9's spec shape
+    (podman 5 emits NO netns entry for host/none modes). A/U now sit
+    on a dedicated podman bridge network (onionhost.network Quadlet);
+    podman creates a netns owned by the container's userns, the spec
+    carries that entry, and runsc uses it as-is - so for tor bundles
+    the wrapper leaves the spec untouched and passes NO --network
+    flag. (The pre-bridge --network=host fallback for a tor bundle
+    with no netns entry was REMOVED in Repo Review 2 task 21: host
+    networking is never a safe fallback for a sandbox. A tor bundle
+    without a netns entry now simply gets no --network flag and
+    runsc's own default applies; production Quadlets always carry
+    the bridge netns entry.)
+  * For website-class bundles (the nginx container B and the
+    combined app container) it strips the netns entry if one ever
+    appears and passes --network=none: the website gets a private
+    loopback-only gVisor netns. It must never have a route anywhere.
+    Unrecognised bundles get the same strip and --network=none
+    (Repo Review 5 B-2): no network is the only safe default for
+    a bundle this wrapper cannot classify.
+
+Host-UDS modes (Repo Review 2 task 21 / finding S3):
+  * Tor class (A and U): --host-uds=all. A must CONNECT to the
+    website's socket (B's publish alone left A's tor unable to
+    connect in the rig measurements), so tor keeps the broad mode.
+  * Website class and unrecognised bundles: --host-uds=create.
+    They only CREATE their listener socket (B/app create b1.sock;
+    the host side and A do the connecting), so create-only is
+    least privilege and is exactly what the PoC shim proved serves
+    the site (poc/scripts/runsc-shim.py used create for nginx).
+
+FAIL CLOSED (Repo Review 2 task 21 / finding S2): the pre-review
+wrapper caught every bundle error and exec'd runsc anyway with
+only --host-uds=all, silently dropping the network and UDS
+restrictions. Now, any invocation that NAMES a bundle (--bundle,
+either form) whose config.json is missing, unreadable or corrupt -
+or whose bundle edit cannot be written back - exits non-zero
+WITHOUT exec'ing runsc, as does a create/run with no bundle at
+all. The container does not start; nothing runs unsandboxed or
+half-configured. Invocations with no bundle and no create/run
+verb pass through as before: the post-create lifecycle verbs
+(start/state/kill/delete) legitimately carry no bundle - they
+operate on a sandbox whose containment was fixed at create time -
+and so do --version-style probes.
+
+The container is identified by its process args in the bundle config
+(tor = A/U, nginx = B, an app-init.sh invocation = the slice-6B
+combined app container, which occupies B's slot).
+NEVER add --ignore-cgroups here: that flag surrenders the resource
+ceilings the rootful design exists to keep (A5/A18).
+"""
+import json
+import os
+import sys
+
+REAL_RUNSC = "/usr/local/bin/runsc"
+
+# The verbs that CREATE a sandbox. Only these must present a
+# bundle: the containment decision (network + UDS mode) is made at
+# create time. Post-create lifecycle verbs carry no bundle (see
+# the header) and pass through with the legacy flag shape.
+_CREATE_VERBS = frozenset({"create", "run"})
+
+
+def _find_bundle(args):
+    """Locate the OCI bundle dir in runtime argv.
+
+    conmon/podman pass it as '--bundle <dir>' or '--bundle=<dir>'
+    depending on version (podman 5 uses the = form; missing it meant
+    the netns strip silently never happened and runsc refused the
+    host netns at start). Fall back to any arg that is a directory
+    containing a config.json.
+    """
+    for i, a in enumerate(args):
+        if a == "--bundle" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--bundle="):
+            return a.split("=", 1)[1]
+    for a in args:
+        if os.path.isdir(a) and os.path.exists(os.path.join(a, "config.json")):
+            return a
+    return None
+
+
+def _fail(msg):
+    print(f"runsc-wrap: FAIL CLOSED: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _strip_netns(cfg, cfg_path, bundle, ns, has_netns):
+    """Remove any network-namespace entry from the bundle spec,
+    writing the config back. A failed write-back fails closed:
+    starting with the entry still in place would hand the
+    container a namespace the caller meant to deny."""
+    if not has_netns:
+        return
+    # (shared by the website and unrecognised branches)
+    cfg["linux"]["namespaces"] = \
+        [n for n in ns if n.get("type") != "network"]
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+    except Exception as e:
+        _fail(f"bundle {bundle!r} netns strip failed: {e}")
+
+
+def main():
+    args = sys.argv[1:]
+    bundle = _find_bundle(args)
+    if bundle is None:
+        # No bundle anywhere. A create/run without a bundle cannot
+        # be classified - fail closed. Anything else is a
+        # post-create lifecycle verb or a probe, which legitimately
+        # carries no bundle: pass through with the pre-review flag
+        # shape (the sandbox it operates on was fixed at create).
+        if any(a in _CREATE_VERBS for a in args):
+            _fail("create/run with no bundle in argv")
+        os.execv(REAL_RUNSC, [REAL_RUNSC, "--host-uds=all"] + args)
+
+    cfg_path = os.path.join(bundle, "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as e:
+        _fail(f"bundle {bundle!r} unreadable: {e}")
+
+    cmd = cfg.get("process", {}).get("args", [])
+    prog = os.path.basename(cmd[0]) if cmd else ""
+    ns = cfg.get("linux", {}).get("namespaces", [])
+    has_netns = any(n.get("type") == "network" for n in ns)
+    # The combined app container's Exec is the app-init script (it
+    # starts nginx itself); it is website-class: no network, ever,
+    # exactly like the static website.
+    is_website = prog == "nginx" or \
+        any("app-init" in str(a) for a in cmd)
+    is_tor = prog == "tor"
+
+    if is_tor:
+        # A/U: connect-capable UDS, spec untouched, no --network
+        # flag (the bridge netns entry in the spec is runsc's to
+        # use as-is). Unchanged from the proven production shape.
+        extra = ["--host-uds=all"]
+    elif is_website:
+        # Website class: create-only UDS (it creates b1.sock; it
+        # never connects to a host socket) and no network, ever.
+        # Strip a netns entry if one ever appears and force
+        # gVisor's loopback-only mode.
+        _strip_netns(cfg, cfg_path, bundle, ns, has_netns)
+        extra = ["--host-uds=create", "--network=none"]
+    else:
+        # Unrecognised bundle: no network and create-only UDS is
+        # the only safe default. It still runs under gVisor (this
+        # wrapper IS the sandbox boundary), just with nothing to
+        # reach and nothing to connect to. The netns strip applies
+        # here too (Repo Review 5 B-2): --network=none must not
+        # have to outrank a netns entry the spec already carries
+        # for the denial to hold on every runsc version.
+        _strip_netns(cfg, cfg_path, bundle, ns, has_netns)
+        extra = ["--host-uds=create", "--network=none"]
+    os.execv(REAL_RUNSC, [REAL_RUNSC] + extra + args)
+
+
+if __name__ == "__main__":
+    main()

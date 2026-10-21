@@ -1,0 +1,6 @@
+[Unit]
+Description=OnionHost Maintenance (no network, no containers)
+Documentation=file:/usr/local/bin/onionhost-maintenance
+Requires=basic.target onionhost-maintenance.service
+After=basic.target onionhost-maintenance.service
+AllowIsolate=yes

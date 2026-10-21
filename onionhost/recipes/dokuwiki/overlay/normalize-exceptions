@@ -1,0 +1,14 @@
+# DokuWiki recipe: permission-normaliser exceptions (slice 6B
+# flag 1). Read by the app container's init after its uniform
+# pass, and applied by onionhost-recipe itself after an apply
+# and after the install hook; format:
+#   <octal mode> <path relative to the app-data volume>
+# users.auth.php holds every member's password hash and
+# local.php is the owner's own configuration (it can carry
+# sensitive settings for auth plugins). The uniform pass would
+# leave both group-shared at 0664; the recipe keeps them at
+# 0660 - still writable by the application (DokuWiki runs as
+# the files' owner) and manageable by the owner through the
+# owner group, but never readable by other accounts on the host.
+0660 www/conf/users.auth.php
+0660 www/conf/local.php

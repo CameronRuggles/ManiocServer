@@ -1,0 +1,49 @@
+; OnionHost golden PHP-FPM config for the APP container (slice 6B).
+; Rendered to /etc/onionhost/php-fpm-app.conf by
+; onionhost-generate-configs when the site kind is "app" (PHP
+; runtime). One pool, sandbox-internal socket; MariaDB is reached on
+; its sandbox-internal socket too, so the pool's default socket
+; settings point PHP's MySQL drivers at it without the app needing
+; to know a host or port.
+[global]
+pid = /tmp/php-fpm.pid
+error_log = /dev/stderr
+daemonize = no
+; Recipe seam (A23): an optional pool-overlay fragment for future
+; project-packaged recipes. generate-configs always renders the
+; target (empty unless a recipe provides one) so this include can
+; never fail on a missing file.
+include = /etc/onionhost/php-fpm-app-extra.conf
+
+[www]
+user = www-data
+group = www-data
+listen = /run/php-fpm.sock
+; nginx (www-data) is the only client; the socket never leaves the
+; sandbox. Mode mirrors the gate-round finding (in-sandbox socket
+; perms are not a boundary here; the edge socket is).
+listen.mode = 0666
+pm = dynamic
+; A13 forum sizing on the recommended hardware class: a handful of
+; workers is what a home connection can feed through Tor anyway.
+pm.max_children = 8
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+catch_workers_output = yes
+php_admin_value[mysqli.default_socket] = /run/mysqld/mysqld.sock
+php_admin_value[pdo_mysql.default_socket] = /run/mysqld/mysqld.sock
+php_admin_value[session.save_path] = /tmp/php-sessions
+php_admin_value[error_log] = /dev/stderr
+php_admin_flag[log_errors] = on
+; A broken app must not spray internals at visitors; errors go to
+; the container log (journal) where the owner/support can see them.
+php_admin_flag[display_errors] = off
+; Repo Review 5 E-1: do not emit the X-Powered-By version header at
+; all (the app nginx templates also clear it at the edge, in case a
+; recipe pool overlay ever re-enables it).
+php_admin_value[expose_php] = 0
+php_admin_value[memory_limit] = 256M
+php_admin_value[max_execution_time] = 120
+php_admin_value[upload_max_filesize] = 32M
+php_admin_value[post_max_size] = 32M

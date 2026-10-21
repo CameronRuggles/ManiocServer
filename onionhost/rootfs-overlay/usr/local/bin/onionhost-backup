@@ -1,0 +1,712 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-backup: create an OnionHost backup file (DESIGN-v3 A3).
+
+Runs as root (via onionhost-wizard-helper's `backup` subcommand,
+from the Dashboard's Back up button). NO passphrase is asked or
+needed: the archive is `age`-encrypted to the public recipient(s)
+derived from the disk phrase at install time and recorded in
+/etc/onionhost/backup.json. Whoever holds the file alone holds
+ciphertext; opening it requires the disk phrase (typed later, at
+restore, on the machine being restored - see onionhost-restore).
+
+File format (a plain tar, deliberately inspectable from outside):
+    meta.json     plain metadata: format version, per-install
+                  salts (NOT secret - they travel so that file +
+                  phrase alone suffice to restore), the recipient
+                  strings used, the site's onion address, creation
+                  time.
+    payload.age   age ciphertext of a gzipped tar holding
+                  manifest.json + the payload files. The manifest
+                  lists every file with its sha256, size and kind.
+
+Payload contents (and nothing else - the source list is explicit,
+never a directory sweep):
+    content/site.json, content/wizard-progress.json,
+    content/media/*            the owner's editable site store
+    site/releases/<n>/*, site/current.txt       (static sites)
+                               the published trees B serves
+    onion/hostname, onion/hs_ed25519_secret_key,
+    onion/hs_ed25519_public_key
+                               the onion identity: restore revives
+                               the SAME .onion address
+    system/state.txt           informational (the source state)
+
+App sites (slice 6B, DESIGN-v3 A12.4) replace the site/ section:
+    app/runtime.txt            the slot runtime (php | native)
+    app/db-credentials.env     the application's database
+                               credentials (PHP runtime) - they are
+                               the APP's data, so they travel inside
+                               the encrypted payload; a restored
+                               forum's own config (which holds its
+                               copy) keeps matching the database
+    app/db-dump.sql.gz         a consistent MariaDB dump
+                               (mariadb-dump --single-transaction,
+                               taken live through `podman exec`;
+                               kind "db-dump"). The raw datadir is
+                               NEVER copied - the dump is the
+                               vehicle, restored by the app
+                               container's init on its next start.
+    app/www/*, app/native/*    the app-data volume's owner trees
+                               (kind "app-data"): the application
+                               files and the native slot. For the
+                               native runtime the app container is
+                               stopped for the copy (SQLite files
+                               are copied cold) and restarted after;
+                               for PHP the trees are copied live -
+                               the database dump is the consistent
+                               part, as with any file backup.
+A MariaDB dump is included when the site's runtime is php. If the
+owner switched the runtime to native, the database is not part of
+the site as currently configured and is not dumped (the datadir
+stays on the machine, untouched) - APP-SITES.md says so plainly.
+
+Backup format history: format 1 = static tiers only (slice 5B).
+Format 2 (this writer) adds the app section + "siteKind" in the
+manifest; static backups are otherwise unchanged. onionhost-
+restore reads both formats.
+
+Explicitly NEVER included (A19/A19.1 hygiene - a backup carrying
+the disk keyfile would silently undo the product's core promise):
+the LUKS keyfile (/etc/cryptsetup-keys.d, crypto_keyfile.bin),
+initramfs images, /etc/shadow or any account credentials (the new
+install's own login words stand after a restore), the new
+machine's own backup.json (the restored machine keeps deriving
+from ITS phrase), LUKS role maps (machine-specific), and Tor
+guard state (a restored machine is a new network location; fresh
+guards are correct). Also never included: a staged recipe
+administrator env (appdata/native/.recipe-admin.env - the
+plaintext admin password an interrupted first boot can leave
+behind, S6). A payload path naming one of the platform's own
+named secret files (.recipe-admin.env, recipe-admin.env.tmp)
+refuses the backup, with a plain message saying a setup /
+first-boot step did not finish (S12). Any OTHER *.tmp path
+under appdata/ is a temporary file - an application's own
+in-flight or stale atomic-write temp, never a complete file
+worth backing up - so it is SKIPPED (left out of the backup)
+and LISTED in the completion report (a BACKUP_SKIPPED line
+per file, and a "skipped" list in the payload manifest),
+never silently dropped and never fatal (S12).
+
+Prints: one BACKUP_SKIPPED path=<arc> line per skipped *.tmp
+file (if any), then
+BACKUP_OK path=<dest> bytes=<n> recipients=<k>
+"""
+import argparse
+import gzip
+import hashlib
+import io
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/usr/lib/onionhost")
+import sitegen  # noqa: E402
+
+BACKUP_KEYS = "/etc/onionhost/backup.json"
+SITE_DIR = "/var/lib/onionhost/site"
+HS_DIR = "/var/lib/onionhost/tor/hs"
+STATE_FILE = "/var/lib/onionhost/state"
+APPDATA = "/var/lib/onionhost/appdata"
+APP_DB_ENV = "/etc/onionhost/app-db.env"
+APP_CONTAINER = "onionhost-app"
+FORMAT = 2
+
+FORBIDDEN_MARKERS = ("cryptsetup-keys", "crypto_keyfile", "root.key",
+                     "initrd", "initramfs", "shadow", "luks-roles",
+                     ".recipe-admin.env")
+# Markers that also forbid a component's dotted extensions
+# (initrd.img-6.1, crypto_keyfile.bin): the system file shapes.
+FORBIDDEN_DOTTED = ("initrd", "initramfs", "root.key",
+                    "crypto_keyfile")
+# The platform's own named secret files (exact basenames): the
+# staged recipe administrator env and its in-flight temp form.
+# Either one still being on the volume means a setup /
+# first-boot step did not finish, and the file can hold a
+# plaintext administrator credential by construction (S5/S6),
+# so its presence refuses the backup - with the plain,
+# actionable message from _named_secret_message, never an
+# "internal error" (S12). Any OTHER *.tmp path under appdata/
+# is an application's own temporary file: it is skipped and
+# listed in the report, not refused (see create_backup).
+NAMED_SECRET_BASENAMES = (".recipe-admin.env",
+                          "recipe-admin.env.tmp")
+
+
+def _forbidden_component(part):
+    if part in FORBIDDEN_MARKERS:
+        return True
+    return any(part.startswith(m + ".") for m in FORBIDDEN_DOTTED)
+
+
+def _named_secret_message(arc, src):
+    name = arc.rsplit("/", 1)[-1]
+    where = src or arc
+    return ("the backup was not made: a setup or first-boot "
+            "step did not finish, and it left the file %s "
+            "behind (at %s). That file was staged for the "
+            "unfinished setup and can hold a password, so it "
+            "must never travel in a backup. Finish the setup, "
+            "then make the backup again. If the setup was "
+            "given up on and will not be finished, remove the "
+            "file %s and then make the backup again."
+            % (name, where, name))
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _fail(msg):
+    print("backup: %s" % msg, file=sys.stderr)
+    return 1
+
+
+def _db_name():
+    try:
+        with open(APP_DB_ENV) as f:
+            for line in f:
+                if line.startswith("DB_NAME="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "onionhost_app"
+
+
+def _app_running():
+    proc = subprocess.run(
+        ["podman", "inspect", "-f", "{{.State.Running}}",
+         APP_CONTAINER], capture_output=True, text=True)
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _app_exec(argv, timeout=120):
+    return subprocess.run(["podman", "exec", APP_CONTAINER] + argv,
+                          capture_output=True, timeout=timeout)
+
+
+def _db_root_password():
+    """The per-install MariaDB root password from the
+    credentials record (D2: root authenticates by password,
+    never by unix_socket peer credentials, which gVisor does
+    not honour - see onionhost-app-provision). Empty when the
+    record predates root passwords; the callers then fall back
+    to the passwordless form (which is also what the app init's
+    bridge needs on a not-yet-bridged datadir)."""
+    try:
+        with open(APP_DB_ENV) as f:
+            for line in f:
+                if line.startswith("DB_ROOT_PASSWORD="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _root_exec(argv, timeout=120):
+    """Run a MariaDB client inside the app container as root,
+    presenting the root password through the client's
+    environment (MYSQL_PWD - never an argv element)."""
+    pw = _db_root_password()
+    if pw:
+        argv = ["env", "MYSQL_PWD=" + pw] + argv
+    return _app_exec(argv, timeout=timeout)
+
+
+def _ensure_app_db_ready():
+    """Make sure the app container is up and MariaDB answers, so
+    the dump is live and consistent. Raises ValueError (plain
+    message) if it cannot be."""
+    if not _app_running():
+        proc = subprocess.run(["systemctl", "start",
+                               "onionhost-app"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise ValueError(
+                "the website software is not running and could "
+                "not be started, so its database cannot be "
+                "backed up")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            proc = _root_exec(["mariadb-admin", "-u", "root",
+                               "ping"], timeout=15)
+        except subprocess.SubprocessError:
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            return
+        time.sleep(2)
+    raise ValueError("the website database did not answer in time; "
+                     "the backup was not made")
+
+
+def _dump_database(work):
+    """mariadb-dump through the container, gzipped to a file in
+    `work`; returns its path."""
+    proc = _root_exec(["mariadb-dump", "--single-transaction",
+                       "-u", "root", _db_name()], timeout=600)
+    if proc.returncode != 0:
+        raise ValueError(
+            "reading the website database failed: %s"
+            % proc.stderr.decode("utf-8", "replace").strip()[:200])
+    if not proc.stdout:
+        raise ValueError("the website database dump came back "
+                         "empty; the backup was not made")
+    path = os.path.join(work, "db-dump.sql.gz")
+    with open(path, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                           mtime=0) as gz:
+            gz.write(proc.stdout)
+    return path
+
+
+def _collect_static(entries):
+    """The published trees B serves. Returns the current release
+    sequence string for site/current.txt."""
+    releases = os.path.join(SITE_DIR, "releases")
+    if not os.path.isdir(releases):
+        raise ValueError("the published website is missing")
+    found_release = False
+    for seq in sorted(os.listdir(releases)):
+        rdir = os.path.join(releases, seq)
+        if not seq.isdigit() or not os.path.isdir(rdir):
+            continue
+        found_release = True
+        for root, _dirs, files in os.walk(rdir):
+            for name in sorted(files):
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, SITE_DIR)
+                entries.append(("site/" + rel.replace(os.sep, "/"),
+                                src, "file"))
+    if not found_release:
+        raise ValueError("the published website is missing")
+    current = os.path.join(SITE_DIR, "current")
+    if not os.path.islink(current):
+        raise ValueError("the published website is not linked in")
+    return os.path.basename(os.readlink(current).rstrip("/"))
+
+
+def _site_db_engine(model, runtime):
+    """Which database engine the app site's backup must dump,
+    or None: the recipe manifest decides for a packaged site (a
+    flat-file recipe declares db.required=false; a PostgreSQL
+    recipe - native, A23 recipe 5 - declares db.engine
+    "postgres"); a hand-installed PHP app always gets the
+    MariaDB leg; a native site without a manifest engine has
+    no database leg (its store is files on the volume). An
+    unreadable manifest means MariaDB for php - fail-closed,
+    as the platform treats a missing database record today."""
+    recipe = model.get("recipe")
+    if recipe:
+        try:
+            with open("/usr/share/onionhost/recipes/%s/"
+                      "manifest.json" % recipe) as f:
+                manifest = json.load(f)
+            db = manifest.get("db", {})
+            if not db.get("required", True):
+                return None
+            if db.get("engine") == "postgres":
+                return "postgres"
+        except (OSError, ValueError):
+            pass
+    return "mariadb" if runtime == "php" else None
+
+
+def _ensure_pg_ready():
+    """Make sure the app container is up and PostgreSQL
+    answers, so the dump is live and consistent (the
+    _ensure_app_db_ready contract, for the postgres engine:
+    the superuser authenticates by password over the sandbox
+    loopback - see onionhost-app-provision)."""
+    if not _app_running():
+        proc = subprocess.run(["systemctl", "start",
+                               "onionhost-app"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise ValueError(
+                "the website software is not running and could "
+                "not be started, so its database cannot be "
+                "backed up")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            proc = _app_exec(
+                ["env", "PGPASSWORD=" + _db_root_password(),
+                 "psql", "-h", "127.0.0.1", "-U", "postgres",
+                 "-d", "postgres", "-tAc", "SELECT 1"],
+                timeout=15)
+        except subprocess.SubprocessError:
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            return
+        time.sleep(2)
+    raise ValueError("the website database did not answer in "
+                     "time; the backup was not made")
+
+
+def _dump_pg_database(work):
+    """pg_dump through the container (as the superuser, by
+    password over the loopback), gzipped to a file in `work`;
+    returns its path. The dump is plain SQL for the one
+    application database - the same restore contract as the
+    MariaDB leg: the app init imports it into a fresh
+    database at the next start."""
+    proc = _app_exec(
+        ["env", "PGPASSWORD=" + _db_root_password(),
+         "pg_dump", "-h", "127.0.0.1", "-U", "postgres",
+         _db_name()], timeout=600)
+    if proc.returncode != 0:
+        raise ValueError(
+            "reading the website database failed: %s"
+            % proc.stderr.decode("utf-8", "replace")
+            .strip()[:200])
+    if not proc.stdout:
+        raise ValueError("the website database dump came back "
+                         "empty; the backup was not made")
+    path = os.path.join(work, "db-dump.sql.gz")
+    with open(path, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                           mtime=0) as gz:
+            gz.write(proc.stdout)
+    return path
+
+
+def _collect_app(entries, generated, work, runtime, engine):
+    """The app slot's contents (see the header). May stop/start
+    the app container: the native runtime's SQLite files must be
+    copied cold, and a database-less PHP site's files ARE its
+    database, so they get the same cold copy; a PHP site with a
+    database copies its trees live and takes a consistent dump
+    instead. A PostgreSQL site (native runtime, engine
+    "postgres") gets BOTH: its dump is taken live first (the
+    pgdb datadir itself is never copied - the dump is the
+    portable form, as with MariaDB), then its trees are copied
+    cold like any native site's."""
+    if not os.path.isdir(APPDATA):
+        raise ValueError("there is no application installed to "
+                         "back up yet")
+    generated["app/runtime.txt"] = (runtime + "\n").encode()
+    entries.append(("app/runtime.txt", None, "app-config"))
+
+    if engine == "postgres":
+        if not os.path.isfile(APP_DB_ENV):
+            raise ValueError("the application's database record "
+                             "is missing; the backup was not "
+                             "made")
+        entries.append(("app/db-credentials.env", APP_DB_ENV,
+                        "app-config"))
+        _ensure_pg_ready()
+        entries.append(("app/db-dump.sql.gz",
+                        _dump_pg_database(work), "db-dump"))
+
+    stopped = False
+    if runtime == "native" or (runtime == "php"
+                                and engine is None):
+        subprocess.run(["systemctl", "stop", "onionhost-app"],
+                       capture_output=True)
+        stopped = True
+    try:
+        for sub in ("www", "native"):
+            base = os.path.join(APPDATA, sub)
+            if not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                for name in sorted(files):
+                    src = os.path.join(root, name)
+                    rel = os.path.relpath(src, APPDATA)
+                    entries.append(
+                        ("app/" + rel.replace(os.sep, "/"),
+                         src, "app-data"))
+    finally:
+        if stopped:
+            subprocess.run(["systemctl", "start", "onionhost-app"],
+                           capture_output=True)
+
+    if runtime == "php" and engine == "mariadb":
+        if not os.path.isfile(APP_DB_ENV):
+            raise ValueError("the application's database record "
+                             "is missing; the backup was not "
+                             "made")
+        entries.append(("app/db-credentials.env", APP_DB_ENV,
+                        "app-config"))
+        _ensure_app_db_ready()
+        entries.append(("app/db-dump.sql.gz",
+                        _dump_database(work), "db-dump"))
+
+
+def _collect(user, work):
+    """Return (entries, onion, generated, site_kind, runtime)
+    where entries is a list of (archive_path, source_path, kind).
+    Raises ValueError with a plain message on any missing piece."""
+    home = pwd.getpwnam(user).pw_dir
+    cfg = os.path.join(home, ".config", "onionhost")
+    entries = []
+    generated = {}
+
+    def add(arc, src, kind="file"):
+        if not os.path.isfile(src):
+            raise ValueError("a needed file is missing: %s" % src)
+        entries.append((arc, src, kind))
+
+    model_file = os.path.join(cfg, "site.json")
+    if not os.path.isfile(model_file):
+        raise ValueError("there is no website to back up yet")
+    add("content/site.json", model_file)
+    try:
+        model = sitegen.load_model(model_file)
+    except (ValueError, OSError):
+        raise ValueError("the website record could not be read")
+    site_kind = model.get("tier", "pages")
+    runtime = model.get("runtime") if site_kind == "app" else None
+    progress = os.path.join(cfg, "wizard-progress.json")
+    if os.path.isfile(progress):
+        add("content/wizard-progress.json", progress)
+    media = os.path.join(cfg, "media")
+    if os.path.isdir(media):
+        for name in sorted(os.listdir(media)):
+            add("content/media/%s" % name,
+                os.path.join(media, name))
+
+    if site_kind == "app":
+        _collect_app(entries, generated, work, runtime,
+                     _site_db_engine(model, runtime))
+    else:
+        cur_target = _collect_static(entries)
+        generated["site/current.txt"] = (cur_target + "\n").encode()
+        entries.append(("site/current.txt", None, "file"))
+
+    hs_names = ("hostname", "hs_ed25519_secret_key",
+                "hs_ed25519_public_key")
+    for name in hs_names:
+        add("onion/%s" % name, os.path.join(HS_DIR, name))
+    with open(os.path.join(HS_DIR, "hostname")) as f:
+        onion = f.read().strip()
+    generated["system/state.txt"] = (_read_state_text()
+                                     + "\n").encode()
+    entries.append(("system/state.txt", None, "file"))
+    return entries, onion, generated, site_kind, runtime
+
+
+def create_backup(user, dest):
+    try:
+        with open(BACKUP_KEYS) as f:
+            keys = json.load(f)
+    except OSError:
+        return _fail("backups are not set up on this computer "
+                     "(no backup key record)")
+    except ValueError:
+        return _fail("the backup key record is damaged")
+    entry = keys.get("main")
+    if not entry:
+        return _fail("backups are not set up on this computer "
+                     "(no backup recipients)")
+    recipients = [entry["recipient"]]
+    salts = {"main": entry["salt"]}
+
+    skipped = []
+    work = tempfile.mkdtemp(prefix="onionhost-backup-",
+                             dir="/var/lib/onionhost")
+    try:
+        try:
+            entries, onion, generated, site_kind, runtime = \
+                _collect(user, work)
+        except ValueError as e:
+            return _fail(str(e))
+        except KeyError:
+            return _fail("unknown user %r" % user)
+
+        # Belt-and-braces: no payload path may ever name key
+        # material. Markers match whole path components (or a
+        # component's dotted prefix, for versioned system file
+        # shapes like initrd.img-*), never raw substrings: an
+        # application may legitimately ship files whose names
+        # merely CONTAIN a marker - WordPress core ships
+        # wp-includes/block-supports/shadow.php and an icon
+        # named shadow.svg - and a substring match would make
+        # such an app unbackupable (found by the WordPress
+        # recipe acceptance, 2026-10-14).
+        #
+        # Two *.tmp carve-outs (S12), checked before the
+        # forbidden markers:
+        # - a payload path whose basename is one of the
+        #   platform's own named secret files refuses the
+        #   backup, with the plain _named_secret_message;
+        # - any other *.tmp path in the app-data trees is the
+        #   application's own temporary file: skip it (it is
+        #   not copied below) and record it in `skipped`, so
+        #   the completion report and the manifest name it.
+        # A *.tmp path anywhere else keeps the pre-S12 refusal.
+        kept = []
+        for arc, src, kind in entries:
+            parts = arc.lower().split("/")
+            if parts[-1] in NAMED_SECRET_BASENAMES:
+                return _fail(_named_secret_message(arc, src))
+            if any(part.endswith(".tmp") for part in parts):
+                if kind == "app-data":
+                    skipped.append(arc)
+                    continue
+                return _fail("internal error: forbidden path in "
+                             "backup set: %s" % arc)
+            if any(_forbidden_component(part) for part in parts):
+                return _fail("internal error: forbidden path in "
+                             "backup set: %s" % arc)
+            kept.append((arc, src, kind))
+        entries = kept
+
+        payload_dir = os.path.join(work, "payload")
+        os.makedirs(payload_dir)
+        manifest_entries = []
+        for arc, src, kind in entries:
+            target = os.path.join(payload_dir, arc)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if src is None:
+                data = generated[arc]
+                with open(target, "wb") as f:
+                    f.write(data)
+                digest = hashlib.sha256(data).hexdigest()
+                size = len(data)
+            else:
+                shutil.copyfile(src, target)
+                digest = _sha256(target)
+                size = os.path.getsize(target)
+            manifest_entries.append({
+                "path": arc, "sha256": digest, "size": size,
+                "kind": kind,
+            })
+        try:
+            with open(sitegen.model_path(
+                    pwd.getpwnam(user).pw_dir)) as f:
+                title = json.load(f).get("title", "")
+        except Exception:  # noqa: BLE001 - title is cosmetic here
+            title = ""
+        created = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        manifest = {
+            "format": FORMAT,
+            "kind": "onionhost-backup-payload",
+            "created": created,
+            "onion": onion,
+            "siteTitle": title,
+            "siteKind": site_kind,
+            "entries": manifest_entries,
+        }
+        if site_kind == "app":
+            manifest["appRuntime"] = runtime
+        if skipped:
+            manifest["skipped"] = [
+                {"path": arc,
+                 "reason": "temporary file (*.tmp): not a "
+                           "complete file, left out of the "
+                           "backup"}
+                for arc in skipped]
+        with open(os.path.join(payload_dir, "manifest.json"),
+                  "w") as f:
+            f.write(json.dumps(manifest, indent=2, sort_keys=True)
+                    + "\n")
+
+        tar_gz = os.path.join(work, "payload.tar.gz")
+        with open(tar_gz, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb",
+                               fileobj=raw, mtime=0) as gz:
+                with tarfile.open(fileobj=gz, mode="w") as tar:
+                    for name in sorted(os.listdir(payload_dir)):
+                        tar.add(os.path.join(payload_dir, name),
+                                arcname=name)
+        payload_age = os.path.join(work, "payload.age")
+        cmd = ["age"]
+        for r in recipients:
+            cmd += ["-r", r]
+        cmd += ["-o", payload_age, tar_gz]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return _fail("encrypting the backup failed: %s"
+                         % proc.stderr.strip()[:200])
+
+        meta = {
+            "format": FORMAT,
+            "kind": "onionhost-backup",
+            "created": created,
+            "onion": onion,
+            "salts": {"main": salts.get("main")},
+            "recipients": recipients,
+        }
+        meta_json = (json.dumps(meta, indent=2, sort_keys=True)
+                     + "\n").encode()
+
+        dest_dir = os.path.dirname(dest)
+        fd, tmp_dest = tempfile.mkstemp(
+            prefix=".onionhost-backup-", dir=dest_dir)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                with tarfile.open(fileobj=out, mode="w") as tar:
+                    info = tarfile.TarInfo("meta.json")
+                    info.size = len(meta_json)
+                    info.mtime = 0
+                    info.mode = 0o644
+                    tar.addfile(info, io.BytesIO(meta_json))
+                    tar.add(payload_age, arcname="payload.age")
+                out.flush()
+                os.fsync(out.fileno())
+        except BaseException:
+            try:
+                os.unlink(tmp_dest)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_dest, dest)
+        dfd = os.open(dest_dir, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        pw = pwd.getpwnam(user)
+        os.chown(dest, pw.pw_uid, pw.pw_gid)
+        os.chmod(dest, 0o644)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for arc in skipped:
+        print("BACKUP_SKIPPED path=%s" % arc)
+    print("BACKUP_OK path=%s bytes=%d recipients=%d"
+          % (dest, os.path.getsize(dest), len(recipients)))
+    return 0
+
+
+def _read_state_text():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="onionhost-backup")
+    ap.add_argument("--user", required=True)
+    ap.add_argument("--dest", required=True,
+                    help="full path of the backup file to write")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        print("backup: must run as root", file=sys.stderr)
+        return 1
+    dest = os.path.abspath(args.dest)
+    if not dest.endswith(".onionhost-backup"):
+        return _fail("the backup file name must end in "
+                     ".onionhost-backup")
+    if not os.path.isdir(os.path.dirname(dest)):
+        return _fail("that folder does not exist")
+    return create_backup(args.user, dest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

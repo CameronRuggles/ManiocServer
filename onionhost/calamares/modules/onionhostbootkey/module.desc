@@ -1,0 +1,6 @@
+---
+type:       "job"
+name:       "onionhostbootkey"
+interface:  "python"
+script:     "main.py"
+weight:     1.0

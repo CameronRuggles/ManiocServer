@@ -1,0 +1,378 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-wizard-helper: the wizard's only privileged path.
+
+Invoked via sudo (sudoers allows the sudo group to run ONLY this
+script without a password) by the unprivileged first-boot wizard.
+Subcommands:
+
+  commit-login   Read the new login phrase from stdin and perform
+                 the A10 S0->S1 transition IN ORDER:
+                   1. set the calling user's password to the phrase
+                      (chpasswd, phrase never in argv/logs),
+                   2. remove the S0 LightDM autologin drop-in,
+                   3. fsync the touched files and directories,
+                   4. write state=S1 (atomic tmp+rename+fsync),
+                   5. point the user's remembered session at XFCE,
+                   6. restart LightDM (deferred ~2 s so this process
+                      can exit cleanly first).
+                 A power cut between steps leaves a consistent
+                 state: either still S0 (drop-in present, wizard
+                 repeats) or S1 with a working password login.
+
+  set-state S2   The Go Live transition. Only S1 -> S2 is
+                 accepted; anything else exits non-zero.
+
+  publish        Run onionhost-publish for the calling user (the
+                 only writer of the served content tree). The
+                 wizard/dashboard editor is unprivileged; this is
+                 its single path to publishing. Output and exit
+                 code pass through.
+
+  probe-status   Run onionhost-probe (the A4 self-check through
+                 the client-only container U) and pass its output
+                 and exit code through, for the Dashboard status
+                 card. The probe reads A's hostname file, which
+                 the login user cannot read - hence this hop.
+
+  backup DEST    Run onionhost-backup for the calling user into
+                 the destination file the wizard's save dialog
+                 chose (Dashboard Back up button; DESIGN-v3 A3).
+                 DEST is validated before the run: it must be a
+                 .onionhost-backup name inside the caller's home
+                 or on their removable media mounts. Output and
+                 exit code pass through. NO passphrase is involved
+                 in making a backup - see onionhost-backup.
+
+  app-info       Print the app slot's details for the Dashboard's
+                 app page (slice 6B): runtime, the app folder, and
+                 (PHP runtime) the database name / user / password
+                 from /etc/onionhost/app-db.env. That file is
+                 root-and-container readable only AT REST; showing
+                 it to the machine's owner in their own signed-in
+                 desktop session is how they configure the
+                 application they installed. No other reader exists:
+                 the helper discloses it only via the owner's own
+                 sudo'd GUI hop, same as the probe's status.
+
+  recipe-setup   Stage the administrator details for a packaged
+                 recipe's first install (A23). Reads THREE lines
+                 from stdin - recipe id, administrator user name,
+                 administrator password - plus an OPTIONAL fourth
+                 line, the site title (recipes whose installer
+                 asks for one, e.g. WordPress, consume it), and
+                 writes them to /etc/onionhost/recipe-admin.env
+                 (0400, root-only), the same stdin discipline as
+                 commit-login: the password never appears in argv
+                 or logs. onionhost-recipe consumes the file when
+                 it seeds the recipe (or drives its installer) and
+                 shreds it afterwards, so the plaintext exists only
+                 between the wizard's Go Live and the first publish.
+"""
+import os
+import subprocess
+import sys
+
+STATE_FILE = "/var/lib/onionhost/state"
+RESTORED_MARKER = "/var/lib/onionhost/restored"
+S0_DROPIN = "/etc/lightdm/lightdm.conf.d/20-onionhost-s0.conf"
+
+
+def _fsync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_state():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _write_state(value):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(value + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE_FILE)
+    _fsync_file(STATE_FILE)
+    _fsync_dir(os.path.dirname(STATE_FILE))
+
+
+def _calling_user():
+    user = os.environ.get("SUDO_USER", "")
+    if not user or user == "root":
+        raise SystemExit("wizard-helper: no valid SUDO_USER")
+    return user
+
+
+def cmd_commit_login():
+    if _read_state() != "S0":
+        raise SystemExit("wizard-helper: commit-login requires "
+                         "state S0 (found %r)" % _read_state())
+    user = _calling_user()
+    phrase = sys.stdin.read().rstrip("\n")
+    if len(phrase) < 8 or "\n" in phrase or ":" in phrase:
+        raise SystemExit("wizard-helper: invalid login phrase")
+
+    # 1. Set the password (phrase travels on stdin only).
+    proc = subprocess.run(["chpasswd"], input="%s:%s\n" % (user, phrase),
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit("wizard-helper: chpasswd failed: %s"
+                         % proc.stderr.strip()[:200])
+    _fsync_file("/etc/shadow")
+
+    # 2. Remove the S0 autologin drop-in.
+    try:
+        os.unlink(S0_DROPIN)
+    except FileNotFoundError:
+        pass
+    # 3. fsync the directory so the removal is durable.
+    _fsync_dir(os.path.dirname(S0_DROPIN))
+    _fsync_dir("/etc/lightdm")
+
+    # 4. State S1, atomically.
+    _write_state("S1")
+
+    # 5. Remembered session -> XFCE (belt and braces: the wizard
+    # session script itself also falls through to XFCE off-S0).
+    as_dir = "/var/lib/AccountsService/users"
+    try:
+        os.makedirs(as_dir, exist_ok=True)
+        as_path = os.path.join(as_dir, user)
+        existing = ""
+        if os.path.exists(as_path):
+            with open(as_path) as f:
+                existing = f.read()
+        lines = [l for l in existing.splitlines()
+                 if not l.startswith(("Session=", "XSession=",
+                                      "[User]"))]
+        content = "[User]\nSession=xfce\nXSession=xfce\n" + \
+            ("\n".join(lines) + "\n" if lines else "")
+        with open(as_path, "w") as f:
+            f.write(content)
+    except OSError:
+        pass  # non-fatal: the session-script fallthrough covers it
+
+    # 6. Restart LightDM shortly after we exit.
+    subprocess.run(["systemd-run", "--on-active=2s",
+                    "--unit=onionhost-s1-lightdm-restart",
+                    "/bin/systemctl", "restart", "lightdm"],
+                   capture_output=True)
+    print("wizard-helper: S0->S1 committed for user %s" % user)
+    return 0
+
+
+def cmd_set_state(value):
+    current = _read_state()
+    if not (current == "S1" and value == "S2"):
+        raise SystemExit("wizard-helper: transition %s -> %s not "
+                         "allowed" % (current, value))
+    _write_state("S2")
+    # A restore at S0 leaves a "your website is back" marker; the
+    # wizard's restored page ends here, so the marker's job is done.
+    try:
+        os.unlink(RESTORED_MARKER)
+        _fsync_dir(os.path.dirname(RESTORED_MARKER))
+    except FileNotFoundError:
+        pass
+    print("wizard-helper: state S1->S2 committed")
+    return 0
+
+
+def cmd_publish():
+    user = _calling_user()
+    proc = subprocess.run(["/usr/local/bin/onionhost-publish",
+                           "--user", user],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+def cmd_probe_status():
+    proc = subprocess.run(["/usr/local/bin/onionhost-probe"])
+    return proc.returncode
+
+
+def cmd_backup(dest):
+    """Validated hop to onionhost-backup (see the docstring)."""
+    import pwd
+    user = _calling_user()
+    home = pwd.getpwnam(user).pw_dir
+    dest = os.path.abspath(dest)
+    if not dest.endswith(".onionhost-backup"):
+        print("wizard-helper: the backup file name must end in "
+              ".onionhost-backup", file=sys.stderr)
+        return 2
+    allowed = (home + os.sep,
+               "/media/%s/" % user,
+               "/run/media/%s/" % user)
+    if not dest.startswith(allowed):
+        print("wizard-helper: backups can only be saved in your "
+              "home folder or on your own stick/drive",
+              file=sys.stderr)
+        return 2
+    proc = subprocess.run(["/usr/local/bin/onionhost-backup",
+                           "--user", user, "--dest", dest],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+def cmd_app_info():
+    _calling_user()  # only the owner's own session gets this
+    out = {}
+    try:
+        with open("/var/lib/onionhost/app-runtime") as f:
+            out["RUNTIME"] = f.read().strip()
+    except OSError:
+        out["RUNTIME"] = ""
+    out["APP_FOLDER"] = "/var/lib/onionhost/appdata/www"
+    out["APP_NATIVE_FOLDER"] = "/var/lib/onionhost/appdata/native"
+    try:
+        with open("/etc/onionhost/app-db.env") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(("DB_NAME=", "DB_USER=",
+                                    "DB_PASSWORD=")):
+                    key, _, value = line.partition("=")
+                    out[key] = value
+    except OSError:
+        pass
+    out["DB_SOCKET"] = "/run/mysqld/mysqld.sock (inside the app; PHP " \
+                       "apps: host = localhost)"
+    for key in ("RUNTIME", "APP_FOLDER", "APP_NATIVE_FOLDER",
+                "DB_SOCKET", "DB_NAME", "DB_USER", "DB_PASSWORD"):
+        if key in out:
+            print("%s=%s" % (key, out[key]))
+    return 0
+
+
+def cmd_recipe_setup():
+    _calling_user()  # only the owner's own session gets this
+    import re
+    raw = sys.stdin.read()
+    lines = raw.split("\n")
+    if len(lines) < 3:
+        print("recipe-setup: expected recipe id, admin user and "
+              "admin password on stdin", file=sys.stderr)
+        return 1
+    recipe_id = lines[0].strip()
+    user = lines[1].strip()
+    password = lines[2]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", recipe_id):
+        print("recipe-setup: bad recipe id", file=sys.stderr)
+        return 1
+    manifest = os.path.join("/usr/share/onionhost/recipes",
+                            recipe_id, "manifest.json")
+    if not os.path.isfile(manifest):
+        print("recipe-setup: no such recipe installed: %s"
+              % recipe_id, file=sys.stderr)
+        return 1
+    # A recipe whose application enforces stricter administrator
+    # rules than the generic floor declares them in its manifest
+    # (admin_password_min / admin_user_max); staging a choice the
+    # application would refuse at first boot helps nobody - the
+    # refusal belongs here, where the owner can still fix it.
+    pw_min = 8
+    user_max = 25
+    try:
+        import json
+        with open(manifest) as f:
+            mdata = json.load(f)
+        pw_min = max(pw_min, int(mdata.get("admin_password_min",
+                                           pw_min)))
+        user_max = min(user_max, int(mdata.get("admin_user_max",
+                                               user_max)))
+    except (OSError, ValueError):
+        pass
+    if not re.fullmatch(r"[A-Za-z0-9 _.\-@]{1,%d}" % user_max,
+                        user):
+        print("recipe-setup: the administrator name must be "
+              "1-%d characters (letters, numbers, spaces, _ . - @)"
+              % user_max, file=sys.stderr)
+        return 1
+    if not (pw_min <= len(password) <= 200) or "\x00" in password:
+        print("recipe-setup: the administrator password must be "
+              "at least %d characters" % pw_min, file=sys.stderr)
+        return 1
+    title = lines[3].strip() if len(lines) > 3 else ""
+    if len(title) > 200 or "\x00" in title:
+        print("recipe-setup: bad site title", file=sys.stderr)
+        return 1
+    path = "/etc/onionhost/recipe-admin.env"
+    tmp = path + ".tmp"
+    # The staged file IS a plaintext password: it must be BORN
+    # at 0400, not written under the process umask and chmodded
+    # afterwards (S5) - a crash in between would leave the
+    # secret at the wider mode, and the .tmp was never shredded.
+    # A stale temp from an interrupted earlier run is removed
+    # first and the new temp created O_EXCL at its final mode;
+    # fchmod on the still-empty file pins the exact mode before
+    # any secret bytes land (os.open's mode is umask-narrowed).
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o400)
+        f.write("RECIPE_ID=%s\nRECIPE_ADMIN_USER=%s\n"
+                "RECIPE_ADMIN_PASSWORD=%s\n"
+                % (recipe_id, user, password))
+        if title:
+            f.write("RECIPE_SITE_TITLE=%s\n" % title)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_file(path)
+    _fsync_dir(os.path.dirname(path))
+    print("RECIPE_SETUP_OK recipe=%s" % recipe_id)
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        print("wizard-helper: must run as root", file=sys.stderr)
+        return 1
+    if len(sys.argv) >= 2 and sys.argv[1] == "commit-login":
+        return cmd_commit_login()
+    if len(sys.argv) >= 2 and sys.argv[1] == "app-info":
+        return cmd_app_info()
+    if len(sys.argv) == 2 and sys.argv[1] == "recipe-setup":
+        return cmd_recipe_setup()
+    if len(sys.argv) == 3 and sys.argv[1] == "set-state":
+        return cmd_set_state(sys.argv[2])
+    if len(sys.argv) == 2 and sys.argv[1] == "publish":
+        return cmd_publish()
+    if len(sys.argv) == 2 and sys.argv[1] == "probe-status":
+        return cmd_probe_status()
+    if len(sys.argv) == 3 and sys.argv[1] == "backup":
+        return cmd_backup(sys.argv[2])
+    print("usage: onionhost-wizard-helper commit-login | "
+          "set-state S2 | publish | probe-status | backup DEST | "
+          "app-info | recipe-setup",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

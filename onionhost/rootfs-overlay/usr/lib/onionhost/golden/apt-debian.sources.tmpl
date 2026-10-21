@@ -1,0 +1,17 @@
+# Debian base updates ride the same Tor path as the project repo
+# (Gate 4): Debian's own official onion mirrors (addresses per
+# onion.debian.org, also printed in apt-transport-tor's README),
+# fetched through container U by the same tor+http method.
+# Rendered to /etc/apt/sources.list.d/debian.sources by
+# onionhost-generate-configs.
+Types: deb
+URIs: tor+http://2s4yqjx5ul6okpp3f2gaunr2syex5jgbfpfvhxxbbjwnrsvbk5v3qbid.onion/debian
+Suites: trixie trixie-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: tor+http://5ajw6aqf3ep7sijnscdzw77t7xq4xjpsy335yb2wiwgouo7yfxtjlmid.onion/debian-security
+Suites: trixie-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg

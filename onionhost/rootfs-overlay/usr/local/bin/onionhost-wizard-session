@@ -1,0 +1,18 @@
+#!/bin/sh
+# OnionHost wizard session (DESIGN-v3 A10).
+#
+# At state S0 this session is a kiosk: a window manager for focus and
+# the wizard full-screen, nothing else. At ANY other state the
+# session falls through to the normal XFCE desktop, so even if the
+# S0 autologin drop-in somehow survives, the user can never be
+# trapped in a wizard-only session after setup - and if the state
+# file is missing entirely, the desktop wins too.
+state=""
+if [ -r /var/lib/onionhost/state ]; then
+    state=$(cat /var/lib/onionhost/state)
+fi
+if [ "$state" != "S0" ]; then
+    exec xfce4-session
+fi
+xfwm4 &
+exec python3 /usr/lib/onionhost/wizard.py --kiosk

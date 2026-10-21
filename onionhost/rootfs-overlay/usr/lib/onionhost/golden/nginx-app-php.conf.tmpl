@@ -1,0 +1,75 @@
+# OnionHost golden nginx config for the APP container, PHP runtime
+# (slice 6B, DESIGN-v3 A12/A20). Rendered to /etc/onionhost/nginx-app.conf
+# by onionhost-generate-configs when the site kind is "app".
+#
+# One combined sandbox (gate-round recommendation): nginx, PHP-FPM and
+# MariaDB are processes in THIS container. The FPM and DB sockets are
+# sandbox-internal (/run/*.sock); the ONLY socket that crosses the
+# boundary is the edge listener below, in the shared /run/onionhost/web
+# directory, on the same b1.sock name container A's http.sock symlink
+# already points at - so A, the torrc and the rotation story are
+# unchanged from the static tier.
+#
+# REMOTE_ADDR is fixed at 127.0.0.1 (gate P3 finding): the edge is a
+# unix socket (in production: Tor), there IS no client IP to pass, and
+# apps that validate REMOTE_ADDR as an IP (SMF does, fatally) break on
+# nginx's literal "unix:" value. Over Tor there is no visitor address
+# to leak; a fixed loopback is the honest value.
+load_module /usr/lib/nginx/modules/ngx_http_headers_more_filter_module.so;
+user www-data;
+pid /tmp/nginx.pid;
+error_log /dev/stderr notice;
+worker_processes 1;
+events { worker_connections 256; }
+http {
+    access_log off;
+    server_tokens off;
+    more_clear_headers Date;
+    # Repo Review 5 E-1: never advertise versions to visitors.
+    # PHP's X-Powered-By hands an attacker the exact interpreter
+    # version for a targeted exploit; Server is cleared
+    # defensively beside it (server_tokens off already keeps it
+    # versionless). The FPM pool also sets expose_php = 0.
+    more_clear_headers 'X-Powered-By';
+    more_clear_headers 'Server';
+    sendfile on;
+    # Forum-class apps accept uploads; the app data volume's quota is
+    # the real bound, this just keeps single requests sane.
+    client_max_body_size 32m;
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+    server {
+        listen unix:/run/onionhost/web/b1.sock;
+        root /srv/appdata/www;
+        index index.php index.html index.htm;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location ~ \.php$ {
+            try_files $uri =404;
+            include /etc/nginx/fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param REMOTE_ADDR 127.0.0.1;
+            fastcgi_pass unix:/run/php-fpm.sock;
+        }
+
+        # App data that must never be web-readable: the platform's
+        # own marker/secret files if an owner drops them in the
+        # docroot by mistake. (The DB credentials file itself never
+        # lives in the docroot - it is mounted at /etc/onionhost/.)
+        location ~* /\.(onionhost|env|git) {
+            deny all;
+        }
+
+        # Recipe seam (A23): a future project-packaged app recipe
+        # may ship an nginx overlay fragment; generate-configs
+        # renders this include target (empty unless a recipe
+        # provides one). Owner-installed apps never need it.
+        include /etc/onionhost/nginx-app-extra.conf;
+    }
+}

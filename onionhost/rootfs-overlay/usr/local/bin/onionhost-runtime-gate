@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""OnionHost runtime gate (Repo Review 2 task 20, finding S1).
+
+gVisor is the containment boundary for the app slot (A20: owners may
+install arbitrary software there; containment is a property of the
+wiring, not curation). Before this gate, gVisor was selected per
+Quadlet unit (PodmanArgs=--runtime=runsc-wrap) with the engine
+default at crun and NOTHING checked the runtime of a running
+container: a unit that lost that one line ran the app slot
+unsandboxed with no signal.
+
+This gate is the check. It reads each OnionHost container's
+OCIRuntime via `podman inspect` and judges it against the only
+acceptable value, "runsc-wrap". Like onionhost-nft-gate it ONLY
+judges - enforcement (stopping units, Dashboard state) lives in
+onionhost-runtime-gate-check:
+
+  exit 0 = every present OnionHost container runs runsc-wrap
+  exit 1 = at least one present container runs something else
+  exit 2 = the gate itself could not run (podman missing/errored)
+
+One line per container goes to stdout for the caller's log/state:
+  OK  <container> <runtime>
+  BAD <container> <runtime>
+  (a container that does not exist is simply absent from the list:
+  B and the app container are condition-selected alternatives, so
+  one of them is legitimately missing on every box. Absence is
+  proven by `podman container exists` exiting 1; any other
+  inspect/exists failure is a gate error, exit 2 - never a pass.)
+
+Env overrides (same pattern as onionhost-update's test seams):
+  ONIONHOST_PODMAN - podman binary (default "podman" via PATH)
+"""
+import json
+import os
+import subprocess
+import sys
+
+EXPECTED = "runsc-wrap"
+CONTAINERS = ["onionhost-a", "onionhost-b", "onionhost-u",
+              "onionhost-app"]
+PODMAN = os.environ.get("ONIONHOST_PODMAN", "podman")
+
+
+def inspect(name):
+    """OCIRuntime for one container, or None if it does not exist.
+
+    Raises RuntimeError when podman ran but its answer cannot be
+    trusted (unparseable / missing field, or an inspect/exists
+    failure for a container that may be present) - that is a gate
+    error (exit 2), not a pass and not a mismatch.
+
+    Absence is established separately, never inferred from an
+    inspect failure (Repo Review 3 task 16, finding S9: the
+    pre-fix code mapped EVERY non-zero inspect exit to "does
+    not exist", so a storage-lock timeout or other transient
+    error on a running, unsandboxed container judged clean -
+    and cleared any standing fail-closed marker). `podman
+    container exists` has a three-way contract: exit 0 = the
+    container is present, exit 1 = it is absent, anything else
+    is an error. Only exit 1 means absent; an inspect failure
+    for a container `exists` says is present is an error too.
+    """
+    try:
+        exists = subprocess.run([PODMAN, "container", "exists", name],
+                                capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"exists {name}: cannot run podman: {e}")
+    if exists.returncode == 1:
+        return None
+    if exists.returncode != 0:
+        raise RuntimeError(
+            f"exists {name}: podman exited {exists.returncode}: "
+            f"{exists.stderr.strip()}")
+    try:
+        proc = subprocess.run([PODMAN, "inspect", name],
+                              capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"inspect {name}: cannot run podman: {e}")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"inspect {name}: podman exited {proc.returncode} for a "
+            f"container that exists: {proc.stderr.strip()}")
+    try:
+        data = json.loads(proc.stdout)
+        return data[0]["OCIRuntime"]
+    except Exception as e:
+        raise RuntimeError(f"inspect {name}: unusable output: {e}")
+
+
+def main():
+    # Probe the binary first: if podman cannot run at all, per-
+    # container failures below would masquerade as "all absent".
+    try:
+        probe = subprocess.run([PODMAN, "--version"],
+                               capture_output=True, text=True)
+        if probe.returncode != 0:
+            raise RuntimeError("podman --version failed")
+    except (OSError, RuntimeError) as e:
+        print(f"onionhost-runtime-gate: ERROR cannot run podman: {e}",
+              file=sys.stderr)
+        return 2
+    bad = 0
+    try:
+        for name in CONTAINERS:
+            runtime = inspect(name)
+            if runtime is None:
+                continue
+            if runtime == EXPECTED:
+                print(f"OK {name} {runtime}")
+            else:
+                print(f"BAD {name} {runtime}")
+                bad += 1
+    except RuntimeError as e:
+        print(f"onionhost-runtime-gate: ERROR {e}", file=sys.stderr)
+        return 2
+    if bad:
+        print(f"onionhost-runtime-gate: MISMATCH {bad} container(s) "
+              f"not running {EXPECTED}", file=sys.stderr)
+        return 1
+    print("onionhost-runtime-gate: OK all present containers run "
+          f"{EXPECTED}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

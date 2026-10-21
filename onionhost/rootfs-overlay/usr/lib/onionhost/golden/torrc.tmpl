@@ -1,0 +1,27 @@
+# OnionHost golden torrc for container A (the onion-service gateway).
+# Rendered to /etc/onionhost/torrc by onionhost-generate-configs.
+# Settings: PoC golden set (POC-RESULTS Gate 0) with production paths.
+# PoWQueueRate/Burst CALIBRATED in step-3 slice 3 (ISO-BUILD-LOG):
+# DQ3's rule - ~2x the sustained rendezvous rate (Gate 5 rig baseline
+# 2.23/s, corroborated by slice-3 multi-client runs: 1.6/s at 12
+# isolated-circuit clients, ~6.4/s aggregate under 48-way parallelism,
+# service CPU ~2% throughout). 5/10 provably engages under a
+# saturating introduction flood and is invisible under moderate load;
+# the old 250/500 never engaged at any load generatable from one host
+# (max attempt rate ~6.4/s). See the slice-3 log for the full table
+# and the single-host caveats.
+DataDirectory /var/lib/onionhost/tor/data
+SocksPort 0
+Log notice stderr
+HiddenServiceDir /var/lib/onionhost/tor/hs
+HiddenServicePort 80 unix:/run/onionhost/web/http.sock
+HiddenServicePoWDefensesEnabled 1
+HiddenServicePoWQueueRate 5
+HiddenServicePoWQueueBurst 10
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServiceEnableIntroDoSRatePerSec 25
+HiddenServiceEnableIntroDoSBurstPerSec 200
+HiddenServiceNumIntroductionPoints 3
+HiddenServiceMaxStreams 50
+HiddenServiceMaxStreamsCloseCircuit 1
+ControlSocket /run/onionhost/control/a.sock

@@ -1,0 +1,311 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""onionhost-rekey: replace the MAIN disk passphrase (DESIGN-v3
+A19.1 re-key procedure, A18 running-system path).
+
+Run as root on the BOOTED system (Maintenance boot entry, or sudo
+from a terminal). The volume was opened at boot with the keyring
+disabled (A18), so the volume key is recoverable from the running
+mapping; the old phrase is never needed and never asked for.
+
+Sequence (add -> test -> kill -> regenerate; nothing destructive
+happens before the new slot is proven):
+  1. Read /etc/onionhost/luks-roles.json for the device + MAIN slot.
+  2. Extract the volume key from `dmsetup table --showkeys` of the
+     root mapping into a 0600 file in /dev/shm (tmpfs). The key is
+     never in argv, env, or logs.
+  3. Generate (or accept with --phrase-from-file) the new 7-word
+     phrase into another 0600 tmpfs file.
+  4. luksAddKey --volume-key-file (Gate R method) a new PBKDF2 slot
+     (--iter-time 2000, sha256).
+  5. cryptsetup open --test-passphrase on the NEW slot.
+  6. luksKillSlot the old MAIN slot (proof: the new phrase).
+  7. Update the role map (atomic write + fsync).
+  8. update-initramfs -u -k all.
+  9. Shred + remove all temp key material.
+
+Modes:
+  --interactive    show the new phrase, verify 3 words typed back
+                   (the Maintenance-console flow),
+  --print-and-go   print the new phrase once and proceed (scripted
+                   runs; the caller captures stdout),
+  --phrase-from-file PATH  use this phrase instead of generating.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, "/usr/lib/onionhost")
+import phrasegen  # noqa: E402
+
+ROLES_PATH = "/etc/onionhost/luks-roles.json"
+PBKDF = "pbkdf2"
+HASH = "sha256"
+ITER_TIME_MS = "2000"
+
+
+def _run(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def _shred(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "wb") as f:
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _parse_slots(dump):
+    slots = {}
+    current = None
+    for line in dump.splitlines():
+        m = re.match(r"\s*(\d+): luks2", line)
+        if m:
+            current = int(m.group(1))
+            slots[current] = {}
+            continue
+        m = re.match(r"\s*PBKDF:\s*(\S+)", line)
+        if m and current is not None:
+            slots[current]["pbkdf"] = m.group(1)
+    return slots
+
+
+def _root_mapping():
+    proc = _run(["findmnt", "-no", "SOURCE", "/"])
+    src = proc.stdout.strip()
+    m = re.match(r"/dev/mapper/(.+)$", src)
+    if not m:
+        raise SystemExit("rekey: root is not on a device-mapper "
+                         "mapping (%r)" % src)
+    return m.group(1)
+
+
+def _volume_key_hex(mapping):
+    proc = _run(["dmsetup", "table", "--showkeys", mapping])
+    if proc.returncode != 0:
+        raise SystemExit("rekey: dmsetup table failed: %s"
+                         % proc.stderr.strip()[:200])
+    for token in proc.stdout.split():
+        if re.fullmatch(r"[0-9a-f]{64,128}", token):
+            return token
+    raise SystemExit("rekey: no volume key in the dm table - was "
+                     "the volume opened with the keyring enabled? "
+                     "(A18 requires --disable-keyring at boot.)")
+
+
+def _phrase_slots(device, phrase_file, slots):
+    hits = []
+    for idx in sorted(slots):
+        proc = _run(["cryptsetup", "open", "--test-passphrase",
+                     "--key-slot", str(idx),
+                     "--key-file", phrase_file, device])
+        if proc.returncode == 0:
+            hits.append(idx)
+    return hits
+
+
+def _fsync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="onionhost-rekey")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--interactive", action="store_true")
+    mode.add_argument("--print-and-go", action="store_true")
+    mode.add_argument("--phrase-from-file")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        print("onionhost-rekey: must run as root", file=sys.stderr)
+        return 1
+
+    with open(ROLES_PATH) as f:
+        roles = json.load(f)
+    uuid = roles.get("uuid")
+    device = roles.get("device")
+    if uuid:
+        by_uuid = "/dev/disk/by-uuid/" + uuid
+        if os.path.exists(by_uuid):
+            device = os.path.realpath(by_uuid)
+    if not device or not os.path.exists(device):
+        print("onionhost-rekey: LUKS device not found (%r)" % device,
+              file=sys.stderr)
+        return 1
+    old_main = roles["slots"]["MAIN"]
+    print("rekey: device %s, replacing MAIN slot %d (KEYFILE=%s)"
+          % (device, old_main, roles["slots"].get("KEYFILE")))
+
+    mapping = _root_mapping()
+    key_hex = _volume_key_hex(mapping)
+    print("rekey: volume key recovered from mapping %s (keyring "
+          "disabled per A18)" % mapping)
+
+    tmpdir = tempfile.mkdtemp(prefix="onionhost-rekey-", dir="/dev/shm")
+    os.chmod(tmpdir, 0o700)
+    vk_file = os.path.join(tmpdir, "vk.bin")
+    phrase_file = os.path.join(tmpdir, "phrase")
+    secret_files = [vk_file, phrase_file]
+    try:
+        with open(vk_file, "wb") as f:
+            f.write(bytes.fromhex(key_hex))
+        os.chmod(vk_file, 0o600)
+        key_hex = None
+
+        if args.phrase_from_file:
+            with open(args.phrase_from_file) as f:
+                phrase = f.read().strip()
+        else:
+            phrase = phrasegen.generate(7)
+        with open(phrase_file, "w") as f:
+            f.write(phrase)
+        os.chmod(phrase_file, 0o600)
+
+        if args.interactive:
+            words = phrase.split(" ")
+            print("\nYour NEW disk passphrase is:\n")
+            print("   " + "  ".join(
+                "%d. %s" % (i + 1, w) for i, w in enumerate(words)))
+            print("\nWrite all 7 words on a NEW piece of paper, in "
+                  "order.\nYour old paper will stop working as soon "
+                  "as this finishes.\n")
+            import random
+            for pos in sorted(random.sample(range(1, 8), 3)):
+                typed = input("Type word number %d from the new "
+                              "paper: " % pos).strip().lower()
+                if typed != words[pos - 1].lower():
+                    print("That does not match - re-key ABORTED, "
+                          "nothing was changed.")
+                    return 1
+        elif args.print_and_go:
+            print("NEW-PHRASE: %s" % phrase)
+
+        before = _parse_slots(
+            _run(["cryptsetup", "luksDump", device]).stdout)
+        proc = _run(["cryptsetup", "luksAddKey", "--batch-mode",
+                     "--pbkdf", PBKDF, "--hash", HASH,
+                     "--iter-time", ITER_TIME_MS,
+                     "--volume-key-file", vk_file, device, phrase_file])
+        if proc.returncode != 0:
+            print("rekey: luksAddKey failed: %s"
+                  % proc.stderr.strip()[:300], file=sys.stderr)
+            return 1
+        after_add = _parse_slots(
+            _run(["cryptsetup", "luksDump", device]).stdout)
+        new_slots = [i for i in after_add if i not in before]
+        if len(new_slots) != 1:
+            print("rekey: expected exactly one new slot, got %s"
+                  % new_slots, file=sys.stderr)
+            return 1
+        new_main = new_slots[0]
+        print("rekey: new PBKDF2 slot %d added (iter-time %s ms)"
+              % (new_main, ITER_TIME_MS))
+
+        proc = _run(["cryptsetup", "open", "--test-passphrase",
+                     "--key-slot", str(new_main),
+                     "--key-file", phrase_file, device])
+        if proc.returncode != 0:
+            print("rekey: new slot FAILED --test-passphrase; old "
+                  "slot kept, aborting.", file=sys.stderr)
+            return 1
+        print("rekey: new slot %d verified with --test-passphrase"
+              % new_main)
+
+        proc = _run(["cryptsetup", "luksKillSlot",
+                     "--key-file", phrase_file, device, str(old_main)])
+        if proc.returncode != 0:
+            print("rekey: luksKillSlot %d failed: %s"
+                  % (old_main, proc.stderr.strip()[:300]),
+                  file=sys.stderr)
+            return 1
+        print("rekey: old MAIN slot %d killed" % old_main)
+
+        roles["slots"]["MAIN"] = new_main
+        roles["iterTimeMs"] = int(ITER_TIME_MS)
+        tmp_roles = ROLES_PATH + ".tmp"
+        with open(tmp_roles, "w") as f:
+            f.write(json.dumps(roles, indent=2, sort_keys=True) + "\n")
+        os.chmod(tmp_roles, 0o644)
+        os.replace(tmp_roles, ROLES_PATH)
+        _fsync_file(ROLES_PATH)
+        print("rekey: role map updated: %s" % roles["slots"])
+
+        proc = _run(["update-initramfs", "-u", "-k", "all"])
+        if proc.returncode != 0:
+            print("rekey: update-initramfs failed: %s"
+                  % proc.stderr.strip()[:300], file=sys.stderr)
+            return 1
+        print("rekey: initramfs regenerated")
+
+        # Refresh the BACKUP recipient (DESIGN-v3 A3): backups made
+        # from now on must open with the NEW phrase. A fresh salt is
+        # derived and the "main" entry - the only entry - is
+        # replaced. A failure here must not undo a successful
+        # re-key - warn loudly instead.
+        try:
+            sys.path.insert(0, "/usr/lib/onionhost")
+            import backupkeys
+            bpath = "/etc/onionhost/backup.json"
+            if os.path.exists(bpath):
+                with open(bpath) as f:
+                    brec = json.load(f)
+                salt = os.urandom(backupkeys.SALT_LEN)
+                brec["main"] = {
+                    "salt": salt.hex(),
+                    "recipient": backupkeys.derive_recipient(
+                        phrase, salt),
+                }
+                btmp = bpath + ".tmp"
+                with open(btmp, "w") as f:
+                    f.write(json.dumps(brec, indent=2,
+                                       sort_keys=True) + "\n")
+                os.chmod(btmp, 0o644)
+                os.replace(btmp, bpath)
+                _fsync_file(bpath)
+                print("rekey: backup key updated - backups made "
+                      "from now on open with the NEW paper. "
+                      "Backups already made still open with the "
+                      "OLD paper, so keep the old paper until "
+                      "those backups are replaced.")
+        except Exception as e:  # noqa: BLE001
+            print("rekey: WARNING: the re-key worked but the "
+                  "backup key could not be refreshed (%s). "
+                  "Backups can still be made; note this message "
+                  "for support." % e, file=sys.stderr)
+        final_hits = _phrase_slots(device, phrase_file,
+                                   _parse_slots(_run(
+                                       ["cryptsetup", "luksDump",
+                                        device]).stdout))
+        print("rekey: DONE. New phrase opens slot(s) %s. The old "
+              "passphrase no longer works; test at the next reboot."
+              % final_hits)
+        return 0
+    finally:
+        for path in secret_files:
+            _shred(path)
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

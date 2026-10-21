@@ -1,0 +1,7 @@
+[Unit]
+Description=OnionHost app-data quota guard
+After=onionhost-config.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-appdata-guard

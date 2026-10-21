@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Manioc Server Setup
+Comment=First-run setup wizard (kiosk session at state S0)
+Exec=/usr/local/bin/onionhost-wizard-session
+TryExec=/usr/local/bin/onionhost-wizard-session
+Type=Application
+DesktopNames=OnionHost
