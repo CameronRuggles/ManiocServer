@@ -6,10 +6,10 @@ against the updater and recipe behaviour described there. This is the
 owner's side of the contract: the list is short because the maintainer
 side (see the runbook) carries the rest.
 
-STATUS: draft for the packaged-app product. One section (§4, persistence
-of owner-added plugins/packages across platform updates) depends on
-Cameron's pending decision in LOCAL-MODS-UPDATE-POLICY-BRIEF-2026-10-15.md
-and is marked as such — do not publish that section until he rules.
+STATUS: draft for the packaged-app product. §4 states the app-update
+policy Cameron settled on 2026-10-21 (amendment A26 — recipes are
+installers, not update channels), which supersedes the open question
+in LOCAL-MODS-UPDATE-POLICY-BRIEF-2026-10-15.md.
 
 ## 1. How updates work — you don't run them
 
@@ -24,12 +24,16 @@ randomized daily schedule. The box never reaches out on the clearnet.
 - **gVisor** is not a Debian package, so a pinned, checksum-verified copy
   rides inside the platform package. It updates when the platform does;
   it never phones Google itself.
-- **The apps** (forum, WordPress, wiki, Gitea) update as signed recipe
-  packages through the same pipeline.
+- **The apps** (forum, WordPress, wiki, Gitea) are the exception, on
+  purpose: a signed recipe package *installs* an app once, and after
+  that the app is yours — updating it is your job (§4). The platform
+  never changes an installed app.
 
-Two protections, automatic:
+Two protections, automatic (they cover the system and the platform —
+your app is never touched by an update run, so it needs neither):
 
-- Every update is health-checked afterwards through the real onion path.
+- Every system and platform update is health-checked afterwards
+  through the real onion path.
   If the site doesn't answer, the update rolls back on its own. If a
   rollback would land on a known-vulnerable version, the box takes the
   site *down* rather than serve vulnerable software, and heals itself
@@ -61,8 +65,8 @@ background update. That ships as a guided project migration.
    the forgotten-login-words fix lives there too — the disk phrase
    resets them.
 6. **Run your own website.** The app admin password you chose, your
-   content, your forum members. Everything underneath it is the
-   platform's job.
+   content, your forum members — and keeping the app itself updated
+   (§4). Everything underneath it is the platform's job.
 7. **Physical reality:** off means sealed. A running machine being seized
    is outside what this can promise — and the setup wizard already tells
    you plainly not to host from home if being located would put you in
@@ -115,8 +119,9 @@ the app container has no outbound network at all, and the update
 machinery is switched off in the config so you never see an "update
 available" button that could never work. An app container that can reach
 wordpress.org can reach anything — that phone-home path is exactly the
-deanonymization route the product exists to close. Core updates arrive
-through the signed recipe channel instead (§1).
+deanonymization route the product exists to close. Core updates are
+yours to make by replacing the files from the desktop (§4) — the
+same door your plugins already come through.
 
 **SMF forum packages — easier, by design:** SMF's Package Manager accepts
 an *uploaded* file, and official point-release security patches ship as
@@ -126,28 +131,62 @@ SMF rewrites its own files in place. Only the expected parts are dead:
 browsing/downloading from a package server, and the version check.
 
 **Your own install instead of a packaged app:** if you want to drive an
-app entirely yourself — hand updates included — install it into the app
-slot as your own app (the A20 door). Every file is then yours. What you
-give up is the signed channel: verified provenance, security floors, and
-automatic rollback. That trade is yours to choose.
+app entirely yourself from the first minute, install it into the app
+slot as your own app (the A20 door). Every file is then yours,
+including the installing. What you give up is the packaged start: the
+verified, pre-configured first install a recipe gives you. Either
+way, updates after install are yours — that is the same for packaged
+apps and your own (§4).
 
-## 4. PENDING — what happens to your additions when WE update an app
+## 4. Updating your app — it's yours
 
-Not yet settled; do not treat this section as a promise.
+The rule, settled 2026-10-21: **we install it; updating it afterwards
+is yours.** A packaged app is installed once, by the signed recipe.
+From that moment the platform never changes it — no update run
+touches an installed app's files, ever, and nothing you added to it
+(a plugin, a theme, a patch, an upload) can be reverted or replaced
+by one. This section replaces the question this guide used to leave
+open: there is no platform app update for your additions to survive,
+because there is no platform app update.
 
-Today, a platform recipe update swaps the app's whole code tree.
-Uploads and config carry over, but owner-added WordPress plugins/themes
-—and SMF source patches applied by package— currently do not, and the
-swap is silent. The proposed policy (LOCAL-MODS-UPDATE-POLICY-BRIEF-
-2026-10-15.md) is: owner additions persist, shipped files win, and
-nothing an owner did is ever reverted silently. The one open decision is
-Cameron's: when a local modification is detected, does an update
-warn-and-proceed, hold-and-ask, or split by whether the update raises the
-security floor. This guide gets its final §4 wording once he rules.
+What you will see: when a newer version of your app gets packaged,
+the Dashboard mentions it — as information, not an alarm. The
+packaged version is also what a *fresh* install gets: a new machine,
+or a first install, always starts from the newest package the box
+carries. Your installed copy stays exactly as it is until you change
+it. Three ways to change it, all of them yours:
+
+- **The app's own upload tools.** Some updates arrive as a file you
+  upload inside the app, and those work exactly as they would
+  anywhere: SMF's Package Manager takes the official point-release
+  patch packages (§3), and WordPress takes plugin and theme zips in
+  wp-admin. What can never work is an updater that wants the
+  *server* to download the update — the sealed room has no internet
+  (§3) — so you bring the file to the app, on a phone or another
+  computer, and upload it.
+- **Replace the files from the desktop.** You have access to your
+  site folder from the desktop. Download the app's new release
+  elsewhere, copy its files over the ones in the site folder, and
+  keep your own state: for WordPress keep `wp-config.php` and
+  everything inside `wp-content` (your uploads, plugins and themes);
+  for DokuWiki keep the `data` and `conf` folders (your pages and
+  settings); for SMF keep `Settings.php` and the `attachments` and
+  `custom_avatar` folders; for Gitea replace the single program
+  file and leave its data folder and settings alone. Then open the
+  app — most apps run their own database tidy-up on the next visit
+  or from their admin page.
+- **Do nothing.** That is allowed, and it is a real choice: plenty
+  of sites run an older app for years. The risk is also yours — an
+  unpatched app can be defaced or have its own contents messed
+  with. What it cannot do is reveal this computer's address: the
+  sealed room holds no matter what state the app is in, patched or
+  not. Keeping the app current is maintenance; your address's
+  safety never depended on it.
 
 ## 5. The honest one-liner
 
 Your job is: keep the paper safe, keep the box plugged in, be there when
-it restarts, back up now and then, and run your website. Everything else
-— updates, patching, rollback, the Tor plumbing — is the platform's job
-and the maintainer's job, not yours.
+it restarts, back up now and then, and run your website — including
+updating its software (§4). Everything else — system updates, rollback,
+the Tor plumbing — is the platform's job and the maintainer's job, not
+yours.

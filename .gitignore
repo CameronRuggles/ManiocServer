@@ -24,6 +24,7 @@ poc/*
 !poc/runtime-gate/
 !poc/backup-proof/
 !poc/runsc-wrap/
+!poc/installer-policy/
 
 # Security-audit working bulk (the audit reports at audit/*.md stay in)
 audit/iso/

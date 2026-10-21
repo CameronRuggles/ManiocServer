@@ -7,12 +7,14 @@
 #
 # A recipe is DATA for the onionhost package channel - its own
 # .deb in the same Tor-served, project-signed repository as the
-# platform package (Gate 4) - so a bundled app's security fix
-# ships on its own cadence, with its own anti-rollback floor, and
-# the updater's install -> restart -> health-check -> rollback
-# choreography covers it unchanged (the package's postinst runs
-# onionhost-recipe apply when this machine selected the recipe;
-# rolling back the .deb re-applies the previous payload).
+# platform package (Gate 4) - so a bundled app ships on its own
+# cadence, with its own floor. Recipes are installers, not
+# update channels (A26, 2026-10-21): the updater never installs
+# recipe packages, the floor gates first installs only (the
+# applier refuses a below-floor first install), and this
+# package's postinst runs onionhost-recipe apply only when the
+# machine selected the recipe AND the app is not installed yet -
+# an installed app is the owner's and is never re-applied.
 #
 # The payload lands in /usr/share/onionhost/recipes/<id>/:
 # manifest.json (recipe.json with the version stamped in),
@@ -236,21 +238,30 @@ Description: OnionHost packaged application recipe: $ID
  Data package for the onionhost platform: the pinned application
  archive, its sealed-world configuration overlay and its database
  seed. Applied by onionhost-recipe when a site chooses this
- recipe; updated through the same signed channel as the platform.
+ recipe. Installing this package never changes an app that is
+ already installed (A26): recipes install, owners update.
 EOF
 cat > "$STAGE/DEBIAN/postinst" <<EOF
 #!/bin/sh
-# A recipe package never restarts the stack itself: the updater
-# restarts and health-checks after managed installs, and rolls
-# back through the previous .deb - whose postinst re-applies the
-# previous payload the same way. Machines that did not select
-# this recipe (including the ISO image build) are untouched.
+# A recipe package installs an app ONCE (A26): it applies only
+# when this machine selected the recipe AND the app is not
+# installed yet (the applier's state record is the judge).
+# Configuring this package over an installed app - an upgrade,
+# a reinstall - updates the packaged payload on disk and leaves
+# the owner's app exactly as it is; updating an installed app
+# is the owner's job. Machines that did not select this recipe
+# (including the ISO image build) are untouched.
 set -e
 if [ "\${1:-}" = "configure" ]; then
     if [ -f /var/lib/onionhost/app-site ] \\
        && [ -f /etc/onionhost/recipe-selection ] \\
        && [ "\$(cat /etc/onionhost/recipe-selection)" = "$ID" ]; then
-        /usr/local/bin/onionhost-recipe apply $ID
+        if /usr/local/bin/onionhost-recipe is-installed $ID \\
+                >/dev/null 2>&1; then
+            echo "onionhost-recipe-$ID: $ID is already installed on this machine - the packaged payload was updated, the installed app was left untouched (updating it is the owner's job; see the Owner Guide)."
+        else
+            /usr/local/bin/onionhost-recipe apply $ID
+        fi
     fi
 fi
 exit 0

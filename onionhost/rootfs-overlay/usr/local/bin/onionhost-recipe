@@ -2,20 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """onionhost-recipe: apply project-packaged app recipes (A23).
 
-A recipe is a signed data package (onionhost-recipe-<id>, delivered
-through the Gate 4 channel like the platform package) whose payload
-lands in /usr/share/onionhost/recipes/<id>/: a manifest, the pinned
-application archive (sha256 in the manifest), config overlays, and
-seed material. This tool is the applier: it turns the payload into
-a running site inside the slice 6B app slot. It runs as root -
+A recipe is a signed data package (onionhost-recipe-<id>) whose
+payload lands in /usr/share/onionhost/recipes/<id>/: a manifest,
+the pinned application archive (sha256 in the manifest), config
+overlays, and seed material. This tool is the applier: it turns
+the payload into a running site inside the slice 6B app slot. It
+runs as root -
 
   * from onionhost-publish, when the owner's site model names a
     recipe (first install and any later re-publish), and
-  * from the recipe package's own postinst, when an update to the
-    recipe package arrives and the site uses that recipe - so the
-    updater's install -> restart -> health-check -> rollback
-    choreography covers the recipe's files too: rolling back the
-    .deb re-runs the old payload's apply.
+  * from the recipe package's own postinst, when the package is
+    configured and the site uses that recipe AND the app is not
+    installed yet.
+
+Recipes are installers, not update channels (A26, owner decision
+2026-10-21): applying a recipe installs the app; once an app is
+installed on a machine, no update run ever applies a recipe over
+it again - the installed tree is the owner's. The updater never
+installs recipe packages, and the package postinst gates on the
+state record this tool maintains (`is-installed` below): a
+completed apply writes installed=True + the applied version, and
+only that record makes an app "installed". A recipe's security
+floor likewise gates install time only: a FIRST install whose
+payload version is below the floor its own package declares is
+refused here, before the site is touched; an installed app is
+never measured against a floor.
 
 Apply is careful in the same order the platform is:
 
@@ -279,6 +290,124 @@ def _save_state(recipe_id, state):
     _atomic_write(_state_path(recipe_id),
                   (json.dumps(state, indent=1, sort_keys=True)
                    + "\n").encode())
+
+
+def _app_installed(recipe_id):
+    """A26's "installed": the state record carries a COMPLETED
+    apply - installed=True plus the applied version. Every state
+    writer that finishes an installation (the tree apply, the
+    native apply, the install hook) writes exactly that shape;
+    a first install that failed before completion leaves no
+    such record, so the install path stays open for it. A
+    rollback rewrites the same record with the restored
+    version - the app is still installed."""
+    state = _load_state(recipe_id)
+    return bool(state.get("installed") and state.get("version"))
+
+
+def _verrevcmp(a, b):
+    """dpkg's verrevcmp (deb-version(7)): compare two upstream
+    or revision strings - alternating non-digit / digit runs,
+    '~' sorting before everything (including end-of-string),
+    letters before non-letters."""
+    i = j = 0
+    la, lb = len(a), len(b)
+
+    def order(c):
+        if not c:
+            return 0
+        if c.isdigit():
+            return 0
+        if c.isalpha():
+            return ord(c)
+        if c == "~":
+            return -1
+        return ord(c) + 256
+
+    while i < la or j < lb:
+        first_diff = 0
+        while (i < la and not a[i].isdigit()) or \
+                (j < lb and not b[j].isdigit()):
+            ac = order(a[i] if i < la else "")
+            bc = order(b[j] if j < lb else "")
+            if ac != bc:
+                return -1 if ac < bc else 1
+            if i < la and not a[i].isdigit():
+                i += 1
+            if j < lb and not b[j].isdigit():
+                j += 1
+        while i < la and a[i] == "0":
+            i += 1
+        while j < lb and b[j] == "0":
+            j += 1
+        while i < la and j < lb and a[i].isdigit() \
+                and b[j].isdigit():
+            if not first_diff:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < la and a[i].isdigit():
+            return 1
+        if j < lb and b[j].isdigit():
+            return -1
+        if first_diff:
+            return 1 if first_diff > 0 else -1
+    return 0
+
+
+def _debver_cmp(a, b):
+    """Debian version comparison in pure Python (epoch,
+    upstream, revision). The applier cannot shell out to dpkg
+    for this: it runs in minimal contexts where no dpkg binary
+    exists (proven by the D8 proof machine), and the A26 floor
+    check must work there too."""
+    def parse(v):
+        epoch = 0
+        if ":" in v:
+            head, v = v.split(":", 1)
+            if head.isdigit():
+                epoch = int(head)
+        if "-" in v:
+            up, rev = v.rsplit("-", 1)
+        else:
+            up, rev = v, ""
+        return epoch, up, rev
+
+    ea, ua, ra = parse(a)
+    eb, ub, rb = parse(b)
+    if ea != eb:
+        return 1 if ea > eb else -1
+    return _verrevcmp(ua, ub) or _verrevcmp(ra, rb)
+
+
+def _check_install_floor(recipe_id, manifest, payload_dir):
+    """A26: a recipe's security floor gates INSTALL TIME only.
+
+    The payload carries the floor its package declares
+    (floor.json beside the manifest, written by the package
+    builder). A first install whose payload version is below
+    that floor is refused before the app is placed: floors
+    exist so a stale or replayed package cannot START an app,
+    and after A26 the first install is the only moment they may
+    judge a recipe at all - nothing here ever runs for an app
+    that is already installed. Returns None when the install
+    may proceed, else the refusal's exit code."""
+    try:
+        with open(os.path.join(payload_dir, "floor.json")) as f:
+            floors = json.load(f)
+    except (OSError, ValueError):
+        return None
+    floor = floors.get("onionhost-recipe-" + recipe_id)
+    if not floor:
+        return None
+    version = manifest["version"]
+    if _debver_cmp(version, floor) < 0:
+        return fail("recipe %s: payload version %s is below "
+                    "this package's security floor %s - "
+                    "refusing to install (floors gate install "
+                    "time only, A26)" % (recipe_id, version,
+                                         floor))
+    return None
 
 
 def _verify_archive(manifest, payload_dir):
@@ -995,6 +1124,13 @@ def apply_native(recipe_id, manifest, payload_dir, state,
         # Fail BEFORE changing anything when the owner's
         # administrator details are not staged.
         staged = _staged_admin(recipe_id)
+    if first_install:
+        # A26: the package's floor gates this install, and only
+        # this install (see _check_install_floor).
+        refused = _check_install_floor(recipe_id, manifest,
+                                       payload_dir)
+        if refused is not None:
+            return refused
     # Recipe-managed files (the first-boot step, any helpers):
     # refreshed from the payload on every apply. They are read
     # and run by the container's init, so they belong to the
@@ -1155,6 +1291,15 @@ def apply_recipe(recipe_id):
         # sync, never re-seed. The config file is the ground
         # truth that the app is already installed.
         first_install = not os.path.isfile(live_config)
+
+    if first_install:
+        # A26: the package's floor gates this install, and only
+        # this install - an installed app never reaches this
+        # check because it is never a first install again.
+        refused = _check_install_floor(recipe_id, manifest,
+                                       payload_dir)
+        if refused is not None:
+            return refused
 
     admin = None
     if first_install and seed_sql_path is not None:
@@ -1632,10 +1777,10 @@ def main():
         return 1
     if len(sys.argv) != 3 or sys.argv[1] not in (
             "apply", "rollback", "status", "install-hook",
-            "await-first-boot"):
+            "await-first-boot", "is-installed"):
         print("usage: onionhost-recipe "
               "apply|rollback|status|install-hook|"
-              "await-first-boot <recipe-id>",
+              "await-first-boot|is-installed <recipe-id>",
               file=sys.stderr)
         return 2
     cmd, recipe_id = sys.argv[1], sys.argv[2]
@@ -1644,6 +1789,17 @@ def main():
               file=sys.stderr)
         return 2
     try:
+        if cmd == "is-installed":
+            # A26 gate query (the recipe package's postinst asks
+            # this before applying): exit 0 iff the state record
+            # carries a completed apply - see _app_installed.
+            state = _load_state(recipe_id)
+            if _app_installed(recipe_id):
+                print("recipe %s: installed (version %s)"
+                      % (recipe_id, state.get("version")))
+                return 0
+            print("recipe %s: not installed" % recipe_id)
+            return 1
         if cmd == "apply":
             return apply_recipe(recipe_id)
         if cmd == "rollback":

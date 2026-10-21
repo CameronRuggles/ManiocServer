@@ -1,5 +1,13 @@
 # OnionHost — Local-modifications vs. recipe updates: unified policy brief
 
+SUPERSEDED 2026-10-21: Cameron decided the question this brief
+posed — recipes are installers, not update channels (amendment
+A26 in DESIGN-v3-amendments.md). No carryover or merge machinery
+was built; an installed app is never modified by a platform
+update run, so there is nothing for owner additions to survive.
+Kept as the record of the options that were considered and
+decided against.
+
 Prepared 2026-10-15 from Cameron's side-chat questions (WordPress plugins,
 SMF packages, owner/maintainer update responsibilities). Grounded in the
 recipe files on disk today. ONE decision needed from Cameron — see §4.

@@ -6727,3 +6727,200 @@ part of this log's history. The removal lands in the fourth
 history rewrite together with the Review 5 fix batch; the
 superseded commit joins the GitHub purge request's list
 (four SHAs; the request remains drafted, not filed).
+
+
+## RECIPES ARE INSTALLERS — A26 (2026-10-21)
+
+Owner decision (Cameron, 2026-10-21): recipes are installers,
+not update channels — the platform installs a recipe app once;
+every future update of that app is the owner's. This closed
+the question LOCAL-MODS-UPDATE-POLICY-BRIEF-2026-10-15.md had
+left open (plain carryover vs surgical merge vs keep-edited-
+and-flag): all three are decided against, no merge machinery
+was built, and the brief is marked superseded. The design
+record is amendment A26 in DESIGN-v3-amendments.md. Working-
+tree changes only; nothing committed or published by this
+batch.
+
+### Rulings taken from the code's own evidence
+
+- "INSTALLED" (the state the update path gates on) is the
+  applier's state record — /var/lib/onionhost/recipes/<id>/
+  state.json carrying installed=True plus the applied
+  version. Every writer that completes an installation (the
+  tree apply after its swap, the native apply after placing
+  the binary, the install hook at verification) writes
+  exactly that shape, and no writer writes it earlier, so: a
+  completed install is unambiguous; a first install that
+  failed before completion leaves no such record and the
+  install path stays open for it; a rollback rewrites the
+  same record with the restored version — still installed.
+  The dpkg state of the recipe package is NOT the judge:
+  the ISO's firstrun job registers every SHIPPING recipe
+  package on every box, selected or not.
+- Publish is not an update run. onionhost-publish calls
+  apply directly; it is the first-install mechanism and the
+  owner's own Go Live act, so its semantics are unchanged
+  (A26 gates the update path: the updater and the package
+  postinst). How the first install works is untouched.
+- Recipe packages sit entirely outside the update channel:
+  the updater does not refresh even an unused payload, so a
+  fresh install takes the payload the box carries (the
+  factory set). Standing high-water marks and floors that
+  pre-A26 updaters recorded for recipe packages are simply
+  never consulted again; a pre-A26 fail-closed marker that
+  names recipe packages is read for its presence only, as
+  before, and new markers record the platform package alone.
+
+### What changed, per site
+
+- onionhost/rootfs-overlay/usr/local/bin/onionhost-update:
+  the managed set is the platform package alone. Recipe
+  packages (discovered from dpkg as before) are observe-
+  only: an observation pass records each one's candidate,
+  and for an INSTALLED app with a newer package it appends
+  an owner_maintained entry (package, recipe, app name,
+  installed + available versions) to status.json and logs
+  the state as expected, not an error. The pass installs
+  nothing and cannot affect the exit code, a rollback, or
+  fail-closed. Recipe packages are still unheld on entry
+  and HELD across the Debian phase, so the generic upgrade
+  cannot fire a recipe postinst inside an update run. The
+  healthy end-of-run detail names the app when an
+  owner-maintained update exists. Header records the A26
+  rules beside the A6 ones.
+- onionhost/rootfs-overlay/usr/local/bin/onionhost-recipe:
+  new `is-installed <id>` query (exit 0 iff the state
+  record carries a completed apply) — the one definition
+  of installed, shared by the postinst gate; and a new
+  install-time floor gate: on a FIRST install (the
+  applier's own first_install judgement, both the tree and
+  native paths), a payload version below the floor its own
+  package declares (floor.json beside the manifest) is
+  refused before the app is placed. Header rewritten where
+  it described the old postinst update choreography.
+- build/build-recipe-deb.sh: the generated postinst now
+  gates on `onionhost-recipe is-installed` — over an
+  installed app it prints the owner-maintained note and
+  exits 0 (payload updated on disk, app untouched); with
+  no completed install it applies as before. The control
+  Description and the builder header say the same.
+- wizard.py: the app-pick page states the model at the
+  moment of choosing ("it installs the software once, and
+  after that updating it is up to you..."), the A23 comment
+  is corrected, and update_status_text appends the
+  owner-maintained sentence (app named) when status.json
+  carries it on a healthy state; the marker/fail-closed
+  wording still wins, and the six Gate 4 Dashboard strings
+  are byte-unchanged for records without the new field.
+- OWNER-GUIDE-2026-10-15.md: §1's apps bullet and the
+  protections scope corrected (they cover system/platform;
+  the app is never touched); §2 item 6 and §5 now count
+  app updates as the owner's; §3's two stale claims fixed
+  (WordPress core updates are the owner's file replacement,
+  not the recipe channel; the own-install paragraph no
+  longer trades on a channel packaged apps also lack);
+  §4 is the real section at last — the rule, what the
+  Dashboard mention means, the three ways an owner updates
+  inside the sealed box (the app's own upload tools;
+  replacing files from the desktop with the per-app
+  keep-list read off the manifests: WordPress wp-config.php
+  + wp-content, DokuWiki data/ + conf/, SMF Settings.php +
+  attachments/ + custom_avatar/, Gitea the one program
+  file), and doing nothing — allowed, the owner's risk,
+  with the sealed room's guarantee stated separately. The
+  header's PENDING note is replaced by the A26 citation.
+
+### One defect this batch introduced and the regression caught
+
+The first cut of the floor gate shelled out to
+`dpkg --compare-versions`. The d8-fix proof machine — a
+minimal rootfs with a curated binary set and no dpkg —
+failed its P3 applies with "No such file or directory:
+'dpkg'": the applier had grown a dependency it never had.
+The gate now compares versions in pure Python (dpkg's own
+verrevcmp algorithm: epoch, upstream, revision; tilde and
+letter ordering), verified against the real dpkg on 16
+version pairs (every recipe's shipped version and floor,
+oh.10 rollovers, epochs, tildes, revisions — 0 disagreements)
+and pinned as standing assertions in the new proof venue.
+
+### Tests — new, and what did not change
+
+- NEW poc/installer-policy/run_proofs.py (26 assertions):
+  builds v1/v2/v3 WordPress packages with the real builder
+  (v2 = honest repackage: bumped version, one shipped
+  file's bytes changed inside the archive, pin updated;
+  v3 = v2 with the floor raised above its version) and
+  proves, with the real applier and the real generated
+  postinst run against the real absolute paths in a mount
+  namespace: (A) install v1 to completion (apply + install
+  hook against the fake installer), owner edits (a shipped
+  file edited, a plugin added, an upload added, the config
+  tweaked), then configure v2 → the postinst reports the
+  app already installed and the app tree plus the recipe
+  state record are BYTE-IDENTICAL, v2's changed file
+  nowhere in the tree; (B) a fresh venue configuring v2
+  installs at the v2 version with the v2 file content;
+  (C1) the floor-raised payload is refused on a first
+  install, placing nothing; (C2) the same payload over the
+  completed install applies — a floor never judges an
+  installed app. Plus the _debver_cmp agreement checks.
+- NEW gate4fix scenarios R1–R4 (28 assertions) with the
+  stubs taught recipes (per-package ctl versions, an
+  apt-get call log with simulated installs, an apt-mark
+  stub that records holds): R1 platform updates healthy
+  while an installed app's newer recipe package is never
+  installed and is reported owner_maintained; R2 fail-
+  closed recovery succeeds with the recipe's floor
+  standing at 99.0 above the installed app; R3 a present
+  package with no installed app reports and installs
+  nothing; R4 a replayed old recipe version draws no
+  downgrade refusal. S1–S10 pass unchanged.
+- NEW test_dashboard cases (5): the owner-maintained
+  Dashboard text on up-to-date and updated, its absence
+  with an empty list, no colouring of a fetch failure, and
+  the marker still winning over it.
+- NO existing assertion was changed. The old update-swap
+  behaviour was asserted only by the 2026-10-14 rig
+  acceptance runs (recorded in this log, not a persisted
+  host suite); the persisted recipe suites drive the
+  applier as a tool — the installer's semantics — and
+  publish-style re-apply with data carryover remains its
+  contract, so all five pass unmodified at their baselines.
+- Venue staging recreated where /tmp had been wiped
+  between sessions (harness-owned, not product): the
+  runtime-gate sim's podman/systemctl/logger stubs at
+  /tmp/rgate/bin (rebuilt to the contract run_sim.py
+  defines, incl. stop-removes-the-container and the S14
+  kill_on_stop behaviour) and backup-proof's shims at
+  /tmp/backup-proof/bin; the d8 proof machine was
+  re-staged from the current tree as usual.
+
+### Regression (final tree)
+
+- poc/recipes-smf 32/32, wordpress 39/39, dokuwiki 37/37,
+  gitea 27/27, marketplace 31/31.
+- poc/gate4fix run_tests: 0 assertion failures (S1–S10 +
+  R1–R4); test_dashboard: 0 failed (Gate 4 six + A26 five).
+- poc/installer-policy run_proofs: 26 assertions, 0 failed.
+- poc/runtime-gate run_sim: 63 assertions, 0 failed;
+  test_runtime_dashboard: 0 failed.
+- poc/runsc-wrap run_tests: 21/21 (0 failed).
+- poc/backup-proof: ALL 20 CHECKS PASS.
+- poc/d8-fix p3-gitea, proof machine re-staged from the
+  current tree: 12/12 PASS, PHASE RESULT: PASS.
+- Edited Python compiles (onionhost-update, onionhost-
+  recipe, wizard); bash -n / sh -n clean on
+  build-recipe-deb.sh and the generated postinst.
+- ci-scan over the working tree: the only findings are
+  the two known rig-user home-path literals in the
+  UNTRACKED audit pack file — untouched, as instructed;
+  the tracked set is clean. (The scan's phrase rule caught
+  one of this batch's own new updater comments mid-flight;
+  reworded, not allowlisted, and the re-scan is clean.)
+
+Standing rig list unchanged: the A26 behaviour is proven
+host-side end to end; re-proof on a real box (an update run
+against a live installed app) joins the pending rig
+session's list with the other deferred items.

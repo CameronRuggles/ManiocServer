@@ -57,6 +57,25 @@ Trust / anti-rollback rules (A6, DQ4, Y8):
     to fetch never overwrites a fail-closed record (Gate 4
     follow-up, found by the A23 SMF recipe slice).
 
+Recipes are NOT update channels (A26, owner decision 2026-10-21):
+a recipe package (onionhost-recipe-*) installs an app ONCE; after
+that the app is the owner's and this tool never installs, upgrades,
+rolls back, or judges a recipe package again. An installed app
+whose recipe package has a newer version in the repository is a
+normal, healthy state - it is reported in status.json
+(owner_maintained) for the Dashboard, never as an error and never
+a rollback or fail-closed trigger. Recipe security floors gate
+install time only (the applier refuses a below-floor first
+install); no floor can strand or fail-close an app that is
+already installed. "Installed" is the applier's state record
+(/var/lib/onionhost/recipes/<id>/state.json carrying a completed
+apply), NOT the dpkg state of the recipe package - factory
+images dpkg-install every recipe package on every box, selected
+or not. Recipe packages are still HELD across the Debian phase
+below, so the generic upgrade cannot fire a recipe postinst
+behind this tool's back (and the A26 postinst gate refuses to
+re-apply over an installed app even if one is upgraded by hand).
+
 Debian base packages ride the same run (same apt invocation config,
 same timing): apt-get upgrade after the managed packages, best
 effort - a Debian failure is logged but never blocks or rolls back
@@ -83,14 +102,23 @@ STATE_DIR = os.environ.get("ONIONHOST_UPDATE_STATE",
                            "/var/lib/onionhost/update")
 ARCHIVES = os.environ.get("ONIONHOST_APT_ARCHIVES",
                           "/var/cache/apt/archives")
-# The managed set: the platform package plus any INSTALLED recipe
-# package (onionhost-recipe-*, A23). Recipes are independent
-# packages in the same signed repo with their own floors, so a
-# bundled app's security fix ships on its own cadence; the set is
-# discovered from dpkg rather than hardcoded, and a machine with
-# no recipe installed behaves exactly as the platform-only design.
-def _managed_packages():
-    out = ["onionhost"]
+# The managed set: the platform package ONLY (A26). The install /
+# rollback / fail-closed machinery below judges this set and
+# nothing else. Recipe packages are discovered separately and are
+# observe-only - see _recipe_packages() and the header's A26 rules.
+PLATFORM_PACKAGE = "onionhost"
+MANAGED = [PLATFORM_PACKAGE]
+
+
+def _recipe_packages():
+    """dpkg-installed recipe packages (onionhost-recipe-*, A23).
+
+    Discovery only: under A26 these packages never take part in
+    the managed phase. A dpkg-installed recipe package is NOT an
+    installed app (the factory image registers every recipe
+    package on every box); whether an app is installed is the
+    applier's state record - see _installed_recipe()."""
+    out = []
     try:
         listing = subprocess.run(
             ["dpkg-query", "-W", "-f", "${Package}\n",
@@ -104,7 +132,19 @@ def _managed_packages():
     return out
 
 
-MANAGED = _managed_packages()
+RECIPE_PKGS = _recipe_packages()
+# Everything this tool knows by name: the unhold/hold hygiene
+# covers recipe packages too, so a hold leaked by a killed run
+# (or by a pre-A26 updater, which held them as managed packages)
+# cannot wedge anything, and the Debian phase never upgrades
+# them behind the managed phase's back.
+ALL_KNOWN = MANAGED + RECIPE_PKGS
+# The applier's state root and the payload root (manifest names),
+# with the same env override names onionhost-recipe uses.
+RECIPE_STATE_ROOT = os.environ.get("ONIONHOST_RECIPE_STATE",
+                                   "/var/lib/onionhost/recipes")
+RECIPE_PAYLOAD_ROOT = os.environ.get(
+    "ONIONHOST_RECIPE_PAYLOAD_ROOT", "/usr/share/onionhost/recipes")
 HEALTH_CMD = os.environ.get("ONIONHOST_HEALTH_CMD",
                             "/usr/local/bin/onionhost-probe")
 STACKCTL = os.environ.get("ONIONHOST_STACKCTL", "")
@@ -424,10 +464,46 @@ def health_ok_after_restart():
     return health_ok()
 
 
+# A26 owner-maintained report: one entry per INSTALLED app whose
+# recipe package has a newer version in the repository. Populated
+# by main()'s observation pass and carried in every status write
+# after it: a normal, healthy state the Dashboard words as
+# information, never as an error.
+OWNER_MAINTAINED = []
+
+
 def write_status(state, detail, packages):
     save_json(os.path.join(STATE_DIR, "status.json"),
               {"state": state, "detail": detail, "checked_at": now(),
-               "packages": packages})
+               "packages": packages,
+               "owner_maintained": OWNER_MAINTAINED})
+
+
+def _installed_recipe(recipe_id):
+    """The completed-install state record for recipe_id, or None.
+
+    A26's "installed": the applier (onionhost-recipe) writes its
+    state record only when an apply COMPLETES (after the tree
+    swap / binary placement, and again when the install hook
+    finishes), always with installed=True and the applied
+    version. A first install that failed before completion
+    leaves no such record, so the install path stays open for
+    it; a rollback rewrites the same record with the restored
+    version - the app is still installed."""
+    state = load_json(os.path.join(RECIPE_STATE_ROOT, recipe_id,
+                                   "state.json"), {})
+    if state.get("installed") and state.get("version"):
+        return state
+    return None
+
+
+def _recipe_app_name(recipe_id):
+    """The app's display name from its payload manifest (the
+    Dashboard's wording), falling back to the recipe id."""
+    manifest = load_json(os.path.join(RECIPE_PAYLOAD_ROOT,
+                                      recipe_id, "manifest.json"),
+                         {})
+    return manifest.get("name") or recipe_id
 
 
 MARKER_PATH = os.path.join(STATE_DIR, "fail-closed.marker")
@@ -442,13 +518,16 @@ def write_marker(packages, floors):
 
     Written whenever the machine fails closed (and once when a
     legacy fail-closed status is adopted - see main); carries the
-    installed version and the standing floor per package, the
-    facts the recovery duty judges by."""
+    installed version and the standing floor per MANAGED package,
+    the facts the recovery duty judges by. Recipe packages never
+    appear here (A26): nothing about an owner-maintained app may
+    feed the fail-closed record."""
     save_json(MARKER_PATH,
               {"since": now(),
                "packages": {pkg: {"installed": installed_version(pkg),
                                   "floor": floors.get(pkg)}
-                            for pkg in packages}})
+                            for pkg in packages
+                            if pkg in MANAGED}})
 
 
 def clear_marker():
@@ -511,6 +590,15 @@ def main():
             floors[pkg] = disk_floor
         packages[pkg] = {"installed": inst}
 
+    # A26 observation baseline: recipe packages are recorded for
+    # the Dashboard record only. No high-water mark is seeded and
+    # no floor is read for them: nothing about a recipe package
+    # may judge, refuse, or fail-close anything ever again.
+    for pkg in RECIPE_PKGS:
+        packages[pkg] = {"installed": installed_version(pkg),
+                         "recipe": pkg[len("onionhost-recipe-"):],
+                         "owner_maintained": True}
+
     if recovering and not marker_present():
         log("adopting a legacy fail-closed status into the marker")
         write_marker(packages, floors)
@@ -518,7 +606,10 @@ def main():
     # Managed packages move only through this phase; clear any
     # hold a previous run's Debian phase may have leaked (it
     # holds the set across its generic upgrade - see there).
-    for pkg in MANAGED:
+    # Recipe packages are unheld too: a pre-A26 updater held them
+    # as managed packages, and a leaked hold must not wedge a
+    # package the owner handles by hand.
+    for pkg in ALL_KNOWN:
         run(["apt-mark", "unhold", pkg])
 
     if not apt_update_project():
@@ -534,6 +625,38 @@ def main():
                      "Your site is unaffected.", packages)
         log("fetch failed - updates pause, site untouched")
         return 3
+
+    # A26: observe recipe packages - never touch them. For each
+    # recipe whose app is INSTALLED on this box (the applier's
+    # state record, not dpkg), a newer package in the repository
+    # is reported as owner-maintained: a normal, healthy state
+    # the Dashboard shows as information, never an error and
+    # never a trigger for rollback or fail-closed. Under A26
+    # this pass is observation only - it installs nothing,
+    # returns nothing, and the run's verdict is not its to move.
+    for pkg in RECIPE_PKGS:
+        recipe_id = pkg[len("onionhost-recipe-"):]
+        inst = installed_version(pkg)
+        cand = repo_best_version(pkg)
+        packages[pkg].update({"candidate": cand})
+        state = _installed_recipe(recipe_id)
+        if not state:
+            log("%s: payload present, app not installed - "
+                "nothing to report" % pkg)
+            continue
+        packages[pkg].update({"app_installed": state.get("version")})
+        if cand and inst and dpkg_compare(cand, "gt", inst):
+            OWNER_MAINTAINED.append({
+                "package": pkg, "recipe": recipe_id,
+                "app": _recipe_app_name(recipe_id),
+                "installed": inst, "available": cand})
+            log("%s: a newer packaged version (%s) is available; "
+                "the installed app is owner-maintained (A26) and "
+                "is NOT updated by the platform - the expected "
+                "state, not an error" % (pkg, cand))
+        else:
+            log("%s: app installed (package %s) - "
+                "owner-maintained (A26)" % (pkg, inst))
 
     for pkg in MANAGED:
         inst = installed_version(pkg)
@@ -720,7 +843,7 @@ def main():
 
     # Debian base packages: same Tor path, same run, best effort -
     # a Debian mirror failure is logged and changes nothing about
-    # the project package's outcome above. The managed set is
+    # the project package's outcome above. The known set is
     # HELD across the generic upgrade: apt-get upgrade sees every
     # configured source (the project repo included) and would
     # otherwise happily re-install a version the managed phase
@@ -728,12 +851,16 @@ def main():
     # undoing the rollback before the run even ends (found by
     # the WordPress recipe acceptance, 2026-10-14: a sabotaged
     # recipe was rolled back cleanly and then re-upgraded by
-    # this phase in the same run). Holds are released at the end
-    # of the phase, and the managed phase unholds defensively on
-    # its way in (below), so a hold leaked by a killed run cannot
-    # wedge the next managed install.
+    # this phase in the same run). Recipe packages are held for
+    # the A26 reason: upgrading one fires its postinst, and no
+    # update run may reach an installed app's tree by any route
+    # (the postinst gate is the second lock on the same door).
+    # Holds are released at the end of the phase, and the
+    # managed phase unholds defensively on its way in (above),
+    # so a hold leaked by a killed run cannot wedge the next
+    # managed install.
     log("apt-get update + upgrade (Debian base, same Tor path)")
-    held = [pkg for pkg in MANAGED
+    held = [pkg for pkg in ALL_KNOWN
             if run(["apt-mark", "hold", pkg]) == 0]
     if run(["apt-get", "update"], timeout=1800) != 0:
         log("Debian apt-get update failed for at least one source "
@@ -761,7 +888,13 @@ def main():
         log("done (exit 5) - still failed closed")
         return 5
     if worst == 0:
-        write_status("up-to-date", "Everything is current.", packages)
+        detail = "Everything is current."
+        if OWNER_MAINTAINED:
+            detail += (" Your %s is yours to update: a newer "
+                       "packaged version is available and was "
+                       "not applied."
+                       % OWNER_MAINTAINED[0]["app"])
+        write_status("up-to-date", detail, packages)
     log("done (exit %d)" % worst)
     return worst
 

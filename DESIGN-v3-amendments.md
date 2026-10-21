@@ -679,3 +679,81 @@ already telling about the main phrase. If a second key is ever wanted
 again, it starts from A3's text and must satisfy BACKUP-RESTORE-
 ACCEPTANCE item 12's honesty spec before it ships — as a new
 amendment, not a quiet return.
+
+---
+
+## A26 — Recipes are installers, not update channels: app updates are the owner's after install (owner decision, 2026-10-21)
+
+Cameron's ruling, closing the question the LOCAL-MODS-UPDATE-POLICY
+brief (2026-10-15) left open: "I think a better method is to just
+install it and then let them deal with every future update."
+
+- **The rule.** A recipe package installs an app once. After an app
+  is installed on a box, no platform update run ever modifies its
+  tree — no swap, no file replacement, byte-for-byte untouched.
+  Because no platform app update exists, the brief's carryover
+  question (plain carryover vs surgical merge vs three-way
+  keep-edited-and-flag) is closed as DECIDED AGAINST: no merge or
+  carryover machinery is built, and nothing an owner added to an
+  app can be silently reverted by an update, because there is no
+  update that touches it.
+- **"Installed" is the applier's state record.** An app counts as
+  installed when its recipe state record
+  (/var/lib/onionhost/recipes/<id>/state.json) carries a completed
+  apply — installed=True plus the applied version, written only
+  when an apply completes (ruling recorded in the ISO-BUILD-LOG
+  entry: the record is the ground truth; a first install that
+  failed before completion leaves no such record, so the install
+  path stays open for it; a rollback rewrites the record with the
+  restored version — still installed). The dpkg state of the
+  recipe PACKAGE is not the judge: factory images register every
+  recipe package on every box, selected or not.
+- **The update path is gated at both locks.** The updater's
+  managed set is the platform package alone: it never installs,
+  upgrades, rolls back, refuses, or judges a recipe package
+  (standing high-water marks and floors recorded for recipe
+  packages by earlier updaters are inert, and the fail-closed
+  marker records the platform only). Recipe packages are still
+  held across the updater's Debian phase so the generic upgrade
+  cannot fire a recipe postinst behind its back — and the
+  postinst itself is the second lock: it applies only when the
+  app is not installed yet (the applier's new `is-installed`
+  query), so even a hand-run package upgrade updates the payload
+  on disk and leaves the installed app exactly as it was.
+- **Reporting.** An installed app with a newer recipe package in
+  the repository is a normal, healthy state — never an error,
+  never a rollback or fail-closed trigger. The updater reports it
+  in status.json (owner_maintained: app, installed version,
+  available version) and the Dashboard words it as information:
+  a newer package exists, the installed copy is the owner's to
+  update. The wizard says the same thing plainly at the moment of
+  choosing an app — we install it; updating it afterwards is
+  yours — and Owner Guide §4 (the section the brief left PENDING)
+  now states the policy and how an owner actually updates each
+  app inside the sealed box.
+- **Floors gate install time only.** A recipe's security floor
+  may refuse a FIRST install (the applier refuses a payload whose
+  version is below the floor its own package declares, before
+  the app is placed); it can never strand, judge, or fail-close
+  an app that is already installed. Platform package floors and
+  the updater's fail-closed semantics are unchanged. This
+  narrows A23's security accounting: packaging still buys
+  known-good configuration and verified provenance **of the
+  first install**, but a CVE in a bundled app no longer obliges
+  the project to deliver the fix into installed apps — the fix
+  ships as a new recipe package for fresh installs, the Dashboard
+  notes its existence, and applying it is the owner's act. The
+  maintenance duty A23 described survives as prompt packaging
+  and honest reporting, not as a channel into running apps.
+- **Scope kept.** Fresh installs get the current recipe version:
+  a box installing an app takes the payload it carries (the
+  factory set), which is the version current for that box; the
+  updater does not refresh unused payloads either — a recipe
+  package is entirely outside the update channel. How the first
+  install works is unchanged (publish → apply → hook), and an
+  owner pressing Go Live re-applies the installer as publish has
+  always done: deliberate, local, owner-initiated — not an update
+  run. Owner-installed (non-recipe) apps were already
+  owner-maintained under A20 and are untouched, as is the
+  marketplace recipe's shipping posture (still excluded from
+  SHIPPING).

@@ -137,10 +137,13 @@ UPDATE_MARKER_PATH = "/var/lib/onionhost/update/fail-closed.marker"
 
 
 def update_status_text():
-    """Dashboard update line (Gate 4): status text only - updates
-    are automatic (onionhost-update.timer), there is nothing for the
-    owner to do, so there is deliberately no button and no new
-    concept. The updater records its state as JSON; the fail-closed
+    """Dashboard update line (Gate 4): status text only - platform
+    updates are automatic (onionhost-update.timer), so there is
+    deliberately no button and no new concept. (The one thing that
+    IS the owner's - updating their installed app, A26 - is
+    reported here as information when a newer packaged version
+    exists; the how lives in the Owner Guide, not in a button.)
+    The updater records its state as JSON; the fail-closed
     wording matches the state the updater wrote. The updater's
     fail-closed MARKER wins over the status file (Gate 4
     follow-up): a machine that is off for safety must say so even
@@ -152,10 +155,23 @@ def update_status_text():
                 "themselves when a fixed version is ready.")
     try:
         with open(UPDATE_STATUS_PATH) as f:
-            state = json.load(f).get("state", "")
+            record = json.load(f)
+        state = record.get("state", "")
     except (OSError, ValueError):
-        state = ""
+        record, state = {}, ""
     if state in ("up-to-date", "updated"):
+        # A26: an installed app with a newer packaged version is
+        # a normal, healthy state - the updater reports it as
+        # owner_maintained, and the Dashboard words it as plain
+        # information (the app is the owner's to update), never
+        # as a problem.
+        maintained = record.get("owner_maintained") or []
+        if maintained:
+            app = maintained[0].get("app") or "your app"
+            return ("Your software is up to date. A newer %s is "
+                    "packaged, but your installed copy is yours "
+                    "to update - Manioc Server never changes an "
+                    "installed program." % app)
         return "Your software is up to date."
     if state == "fail-closed":
         return ("Your site is off for safety. Updates will install "
@@ -835,17 +851,21 @@ class Wizard:
                   "lives on this computer and is only as safe as "
                   "the program itself. Your address stays hidden "
                   "either way.")
-        # A23: a packaged recipe is the no-work path - the
-        # platform installs and updates the app; the owner only
-        # chooses the administrator's name and password, which
-        # the recipe's seeding needs (never invented, never
-        # stored in the site model: held in this window's memory
-        # until Go Live stages them through the helper). The
-        # choices offered are the recipe packages installed on
-        # this machine - nothing is hard-coded per recipe.
+        # A23: a packaged recipe is the no-work START - the
+        # platform installs the app once; updating it afterwards
+        # is the owner's (A26), stated plainly below at the
+        # moment of choosing. The owner chooses the
+        # administrator's name and password, which the recipe's
+        # seeding needs (never invented, never stored in the
+        # site model: held in this window's memory until Go Live
+        # stages them through the helper). The choices offered
+        # are the recipe packages installed on this machine -
+        # nothing is hard-coded per recipe.
         self.body("Manioc Server can set one of these up for you - "
-                  "it installs the software and keeps it updated "
-                  "- or you can install your own program:")
+                  "it installs the software once, and after that "
+                  "updating it is up to you, the way it is with "
+                  "any program you own - or you can install your "
+                  "own program:")
         model = load_site_model() or {}
         self.recipe_manifests = {m["id"]: m
                                  for m in installed_recipes()}
