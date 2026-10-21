@@ -23,6 +23,13 @@ http {
     access_log off;
     server_tokens off;
     more_clear_headers Date;
+    # R-20: clear Server entirely (server_tokens off already
+    # keeps it versionless) and answer errors with generic
+    # bodies below - the stock nginx error page names the
+    # stack to anyone who asks.
+    more_clear_headers Server;
+    error_page 404 @onionhost_notfound;
+    error_page 500 502 503 504 @onionhost_error;
     sendfile on;
     client_body_temp_path /tmp/client_body;
     proxy_temp_path /tmp/proxy;
@@ -34,6 +41,16 @@ http {
         root /srv/site/current;
         location / {
             try_files $uri $uri/ =404;
+        }
+        # Generic error bodies (R-20): one plain sentence each,
+        # no server name, no version, no path detail.
+        location @onionhost_notfound {
+            default_type text/plain;
+            return 404 "Not found.\n";
+        }
+        location @onionhost_error {
+            default_type text/plain;
+            return 503 "This site is not available right now.\n";
         }
     }
 }

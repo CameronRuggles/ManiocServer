@@ -26,6 +26,12 @@ exec'ing, then drives bundle fixtures through main():
       runsc never exec'd.
   W9  lifecycle verb (start) with no bundle -> pass-through exec
       with the legacy --host-uds=all shape.
+  W10 client-tor bundle (U: tor -f .../client-torrc) WITH the
+      bridge netns -> spec byte-identical, argv = runsc
+      --host-uds=create and NO --network flag (deanonymization
+      audit R-01: U only binds its listeners, so unlike A it
+      gets no host-UDS connect reach). FAILS against the
+      pre-R-01 wrapper (which gave every tor bundle `all`).
 
 Exit status: number of failed assertions (0 = all pass).
 """
@@ -192,6 +198,18 @@ shutil.rmtree(b, ignore_errors=True)
 ex, code = run_wrap(["start", "cid123"])
 check("W9", "lifecycle verb passes through with legacy UDS shape",
       ex is not None and ex[1][1] == "--host-uds=all")
+
+# --- W10: client tor (U) + bridge netns (deanonymization audit R-01) ----
+b = make_bundle(["tor", "-f", "/etc/tor/client-torrc"], with_netns=True)
+before = open(os.path.join(b, "config.json")).read()
+ex, code = run_wrap(bundle_argv(b))
+check("W10", "client-tor bundle exec'd", ex is not None)
+check("W10", "client-tor spec byte-identical (bridge netns kept)",
+      open(os.path.join(b, "config.json")).read() == before)
+check("W10", "argv is --host-uds=create with no --network flag",
+      ex and ex[1][1] == "--host-uds=create"
+      and not any(a.startswith("--network") for a in ex[1]))
+shutil.rmtree(b, ignore_errors=True)
 
 os.execv = _real_execv
 print("---")

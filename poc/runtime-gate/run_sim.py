@@ -349,6 +349,59 @@ check("S14 self-stop: next timer run keeps the latch standing",
       r.returncode == 1 and w.marker() is not None
       and (w.status() or {}).get("state") == "runtime-violation", "new")
 
+# ======================================================================
+# Deanonymization audit R-10: the nft drift check stops U too
+# ======================================================================
+# onionhost-nft-gate-check is driven through its test seams with
+# a stub gate whose exit code the case controls: on mismatch (1)
+# BOTH tor containers must be stopped - before the fix only A
+# was, leaving the clearnet-originating container running under
+# a firewall the platform had judged wrong. On match (0) and on
+# gate error (2) nothing is stopped (the error policy itself is
+# unchanged; it is a reserved human-reviewer call).
+NFTCHECK = os.path.join(
+    REPO, "onionhost/rootfs-overlay/usr/local/bin/"
+          "onionhost-nft-gate-check")
+
+
+class NftWorld(World):
+    def __init__(self, name):
+        super().__init__(name)
+        self.gate_stub = os.path.join(self.stub, "nft-gate-stub")
+        with open(self.gate_stub, "w") as f:
+            f.write("#!/bin/bash\nexit $(cat \"%s\")\n"
+                    % os.path.join(self.stub, "nft-gate-rc"))
+        os.chmod(self.gate_stub, 0o755)
+        self.env["ONIONHOST_NFT_GATE"] = self.gate_stub
+
+    def gate_rc(self, rc):
+        with open(os.path.join(self.stub, "nft-gate-rc"), "w") as f:
+            f.write(str(rc))
+
+    def nftcheck(self):
+        return subprocess.run(["bash", NFTCHECK], env=self.env,
+                              capture_output=True, text=True)
+
+
+w = NftWorld("r10a")
+w.gate_rc(1)
+r = w.nftcheck()
+check("R-10 mismatch: check exits 1", r.returncode == 1, "new")
+check("R-10 mismatch: A stopped",
+      "stop onionhost-a.service" in w.stops(), "new")
+check("R-10 mismatch: U stopped",
+      "stop onionhost-u.service" in w.stops(), "new")
+w = NftWorld("r10b")
+w.gate_rc(0)
+r = w.nftcheck()
+check("R-10 match: exit 0, nothing stopped",
+      r.returncode == 0 and w.stops() == [], "new")
+w = NftWorld("r10c")
+w.gate_rc(2)
+r = w.nftcheck()
+check("R-10 gate error: exit propagates, nothing stopped",
+      r.returncode == 2 and w.stops() == [], "new")
+
 print("---")
 print("%d assertion(s), %d failed" % (COUNT["n"], len(FAILS)))
 sys.exit(len(FAILS))

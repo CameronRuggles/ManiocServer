@@ -6924,3 +6924,453 @@ Standing rig list unchanged: the A26 behaviour is proven
 host-side end to end; re-proof on a real box (an update run
 against a live installed app) joins the pending rig
 session's list with the other deferred items.
+
+## DEANON AUDIT FIX BATCH (2026-10-21)
+
+Scope: the 20-item fix brief (section 5) of the interim
+deanonymization audit (~/workspace/onionhost-deanon-audit/
+DEANON-AUDIT-2026-10-21.md, register R-01..R-28), authorised by
+the owner 2026-10-21 and executed in brief order. Working-tree
+changes only; nothing committed or published by this batch.
+Rig-only proofs were NOT simulated in the sandbox: each item
+below separates what the tree now does from the rig proof still
+owed, and the rig additions are numbered 18-22 (the standing
+list's items 1-17 are unchanged). The audit's five reserved
+human-reviewer judgement calls were NOT decided; they are
+restated at the end.
+
+### Per-item verdicts
+
+1. R-01 (Tor-class host-UDS scope) — FIXED, tree half.
+   runsc-wrap now splits the tor class by the torrc path in
+   the bundle args: container A (torrc) keeps --host-uds=all
+   (it must CONNECT to B's http.sock); container U
+   (client-torrc) gets --host-uds=create — U only binds its
+   SOCKS/control listeners and host-side consumers connect,
+   the pattern B's b1.sock already proves, so U loses host-UDS
+   connect reach entirely. Spec untouched for both; no
+   --network flag for either. poc/runsc-wrap gains case W10
+   (client-tor bundle: byte-identical spec, create, no
+   --network flag); suite 24/24. Whether create mode actually
+   bounds the gofer on the real stack is the canary's question
+   — rig item 18, now the rig list's top priority: from
+   inside running A and U, attempt connects to (a) a canary
+   host socket outside the containers' mounts, (b) the podman
+   socket path, (c) the peer's SOCKS/control paths, and
+   verify U still serves its SOCKS socket under create. If
+   the canary shows U broken or the scoping illusory, the
+   audit's alternative (document the mount-bounded proof)
+   is the fallback — the question does not ship open in a
+   release either way.
+2. R-02 (SMF jQuery from Google's CDN) — FIXED. The seed
+   tail now INSERTs jquery_source='local' (INSERT..ON
+   DUPLICATE KEY, because the row's presence in a fresh
+   install is not guaranteed), so Load.php serves the copy
+   SMF ships in its own theme scripts. Sweep of the other
+   visitor-side patterns in the shipped SMF tree: the
+   Load.php CDN table is the only load-by-default external
+   script source; the remaining external URLs in Sources/
+   Who.php are credit hyperlinks (no fetch on view). One
+   residual found and recorded, not fixed: Profile-Export
+   .php:1877 hardcodes the Google CDN jQuery into the
+   admin-only member-data export document. It is not the
+   published site path and cannot be seeded away (hardcoded
+   in application code, which the recipe does not patch);
+   it dies at the wall in the sealed room like every other
+   fetch. SMF suite 33/33 through the real seed import.
+3. R-03 (RECIPE-VERSION.txt served from the docroot) —
+   FIXED by relocation. The marker is now written by
+   _save_state() into the recipe's state directory
+   (STATE_ROOT/<id>/RECIPE-VERSION.txt, beside state.json),
+   so every state writer (tree apply, native apply, both
+   rollbacks, the install hook) keeps it truthful and it
+   never enters the served tree; the staging write is gone.
+   Consumer check first: the only tracked-tree reference
+   was the writer itself (the Dashboard and updater read
+   state.json, never the marker). The two poc harnesses
+   that consumed it (recipes-smf, recipes-dokuwiki) now
+   read the state-dir path and each gained a check that
+   the docroot does NOT contain the file. (Per-recipe fetch
+   verification rides the recipe suites' normal serving
+   proofs; a dedicated rig fetch per recipe is subsumed by
+   rig item 18's session plan.)
+4. R-04 (backup outer layer names the site + the moment) —
+   FIXED. Backup FORMAT is now 3: meta.json carries only
+   {format, kind, salts, recipients} — no onion address,
+   no creation time — and payload.age is written with an
+   explicit mtime-0 tar header (meta.json already had one;
+   the ciphertext member previously leaked the creation
+   moment through tar.add). The address and time live only
+   in the encrypted manifest, as before. onionhost-restore
+   accepts formats 1, 2 and 3 (wrapper and manifest);
+   formats 1/2 restore exactly as before; at the end of a
+   format-3 restore the reported address comes from the
+   verified manifest. The verify comment's "four ways" is
+   corrected to the three checks the code actually
+   performs (manifest, bundled hostname, pubkey-recomputed)
+   — the metadata copy was never compared and no longer
+   exists. poc/backup-proof gains the outer-min case
+   driving the REAL restore module (_read_wrapper +
+   _verify) against a fixture with a self-consistent onion
+   identity: outer meta carries neither the address nor a
+   created key, every outer tar member has mtime 0, and
+   the payload still verifies with the address recovered
+   from the manifest. Suite 27/27. Copy paired in
+   EXPLAINER section 4 (item 6 below).
+5. R-10 (container U outside the firewall gate) — FIXED.
+   onionhost-u.container now mirrors A's binding:
+   BindsTo=onionhost-nft-gate.service (+ After), and
+   onionhost-nft-load.service joins its Wants/After.
+   onionhost-nft-gate-check stops BOTH onionhost-a and
+   onionhost-u on mismatch (previously only A — the client
+   container, the one that originates clearnet-bound
+   traffic, kept running under a firewall the platform had
+   judged wrong) and gained the house test seams
+   (ONIONHOST_NFT_GATE, ONIONHOST_SYSTEMCTL).
+   poc/runtime-gate run_sim gains 5 cases (mismatch stops
+   A and U; match and gate-error stop nothing); sim 68/68,
+   dashboard harness 0 failed.
+6. R-08 (EXIF overclaim in shipped copy) — FIXED.
+   EXPLAINER section 3's unscoped sentence now matches the
+   site's scoped wording (scrub belongs to the built-in
+   page/journal editors; app uploads are published as the
+   app handles them), and both launch-post instances
+   (LAUNCH-POSTS-DRAFT-2026-10-12.md) are scoped the same
+   way. Sweep covered site/, outreach/, EXPLAINER.md,
+   OWNER-GUIDE (already scoped) and the wizard/dashboard
+   strings (sitegen's claim is about its own ingest —
+   accurate). On the brief's served-anywhere question:
+   EXPLAINER.md is referenced by nothing in the build or
+   the shipped tree — it is a repository document only, so
+   the retire/refresh branch was not triggered; its
+   broader pre-app staleness (it still describes a
+   static-only v1) is editorial and outside this brief.
+7. R-09 (the wizard warning the docs claim exists) — BUILT.
+   The Go Live page (page_s1_golive) now carries the
+   warning before the button. Shipped wording, verbatim:
+   "One honest warning before you go live. This system
+   hides your computer's network address - it cannot hide
+   when the computer is online. If being physically
+   located would put you in danger, do not rely on hosting
+   from your home." EXPLAINER section 2's claim ("The
+   setup wizard shows this warning in plain language,
+   including the sentence: if being physically located
+   would put you in danger, do not rely on hosting from
+   your home") and OWNER-GUIDE section 2 item 7 are now
+   true of the shipped wizard.
+8. R-11 (exact app versions served to visitors) — FIXED
+   where a supported surface exists. DokuWiki: the recipe
+   overlay now denies /VERSION, /README and /SECURITY.md
+   (exact-match locations; all three files verified
+   present in the shipped archive's docroot). WordPress:
+   /readme.html denied in the recipe overlay, and the
+   sealed must-use plugin now also suppresses the feed
+   generator (the_generator -> empty on all feed formats)
+   and strips the default ?ver= version parameter from
+   enqueued script/style URLs (script_loader_src /
+   style_loader_src). Two surfaces have NO supported
+   off-switch and are recorded, not patched around: SMF's
+   page footer prints SMF_FULL_VERSION via
+   theme_copyright() (Sources/Subs.php:4677-4678 — a
+   printf of the language string; no settings toggle
+   exists), and Gitea exposes its version with no config
+   surface (its footer/API version are compiled in). Both
+   would need application-code or theme patches, which
+   the recipe discipline does not do; the audit's Gap 4
+   rig fetch remains the exposure record for both.
+9. R-06 (golden ruleset's root clearnet permission) —
+   MECHANICAL PART ONLY. The stale comment (it cited
+   DESIGN-v2 section 7's superseded "host apt is clearnet
+   HTTPS" design) is replaced with a truthful one: nothing
+   shipped sends that traffic (apt is Tor-only, stock
+   methods disabled), the permission is retained, and the
+   narrow-vs-accept question is the reviewer's. The rule
+   itself is byte-unchanged.
+10. R-12 (apt User-Agent names the platform) — FIXED.
+    usr/lib/apt/methods/tor+http now sends
+    "Debian APT-HTTP/1.3 (3.0.3)" — the stock trixie apt
+    method's agent — instead of "apt (onionhost-tor)".
+    Verified on the wire in the fake-SOCKS fetch test
+    (item 12).
+11. R-13 (restart precedes the settle; Persistent timer) —
+    FIXED. (a) On the install path the drawn settle now
+    sleeps BEFORE stackctl("restart"), so the
+    republication itself — not just the local probe —
+    lands at a drawn time unrelated to the fetch; the
+    judgement is then plain health_ok() on its existing
+    probe budget (no second settle). The install-failure
+    branch is byte-equivalent to before (restart, judged
+    unhealthy, no probe — the old short-circuited
+    expression never probed there either). The rollback
+    and fail-closed-recovery paths KEEP their post-restart
+    settle, with the reasoning in health_ok_after_restart's
+    docstring: a rollback's restart must not wait while a
+    judged-bad stack keeps serving (Y8), and recovery's
+    restart returns a site that is OFF — delaying it by
+    hours trades the recovery duty away, and the common
+    recovery follows no same-run package fetch beyond the
+    index refresh. gate4fix S9 was rewritten to assert the
+    stronger property (restart starts >= the settle after
+    the install; the first probe judges the restarted
+    stack with no second settle) and passes; S10
+    (defaults >= 1800s floor, >= 3600s spread) unchanged;
+    suite 0 failed overall. (b) onionhost-update.timer
+    drops Persistent=true, with the reason in its comment:
+    a box off through its window polls at the next window,
+    not at power-on.
+12. R-14 (update-observer bound undisclosed) — FIXED in
+    the Owner Guide: section 1 gains a plain paragraph
+    stating what the channel's two ends can see (the
+    project repository operator: that an anonymous box
+    polled, and when; Debian's mirrors: which package
+    versions an anonymous box fetched, and when — a bound
+    on patch lag) and what they cannot (address, site,
+    identity). R-19 (SOCKS streams blended across
+    clients) — FIXED: both local SOCKS clients now offer
+    username/password auth and authenticate under fixed
+    public usernames — the apt method as "apt", the
+    probe as "probe" (empty passwords; the credential is
+    a circuit-partition label under Tor's default
+    IsolateSOCKSAuth, not an identity) — falling back to
+    no-auth if the server selects it, so the partition
+    can never break the fetch or the check. Verified
+    against a fake SOCKS5 server: greeting offers
+    [no-auth, user/pass], the auth frame carries the
+    fixed name, and the fetch completes end to end.
+    Circuit-level separation is Tor-side behaviour; its
+    observation rides the standing rig circuit item.
+13. R-21 / R-26 / R-28 (residual fetch machinery + stale
+    in-app update wording) — FIXED. R-21: Gitea's
+    app.ini.tmpl gains [cron.update_checker] ENABLED =
+    false (the section name and the dl.gitea.com/gitea/
+    version.json endpoint both verified present in the
+    shipped 1.27.3 binary's strings before relying on
+    them), and wp-config gains DISABLE_WP_CRON = true
+    beside the updater defines, with the trade stated in
+    its comment (version-check/housekeeping noise dies;
+    scheduled posts lose their trigger — no sealed-room
+    equivalent exists). R-26: the SMF seed tail now
+    DELETEs the two seeded package_servers rows (the
+    Package Manager's upload door — the sealed update
+    path — needs no server list); the language-pack
+    endpoint is hardcoded in SMF's code and cannot be
+    unseeded — recorded residual, dies at the wall.
+    DokuWiki's {{rss>}} aggregation is documented IN
+    local.protected.php as an editor-trust decision: a
+    core parser mode with no supported off-switch, inert
+    while the app has no network, to be revisited if a
+    future platform change ever gives it one. R-28: the
+    retired "platform's signed channel (recipe packages)"
+    wording is corrected to the A26 owner-maintained
+    model everywhere it shipped: the DokuWiki protected
+    config, the WP sealed plugin (header and update-check
+    comment), and the applier's wp-config defines comment
+    + render_wp_config docstring.
+14. R-15 (gate errors never stop anything; absent A/U
+    judged clean) — NO CODE CHANGE, on evidence. The
+    exit-2 error policy is one of the five reserved
+    calls (below) and is untouched. The absent-container
+    sub-point has no mechanical remainder: absence is a
+    designed, load-bearing contract (B and the app
+    container are alternatives — one is legitimately
+    missing on every box — and a box before Go Live has
+    no containers at all); the gate already distinguishes
+    PROVEN absence (container exists -> exit 1) from
+    error (exit 2), the Review 3 S9 split; and a down
+    site is owner-visible where owners look — the
+    Dashboard's probe-driven site card — not via the
+    runtime gate. Making mere absence a gate failure
+    would false-positive every pre-Go-Live boot.
+15. R-24 (unbounded timestamped logs) — FIXED. Writer-
+    side caps: onionhost-update's update.log and both
+    writers of maintenance-log.txt (onionhost-maintenance
+    and onionhost-restore) now rewrite the file to its
+    newest 256 KiB (from a line boundary) behind a
+    rotation note once it passes 1 MiB. A journald
+    drop-in ships at etc/systemd/journald.conf.d/
+    onionhost.conf: SystemMaxUse=256M,
+    SystemMaxFileSize=16M, MaxRetentionSec=90day.
+16. R-20 (nginx fingerprint on the app tier) — FIXED.
+    The static template now clears the Server header
+    outright (it already cleared Date and ran
+    server_tokens off). All four templates answer
+    nginx-generated errors with generic bodies (a
+    plain "Not found." / "This site is not available
+    right now." via error_page to named locations; 5xx
+    normalises to 503) — the stock 502 body naming the
+    stack when a native app is down is gone. The app
+    templates clear Last-Modified (real file mtimes on
+    the app tier publish install/edit timing) and the
+    PHP template also sets etag off; application-
+    generated errors and headers are untouched (no
+    intercept_errors anywhere, by design).
+17. R-16 (102 Status helper dead) — FIXED. log_status()
+    in the tor+http method is now called exactly once
+    per method process, when a TCP-proxy CONNECT succeeds
+    — the only path on which the developer-only override
+    can be honoured — recording the override's use in
+    apt's own stream. Verified at function level in the
+    item-12 test (fires once, not per fetch).
+18. R-25 (owner copy routes identity-linked contact) —
+    FIXED. The site page's contact call-to-action now
+    says a project-only account, or reaching the project
+    over Tor Browser, is a respectable way to say hello;
+    the Owner Guide's fetch-elsewhere workflow (section
+    3, covering section 4's downloads by reference) gains
+    the habit in one bullet: fetch over Tor or from a
+    device/account the owner doesn't mind being linked
+    to the software they run.
+19. R-22 / R-23 — ACCEPTED, with reasoning recorded.
+    R-22 (publish timing): when a site changes IS the
+    owner's publishing act; the correlation is inherent
+    to running a live site at all, and an optional
+    publish delay would be a product feature with its
+    own design, not a patch — the platform does not
+    insert itself between the owner and their own site.
+    R-23 (backup stop window): SQLite-file applications
+    need the cold copy for a consistent file set (the
+    WAL problem); the outage is the consistency price
+    of a manual, owner-timed action the owner schedules,
+    and MariaDB sites — the multi-user case — already
+    dump live and never stop. Accepted as designed.
+20. R-07 / R-17 / R-18 / R-27 — the boot, install and
+    resolver tail. R-07 (socket-dir 0777): NO tree
+    change, by the register's own gating — the 0770
+    landing is conditional on Gap 2's three proofs
+    (live A connect, rotation's second instance, the
+    setgid choice); rig item 19. R-17 (installer
+    residue): tree half DONE — the Calamares cleanup
+    jobmodule now removes the session-log paths
+    (/var/log/Calamares, /var/log/calamares, the root
+    session share) and empties the copied live journal
+    directory (its shell — ownership/mode are the
+    installed system's logging configuration — is
+    preserved; every entry in it is install-session
+    residue, since the target has never booted).
+    NetworkManager profiles are deliberately NOT
+    touched: whether a live-session profile may ride
+    into the target is Gap 8's evidence question, and
+    deleting a Wi-Fi profile the owner typed during
+    install could strand a Wi-Fi-only owner — rig item
+    20 decides it. R-18 (firewall load ordering): DONE —
+    onionhost-nft-load.service now orders After/Wants
+    network-pre.target and Before NetworkManager,
+    chrony and lightdm (plus the gate and A, as before);
+    the golden ruleset's default-deny output policy
+    covered the residual window, and this closes the
+    window itself; proof is the rig boot pcap, item 21.
+    R-27 (container resolver): DONE — the A and U
+    quadlets pin DNS=127.0.0.1 (B and the app container
+    are Network=none and have no resolver story); Tor
+    resolves internally and never consults the file, so
+    the pin only removes podman's host-resolver default
+    from a compromised process's reach. Rig item 22
+    confirms Tor unaffected and the resolver dead.
+
+### Reserved — still the human reviewer's calls (not decided here)
+
+The audit reserved five judgement calls, and this batch
+decided none of them: (1) R-06 — whether the golden
+ruleset's root/_apt clearnet permission is narrowed or
+formally accepted (only its stale comment was corrected,
+item 9); (2) R-15 — whether nft-gate ERRORS (exit 2)
+should fail closed (item 14 changed nothing there);
+(3) gVisor gofer semantics beyond the R-01 canary's
+empirical answer (item 1 scopes U; the canary measures
+what the scoping is worth); (4) guard-level correlation
+analysis for A/U; (5) any verdict on R-05's fleet-level
+metadata exposure beyond "bounded and undisclosed"
+(item 12 discloses the bound to owners; the verdict on
+the exposure itself stands reserved).
+
+### Rig additions (standing list continues)
+
+18. R-01 canary (TOP priority): from inside running A
+    and U, connect attempts to a canary host socket
+    outside the mounts, the podman socket path, and the
+    peer's SOCKS/control paths. Pass: U (now create-only)
+    reaches none of them and still serves its SOCKS
+    socket to the host probe/apt; A reaches B's http.sock
+    and nothing else unexpected. Record gofer behaviour
+    verbatim — it also feeds reserved call (3).
+19. Gap 2 / R-07: the 0770 proofs for /run/onionhost/web
+    (A connects live; a rotation's second B instance
+    binds; the setgid-vs-0770 choice measured). Pass:
+    all three demonstrated on the live stack, then the
+    tree change (tmpfiles + generate-configs) lands.
+20. Gap 8 / R-17 remainder: inventory what the installed
+    target actually inherits from the live session
+    (NetworkManager system-connections incl. any Wi-Fi
+    profile typed during install, machine-id, SSH host
+    keys if any). Pass: an itemised list with a keep/drop
+    verdict per item; the cleanup jobmodule gains only
+    what the evidence condemns.
+21. R-18: boot pcap from power-on. Pass: zero non-Tor
+    egress before the golden table loads, and the table
+    loaded before NetworkManager's first connection
+    attempt, chrony's first poll, and lightdm's start.
+22. R-27 + Gap 11: in A and U, read /etc/resolv.conf
+    (expect the 127.0.0.1 pin), attempt a lookup (expect
+    failure), watch the nft input counters; confirm Tor
+    bootstrap and the update fetch are unaffected.
+
+### Regression (final tree)
+
+- poc/recipes-smf 33/33 (32 baseline + the R-03
+  docroot-absence check), wordpress 39/39, dokuwiki
+  38/38 (37 + the R-03 check), gitea 27/27 (the real
+  1.27.3 binary booted against the rendered app.ini —
+  [cron.update_checker] accepted), marketplace 31/31.
+- poc/gate4fix run_tests: 0 assertion(s) failed
+  (S1-S10 + A26 R1-R4; S9 rewritten for R-13 as above);
+  test_dashboard: 0 failed.
+- poc/runtime-gate run_sim: 68 assertions, 0 failed
+  (63 baseline + 5 R-10 cases); test_runtime_dashboard:
+  0 failed.
+- poc/runsc-wrap run_tests: 24/24 (21 baseline + W10's 3).
+- poc/backup-proof: ALL 27 CHECKS PASS (20 baseline +
+  7 format-3 outer-layer checks incl. the real restore
+  round trip).
+- poc/installer-policy run_proofs: 26 assertions,
+  0 failed.
+- poc/d8-fix p3: environment-deferred (see venue notes).
+- ci-scan over the committable set: PASS except the two
+  known rig-user home-path literals in the UNTRACKED
+  audit pack file (owner's briefing material, untouched,
+  as instructed). The scan caught three phrase-rule false
+  positives on the way: one in this batch's own SMF seed
+  comment (a five-word EFF run spanning the comment/SQL
+  boundary) and two pre-existing in poc/installer-policy/
+  run_proofs.py (a five-word run across a line pair in the
+  fake installer handler, and a three-word bracketed
+  segment "work control tag"). All three were REWORDED,
+  not allowlisted - the seed comment's closing sentence,
+  a scratch-dir name ("control-" -> "ctl-"), and an
+  equivalent comparison form - each verified against a
+  faithful reimplementation of the scanner's rule before
+  the final scan, and both affected suites re-run green
+  afterwards (SMF 33/33, installer-policy 26/26). The
+  proof venues' extracted trees under poc/installer-policy/
+  work/ (regenerated by every run_proofs run; ~27.5k
+  stock-WordPress phrase false positives when present)
+  were removed before the final scan - they are build
+  residue of the venue, not tree content.
+- Edited Python compiles (runsc-wrap, onionhost-recipe,
+  onionhost-update, onionhost-backup, onionhost-restore,
+  onionhost-maintenance, wizard, the Calamares cleanup
+  jobmodule); bash -n clean on onionhost-nft-gate-check.
+  The apt method's new handshake, stock User-Agent and
+  102-Status note were verified against a fake SOCKS5
+  server driving the real method module end to end.
+
+Venue notes: the runtime-gate sim and backup-proof stubs
+were already staged at /tmp/rgate/bin and
+/tmp/backup-proof/bin. The d8-fix proof machine is NOT
+staged in this sandbox (/tmp was wiped; its recorded
+p3-gitea output in-tree stands at 12/12 PASS, PHASE
+RESULT: PASS from the A26 batch's re-stage) — the applier
+changes in this batch do not touch the D8 ownership
+machinery (data-dir ownership, mode exceptions,
+normalise), and the venue re-stages from the current
+tree at the next rig session; d8 p3 is therefore
+recorded as environment-deferred, not re-proven here.

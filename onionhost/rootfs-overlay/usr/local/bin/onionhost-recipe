@@ -290,6 +290,20 @@ def _save_state(recipe_id, state):
     _atomic_write(_state_path(recipe_id),
                   (json.dumps(state, indent=1, sort_keys=True)
                    + "\n").encode())
+    # The version marker rides with the state record, never in
+    # the served tree (deanonymization audit R-03): it used to be
+    # written into the staging docroot, where the web server
+    # served /RECIPE-VERSION.txt - the exact recipe and app
+    # versions, on a predictable path - to anyone who asked.
+    # Same one-line text, host-side home: next to state.json,
+    # where only host tooling reads it. Every state writer goes
+    # through here, so the marker always matches the record.
+    marker = "%s %s (app %s)\n" % (state.get("id", recipe_id),
+                                   state.get("version", ""),
+                                   state.get("app_version", ""))
+    _atomic_write(os.path.join(
+        os.path.dirname(_state_path(recipe_id)),
+        "RECIPE-VERSION.txt"), marker.encode())
 
 
 def _app_installed(recipe_id):
@@ -878,10 +892,11 @@ def render_wp_config(template_path, db, manifest):
     recipe), the manifest's table prefix, eight freshly
     generated authentication salts, and the sealed-world
     constants (outbound HTTP blocked at the WordPress API level,
-    WordPress's own updater disabled - updates arrive only
-    through the platform's signed channel - and the theme/plugin
-    code editor off, so an administrator session cannot become
-    code execution)."""
+    WordPress's own updater disabled - it could only ever work
+    by downloading, which the sealed room forbids; updates are
+    the owner's, by file replacement (A26) - WP-Cron disabled
+    for the same reason, and the theme/plugin code editor off,
+    so an administrator session cannot become code execution)."""
     with open(template_path, encoding="utf-8") as f:
         text = f.read()
     for token, key in (("database_name_here", "DB_NAME"),
@@ -922,11 +937,24 @@ def render_wp_config(template_path, db, manifest):
         "// once instead of dialling out (and being blocked at\n"
         "// the container wall anyway).\n"
         "define( 'WP_HTTP_BLOCK_EXTERNAL', true );\n"
-        "// Updates arrive only through the platform's signed\n"
-        "// channel (the recipe packages); WordPress's own\n"
-        "// updater is disabled.\n"
+        "// WordPress's own updater is disabled: it works by\n"
+        "// downloading, and this site has no network to\n"
+        "// download with. Updates are the owner's, made by\n"
+        "// replacing files in the app folder (Owner Guide\n"
+        "// section 4) - the platform installed WordPress once\n"
+        "// and never changes it again (A26).\n"
         "define( 'AUTOMATIC_UPDATER_DISABLED', true );\n"
         "define( 'WP_AUTO_UPDATE_CORE', false );\n"
+        "// WP-Cron is disabled (deanonymization audit R-21):\n"
+        "// with the updater off and outbound HTTP blocked,\n"
+        "// cron's remaining jobs here are version-check and\n"
+        "// housekeeping noise whose loopback self-requests\n"
+        "// achieve nothing the platform does not already do\n"
+        "// on its own schedule. Scheduled posts are the one\n"
+        "// visible cost - WordPress's own answer, an external\n"
+        "// cron trigger, has no sealed-room equivalent; the\n"
+        "// trade is recorded in the build log's audit trail.\n"
+        "define( 'DISABLE_WP_CRON', true );\n"
         "// The theme/plugin code editor is off: an\n"
         "// administrator session must not become code\n"
         "// execution. Files are managed in the app folder.\n"
@@ -1430,10 +1458,9 @@ def apply_recipe(recipe_id):
         dst = os.path.join(staging, item["dst"])
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
-    with open(os.path.join(staging, "RECIPE-VERSION.txt"),
-              "w") as f:
-        f.write("%s %s (app %s)\n" % (recipe_id, version,
-                                      manifest["app"]["version"]))
+    # No version marker in the staged tree: RECIPE-VERSION.txt
+    # is written host-side by _save_state when this apply
+    # completes (deanonymization audit R-03).
 
     # ---- seed (first install only; SQL-seeded recipes) --------
     # Installer-driven recipes (manifest "install") seed later,

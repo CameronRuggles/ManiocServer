@@ -65,6 +65,16 @@ DISABLE_REGISTRATION = true
 ; at the source rather than failing one by one.
 ENABLED = false
 
+[cron.update_checker]
+; The new-release checker (deanonymization audit R-21): left
+; at its upstream default, Gitea periodically fetches
+; dl.gitea.com/gitea/version.json - a version-stamped
+; phone-home attempt that can only die at the sealed wall and
+; retry forever. Off at the source. Gitea updates are the
+; owner's, by replacing the program file (Owner Guide
+; section 4); the platform installed it once (A26).
+ENABLED = false
+
 [picture]
 ; Gravatar would put a hash of every member's email address
 ; into pages for visitors' browsers to fetch - off. Members

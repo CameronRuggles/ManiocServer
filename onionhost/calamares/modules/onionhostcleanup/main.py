@@ -26,10 +26,22 @@ and edits only the target (GlobalStorage rootMountPoint):
   * remove the test sshd drop-in, mask ssh.service, and purge the
     test-only packages (openssh-server, xdotool) if present
   * remove any authorized_keys left in target homes
+  * remove the installer's own session-log residue from the target
+    (deanonymization audit R-17): the Calamares session log and
+    the live session's journal record the install session -
+    network names the installer saw, timings, and any error that
+    named the household's hardware. They are scaffolding of the
+    install, not records of the installed system. The stock
+    NetworkManager connection profiles are deliberately NOT
+    touched here: whether a live-session profile (e.g. a Wi-Fi
+    password typed during install) may ride into the target is
+    the rig session's Gap 8 question - deleting the profile
+    could strand a Wi-Fi-only owner, so it waits for evidence.
 Idempotent and best-effort per item, but a missing rootMountPoint is
 a hard failure: silently skipping cleanup would ship test access.
 """
 import os
+import shutil
 import subprocess
 
 import libcalamares
@@ -38,6 +50,16 @@ LIVE_USER = "user"
 AUTOLOGIN_DROPIN = "/etc/lightdm/lightdm.conf.d/10-onionhost-live.conf"
 SSHD_DROPIN = "/etc/ssh/sshd_config.d/10-onionhost-test.conf"
 TEST_PACKAGES = ["openssh-server", "xdotool"]
+# Install-session log residue removed from the target (R-17):
+# Calamares' session log locations (target-side copies, if the
+# session wrote any) and the live journal directory the unpack
+# copied across. The installed system starts its own journal.
+SESSION_LOG_PATHS = [
+    "/var/log/Calamares",
+    "/var/log/calamares",
+    "/root/.local/share/calamares",
+    "/var/log/journal",
+]
 OLD_KEYFILE = "/crypto_keyfile.bin"
 KEYFILE_DIR = "/etc/cryptsetup-keys.d"
 KEYFILE_NAME = "root.key"
@@ -144,6 +166,37 @@ def run():
         if proc.returncode != 0:
             problems.append("apt purge %s: %s"
                             % (installed, proc.stderr.strip()[:200]))
+
+    # 4. Install-session log residue (R-17): the unpack copied
+    # the live filesystem wholesale, so the install session's
+    # own records ride into the target unless removed here.
+    # Calamares session-log paths go entirely. The journal
+    # directory keeps its shell - its ownership and mode are
+    # the installed system's logging configuration - but none
+    # of the live session's entries: the installed system has
+    # not booted yet, so every entry in it is install residue
+    # (the live session's network view, timings, hardware
+    # names), not the target's own history.
+    for rel in SESSION_LOG_PATHS:
+        p = root + rel
+        try:
+            if os.path.islink(p) or os.path.isfile(p):
+                os.unlink(p)
+            elif os.path.isdir(p):
+                if rel == "/var/log/journal":
+                    for entry in os.listdir(p):
+                        ep = os.path.join(p, entry)
+                        if os.path.isdir(ep) and \
+                                not os.path.islink(ep):
+                            shutil.rmtree(ep,
+                                          ignore_errors=True)
+                        else:
+                            os.unlink(ep)
+                else:
+                    shutil.rmtree(p, ignore_errors=True)
+        except OSError as e:
+            problems.append("session log cleanup %s: %s"
+                            % (rel, e))
 
     if problems:
         return ("OnionHost cleanup", "; ".join(problems), 1)

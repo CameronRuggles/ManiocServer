@@ -2,16 +2,26 @@
 # OnionHost periodic firewall-gate check (DESIGN-v2 section 6 + v3 A8).
 #
 # The boot-time gate (onionhost-nft-gate.service) is a oneshot with
-# RemainAfterExit=yes - that is what lets container A BindsTo= it, but
-# it also means a systemd timer pointing at that unit can never
-# re-execute it (starting an already-active unit is a no-op; found in
-# step-3 slice 3). This wrapper is what the 5-minute timer actually
-# runs: it re-executes the comparison and enforces the design's
-# fail-closed rule itself - on mismatch the gateway is STOPPED (the
-# site goes down, nothing is exposed) and the event is logged loudly
-# for the Dashboard's red card ("Safety settings changed").
+# RemainAfterExit=yes - that is what lets containers A and U BindsTo=
+# it, but it also means a systemd timer pointing at that unit can
+# never re-execute it (starting an already-active unit is a no-op;
+# found in step-3 slice 3). This wrapper is what the 5-minute timer
+# actually runs: it re-executes the comparison and enforces the
+# design's fail-closed rule itself - on mismatch BOTH tor
+# containers are STOPPED (the site goes down and the client path
+# closes, nothing is exposed) and the event is logged loudly for
+# the Dashboard's red card ("Safety settings changed"). U was
+# added by the deanonymization audit fix batch (R-10): before it,
+# the drift check stopped only A, leaving the actual
+# clearnet-originating container running under a firewall the
+# platform itself had judged wrong.
+#
+# Test seams (same pattern as onionhost-runtime-gate-check):
+#   ONIONHOST_NFT_GATE  gate binary
+#   ONIONHOST_SYSTEMCTL systemctl binary
 set -u
-GATE=/usr/local/bin/onionhost-nft-gate
+GATE=${ONIONHOST_NFT_GATE:-/usr/local/bin/onionhost-nft-gate}
+SYSTEMCTL=${ONIONHOST_SYSTEMCTL:-systemctl}
 OUT=$("$GATE" 2>&1)
 RC=$?
 case $RC in
@@ -20,9 +30,10 @@ case $RC in
         ;;
     1)
         logger -t onionhost-nft-gate-check -p daemon.err \
-            "MISMATCH: $OUT - stopping onionhost-a (fail closed)"
-        echo "onionhost-nft-gate-check: MISMATCH - stopping onionhost-a" >&2
-        systemctl stop onionhost-a.service || true
+            "MISMATCH: $OUT - stopping onionhost-a and onionhost-u (fail closed)"
+        echo "onionhost-nft-gate-check: MISMATCH - stopping onionhost-a and onionhost-u" >&2
+        "$SYSTEMCTL" stop onionhost-a.service || true
+        "$SYSTEMCTL" stop onionhost-u.service || true
         exit 1
         ;;
     *)

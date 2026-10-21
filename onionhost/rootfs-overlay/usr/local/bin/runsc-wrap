@@ -38,10 +38,22 @@ run"; DESIGN-v3-amendments A18):
     (Repo Review 5 B-2): no network is the only safe default for
     a bundle this wrapper cannot classify.
 
-Host-UDS modes (Repo Review 2 task 21 / finding S3):
-  * Tor class (A and U): --host-uds=all. A must CONNECT to the
-    website's socket (B's publish alone left A's tor unable to
-    connect in the rig measurements), so tor keeps the broad mode.
+Host-UDS modes (Repo Review 2 task 21 / finding S3; U narrowed
+by the 2026-10-21 deanonymization audit, register R-01):
+  * Tor class A: --host-uds=all. A must CONNECT to the website's
+    socket (B's publish alone left A's tor unable to connect in
+    the rig measurements), so A keeps the broad mode.
+  * Tor class U: --host-uds=create. U only BINDS its SOCKS and
+    control listeners; the host-side consumers (the reachability
+    probe, the apt tor method, the update helper) do the
+    connecting - exactly the create pattern B proves. Nothing
+    inside U ever dials a host socket, so U does not get connect
+    reach (under `all`, host UDS under the listed mounts were all
+    connectable by any process in the sandbox - the widest host
+    path on the platform). U is told apart from A by its torrc
+    path in the bundle args (client-torrc vs torrc). The rig
+    canary (ISO-BUILD-LOG rig list) proves U still serves under
+    create on the real stack.
   * Website class and unrecognised bundles: --host-uds=create.
     They only CREATE their listener socket (B/app create b1.sock;
     the host side and A do the connecting), so create-only is
@@ -155,10 +167,15 @@ def main():
     is_tor = prog == "tor"
 
     if is_tor:
-        # A/U: connect-capable UDS, spec untouched, no --network
-        # flag (the bridge netns entry in the spec is runsc's to
-        # use as-is). Unchanged from the proven production shape.
-        extra = ["--host-uds=all"]
+        # Tor class: spec untouched, no --network flag (the
+        # bridge netns entry in the spec is runsc's to use as-is).
+        # A keeps connect-capable UDS (it dials B's http.sock);
+        # U only binds its listeners, so it runs create-only -
+        # told apart by the torrc path in its args (R-01).
+        if any("client-torrc" in str(a) for a in cmd):
+            extra = ["--host-uds=create"]
+        else:
+            extra = ["--host-uds=all"]
     elif is_website:
         # Website class: create-only UDS (it creates b1.sock; it
         # never connects to a host socket) and no network, ever.

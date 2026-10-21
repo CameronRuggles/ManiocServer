@@ -92,8 +92,8 @@ one job:
 
 Around that: full-disk encryption with a generated 7-word phrase typed at every boot (unplug
 it and it's a brick), a firewall that compares itself against a golden config and fails
-closed, EXIF/GPS stripped from published photos, and no web admin panel at all — editing
-happens in a local app on the machine.
+closed, EXIF/GPS stripped from photos published through the built-in editors, and no web
+admin panel at all — editing happens in a local app on the machine.
 
 What we don't claim is also on the project page: Tor hides where a server is, not when it's
 online, so a patient observer correlating uptime with outage reports can narrow things down
@@ -125,8 +125,8 @@ never seen it, and that holds as long as the sandbox wiring does. The honest lim
 on the project page: this is about the network address only. Tor hides where a server is,
 not when it is online, so a patient observer matching uptime against public outage reports
 can still narrow things down over time. Full-disk encryption with a generated paper
-phrase, golden-config firewall that fails closed, EXIF stripping on publish, local-only
-editing (no web admin panel).
+phrase, golden-config firewall that fails closed, EXIF stripping on publish through the
+built-in editors, local-only editing (no web admin panel).
 Alpha: installers/editors built and passing end-to-end tests; a testing ISO is
 downloadable from the project page — the formal release still waits on reproducible-build
 verification. Recruiting spare-PC testers, security

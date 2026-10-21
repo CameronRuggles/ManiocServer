@@ -9,14 +9,28 @@
 # A and the site are unaffected.
 [Unit]
 Description=OnionHost U - client Tor
-Wants=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service
-After=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service
+Wants=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service onionhost-nft-load.service
+After=network-online.target onionhost-config.service onionhost-images.service onionhost-network.service onionhost-nft-load.service
+# Bound to the firewall gate exactly as container A is
+# (deanonymization audit R-10): the nftables egress table is the
+# platform-wide promise, and U is the container that originates
+# clearnet-bound traffic - it must not start, or keep starting,
+# on a box whose firewall failed its golden comparison.
+BindsTo=onionhost-nft-gate.service
+After=onionhost-nft-gate.service
 
 [Container]
 Image=localhost/onionhost-tor:latest
 ContainerName=onionhost-u
 PodmanArgs=--runtime=runsc-wrap
 Network=onionhost
+# DNS pinned to the sandbox's own loopback, as on container A
+# (deanonymization audit R-27): podman's default hands the
+# container the host's resolver list; Tor resolves internally
+# and never consults it, and the dead-end resolver stops a
+# compromised process from aiming DNS at the household
+# resolver (and keeps bridge DNS noise off the wire entirely).
+DNS=127.0.0.1
 # Fixed userns map, as in onionhost-a.container (container root is
 # always host uid 2200000; state dirs are owned accordingly).
 UIDMap=0:2200000:65536

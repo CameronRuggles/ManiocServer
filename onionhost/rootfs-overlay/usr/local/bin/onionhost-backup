@@ -13,12 +13,19 @@ restore, on the machine being restored - see onionhost-restore).
 File format (a plain tar, deliberately inspectable from outside):
     meta.json     plain metadata: format version, per-install
                   salts (NOT secret - they travel so that file +
-                  phrase alone suffice to restore), the recipient
-                  strings used, the site's onion address, creation
-                  time.
+                  phrase alone suffice to restore) and the
+                  recipient strings used. Nothing else: since
+                  format 3 the outer layer names neither the
+                  site's onion address nor the creation time
+                  (deanonymization audit R-04) - both live only
+                  inside the encrypted manifest, so a found or
+                  seized backup file does not identify the site
+                  it belongs to or when it was made.
     payload.age   age ciphertext of a gzipped tar holding
                   manifest.json + the payload files. The manifest
-                  lists every file with its sha256, size and kind.
+                  lists every file with its sha256, size and kind,
+                  and carries the onion address + creation time
+                  for the restore's own checks.
 
 Payload contents (and nothing else - the source list is explicit,
 never a directory sweep):
@@ -62,9 +69,13 @@ the site as currently configured and is not dumped (the datadir
 stays on the machine, untouched) - APP-SITES.md says so plainly.
 
 Backup format history: format 1 = static tiers only (slice 5B).
-Format 2 (this writer) adds the app section + "siteKind" in the
-manifest; static backups are otherwise unchanged. onionhost-
-restore reads both formats.
+Format 2 adds the app section + "siteKind" in the manifest;
+static backups are otherwise unchanged. Format 3 (this writer)
+minimises the plaintext outer layer: meta.json drops the onion
+address and creation time, and every member of the outer tar
+carries mtime 0 - the address and time live only in the
+encrypted manifest. onionhost-restore reads all three formats;
+formats 1 and 2 restore exactly as before.
 
 Explicitly NEVER included (A19/A19.1 hygiene - a backup carrying
 the disk keyfile would silently undo the product's core promise):
@@ -117,7 +128,7 @@ STATE_FILE = "/var/lib/onionhost/state"
 APPDATA = "/var/lib/onionhost/appdata"
 APP_DB_ENV = "/etc/onionhost/app-db.env"
 APP_CONTAINER = "onionhost-app"
-FORMAT = 2
+FORMAT = 3
 
 FORBIDDEN_MARKERS = ("cryptsetup-keys", "crypto_keyfile", "root.key",
                      "initrd", "initramfs", "shadow", "luks-roles",
@@ -633,11 +644,17 @@ def create_backup(user, dest):
             return _fail("encrypting the backup failed: %s"
                          % proc.stderr.strip()[:200])
 
+        # Format 3 outer meta (R-04): only what the restore
+        # needs BEFORE it can decrypt - the format, the salts
+        # the phrase derivation consumes, and the recipients.
+        # The onion address and creation time are NOT here any
+        # more: they identify the site and date the file to
+        # anyone who merely holds it. Both remain in the
+        # encrypted manifest above, where the restore reads them
+        # after decryption.
         meta = {
             "format": FORMAT,
             "kind": "onionhost-backup",
-            "created": created,
-            "onion": onion,
             "salts": {"main": salts.get("main")},
             "recipients": recipients,
         }
@@ -655,7 +672,16 @@ def create_backup(user, dest):
                     info.mtime = 0
                     info.mode = 0o644
                     tar.addfile(info, io.BytesIO(meta_json))
-                    tar.add(payload_age, arcname="payload.age")
+                    # payload.age gets an explicit mtime-0 header
+                    # too (R-04): tar.add would have stamped the
+                    # ciphertext file's real mtime - the backup's
+                    # creation moment - into the plain outer tar.
+                    pinfo = tarfile.TarInfo("payload.age")
+                    pinfo.size = os.path.getsize(payload_age)
+                    pinfo.mtime = 0
+                    pinfo.mode = 0o644
+                    with open(payload_age, "rb") as pf:
+                        tar.addfile(pinfo, pf)
                 out.flush()
                 os.fsync(out.fileno())
         except BaseException:

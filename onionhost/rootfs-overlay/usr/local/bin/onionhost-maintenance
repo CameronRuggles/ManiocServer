@@ -25,6 +25,33 @@ from datetime import datetime, timezone
 MAINT_LOG = "/var/lib/onionhost/maintenance-log.txt"
 
 
+def _cap_log(path):
+    """Bound the maintenance log (deanonymization audit R-24):
+    an undecayed timestamped history of every console session
+    is a seized-box timeline of the household. Past 1 MiB the
+    file is rewritten to its newest 256 KiB (from a line
+    boundary) behind a rotation note. Best effort, like the
+    append it bounds. (onionhost-restore appends to the same
+    file and applies the same cap.)"""
+    try:
+        if os.path.getsize(path) <= (1 << 20):
+            return
+        with open(path, "rb") as f:
+            f.seek(-(1 << 18), os.SEEK_END)
+            tail = f.read()
+        nl = tail.find(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        note = ("%s maintenance: log rotated - older entries "
+                "discarded by the size cap\n"
+                % datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")).encode()
+        with open(path, "wb") as f:
+            f.write(note + tail)
+    except OSError:
+        pass
+
+
 def _log_event(text):
     line = "%s maintenance: %s\n" % (
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -34,6 +61,7 @@ def _log_event(text):
             f.write(line)
     except OSError:
         pass
+    _cap_log(MAINT_LOG)
     subprocess.run(["logger", "-t", "onionhost-maintenance", text],
                    capture_output=True)
 

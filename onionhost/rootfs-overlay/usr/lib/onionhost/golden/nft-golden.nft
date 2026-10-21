@@ -74,8 +74,19 @@ table inet onionhost {
         # desktop user gets ZERO egress).
         meta skuid { root, _apt, _chrony } udp dport 53 accept
         meta skuid { root, _apt, _chrony } tcp dport 53 accept
-        # Host package updates over HTTPS (DESIGN-v2 section 7: host
-        # apt is clearnet HTTPS; the signature is the gate).
+        # Retained allowance, NOT a shipped behaviour: nothing
+        # on the shipped system sends this traffic - the updater
+        # runs apt as root, but apt is Tor-only by configuration
+        # (the stock http/https methods are disabled and apt is
+        # pinned to the tor+http method; see
+        # usr/lib/apt/methods/tor+http). This permission is what
+        # a future stock-method path would need, and what stands
+        # open if that configuration ever regresses. Whether it
+        # should be narrowed to loopback is reserved to the human
+        # reviewer (deanonymization audit R-06); until that call
+        # the rule stays, and this comment tells the truth about
+        # it: an unused permission, kept deliberately, not a
+        # description of how updates travel today.
         meta skuid { root, _apt } tcp dport { 80, 443 } accept
         # Time: NTS only (DQ10). NTS-KE handshake on TCP 4460, the
         # secured NTP exchange itself on UDP 123, both as _chrony

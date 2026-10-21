@@ -20,6 +20,15 @@ Image=localhost/onionhost-tor:latest
 ContainerName=onionhost-a
 PodmanArgs=--runtime=runsc-wrap
 Network=onionhost
+# DNS pinned to the sandbox's own loopback (deanonymization
+# audit R-27): podman's default for a custom network hands the
+# container the HOST's resolver list, which would let a
+# compromised Tor process aim DNS at the household resolver
+# directly (the nft ruleset would drop it, noisily, and learn
+# nothing good). Tor resolves internally and never consults
+# this file; 127.0.0.1 makes the resolver itself a dead end,
+# so the table's DNS row is no longer this container's story.
+DNS=127.0.0.1
 # Private user namespace with a FIXED map (refines A5's userns=auto):
 # container root is always host uid 2100000, so the state volumes can
 # be deterministically owned by it (see onionhost-generate-configs).

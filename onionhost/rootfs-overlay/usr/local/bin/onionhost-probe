@@ -22,9 +22,26 @@ def fetch(onion, attempts=10):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(20)
             s.connect(SOCKS)
-            # SOCKS5, no auth
-            s.sendall(b"\x05\x01\x00")
-            if s.recv(2) != b"\x05\x00":
+            # SOCKS5, authenticating under a fixed username
+            # (deanonymization audit R-19): Tor's default
+            # IsolateSOCKSAuth keeps streams with different
+            # SOCKS credentials on different circuits, so these
+            # self-probes never share a circuit with the package
+            # fetches (the apt method authenticates as "apt").
+            # The name is fixed and public - a circuit-partition
+            # label, not an identity. If the server selects
+            # no-auth instead, proceed: the partition is a
+            # hardening, the check itself is the duty.
+            s.sendall(b"\x05\x02\x00\x02")
+            greet = s.recv(2)
+            if len(greet) != 2 or greet[0] != 5:
+                raise OSError("socks greeting failed")
+            if greet[1] == 2:
+                s.sendall(b"\x01\x05probe\x00")
+                auth = s.recv(2)
+                if len(auth) != 2 or auth[1] != 0:
+                    raise OSError("socks auth rejected")
+            elif greet[1] != 0:
                 raise OSError("socks auth rejected")
             host = onion.encode()
             s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host +

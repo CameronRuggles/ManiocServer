@@ -3,11 +3,13 @@
  * Plugin Name: OnionHost sealed-world posture
  * Description: A platform file of the packaged WordPress recipe
  * (A23). WordPress on OnionHost runs in a sealed room: no
- * outbound network, no mail, updates only through the platform's
- * signed channel. This must-use plugin carries the parts of that
- * posture that live in WordPress options and filters rather than
- * in wp-config.php. It is (re)written by the recipe on every
- * apply; deleting it deletes the posture, not the site.
+ * outbound network, no mail, and no self-update machinery (it
+ * could only work by downloading). The platform installed
+ * WordPress once; updates after that are the owner's, by file
+ * replacement (A26). This must-use plugin carries the parts of
+ * that posture that live in WordPress options and filters
+ * rather than in wp-config.php. It is (re)written by the recipe
+ * on every apply; deleting it deletes the posture, not the site.
  *
  * @package OnionHost
  * License: GPL-2.0-or-later
@@ -52,12 +54,13 @@ add_filter(
 /*
  * Update checks: wp-config.php defines AUTOMATIC_UPDATER_DISABLED
  * and WP_HTTP_BLOCK_EXTERNAL, so WordPress cannot fetch or apply
- * updates itself; the platform's signed channel (recipe packages)
- * is the only update path. These filters answer the version,
- * plugin and theme checks with "checked just now, nothing new",
- * so wp-admin shows no dead update nags - and the version-check
- * cron, reading the same transients, finds them fresh and skips
- * its (blocked anyway) phone-home entirely.
+ * updates itself - under A26 there is no platform update path
+ * for an installed app at all; updating is the owner's, by file
+ * replacement. These filters answer the version, plugin and
+ * theme checks with "checked just now, nothing new", so wp-admin
+ * shows no dead update nags - and the version-check machinery,
+ * reading the same transients, finds them fresh and skips its
+ * (blocked anyway) phone-home entirely.
  */
 function onionhost_neutral_update_core( $value ) {
 	global $wp_version;
@@ -93,6 +96,25 @@ add_filter( 'emoji_svg_url', '__return_false' );
 
 /* No version disclosure in the page head. */
 remove_action( 'wp_head', 'wp_generator' );
+
+/*
+ * Version disclosure, continued (deanonymization audit R-11):
+ * the head was one of three places WordPress prints its exact
+ * version. Every feed carries a <generator> element naming it -
+ * suppress the generator text on all feed formats. And every
+ * enqueued script and style URL carries the version as its
+ * default ?ver= parameter - strip the parameter; the platform
+ * serves whole files and never relied on it for cache-busting.
+ */
+add_filter( 'the_generator', '__return_empty_string' );
+function onionhost_strip_asset_version( $src ) {
+	if ( is_string( $src ) && false !== strpos( $src, 'ver=' ) ) {
+		$src = remove_query_arg( 'ver', $src );
+	}
+	return $src;
+}
+add_filter( 'script_loader_src', 'onionhost_strip_asset_version' );
+add_filter( 'style_loader_src', 'onionhost_strip_asset_version' );
 
 /*
  * One-time seeded defaults (owner-overridable afterwards - these

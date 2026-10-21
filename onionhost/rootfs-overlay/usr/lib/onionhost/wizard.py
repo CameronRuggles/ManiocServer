@@ -1023,6 +1023,17 @@ class Wizard:
         self.body("Your website software is already running. "
                   "Pressing Go Live publishes your site at your "
                   ".onion address and finishes setup.")
+        # The safety warning the public explainer and the Owner
+        # Guide have always said this page carries - it did not
+        # exist until the deanonymization audit (R-09) found the
+        # claim shipped without the warning. This is the step
+        # where the owner commits to going live, so this is where
+        # it belongs, before the button.
+        self.body("One honest warning before you go live. This "
+                  "system hides your computer's network address - "
+                  "it cannot hide when the computer is online. If "
+                  "being physically located would put you in "
+                  "danger, do not rely on hosting from your home.")
         self.body("After this, use the Manioc Server app on the "
                   "desktop to edit your site and check it is up.")
         self.golive_error = tk.Label(self.frame, text="",

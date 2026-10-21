@@ -13,6 +13,13 @@ unmodified from the tree. Cases:
   secret-tmp   - appdata/native/recipe-admin.env.tmp refuses
                  the same way (named secret, NOT skipped)
   shadow-guard - a file actually named "shadow" still refuses
+  outer-min    - format 3 (deanonymization audit R-04): the
+                 plaintext outer layer carries neither the onion
+                 address nor a creation time (no meta keys, no
+                 nonzero tar mtimes), while the real restore
+                 module still reads the wrapper and verifies the
+                 payload, taking the address from the encrypted
+                 manifest
 """
 import contextlib
 import gzip
@@ -185,6 +192,59 @@ def main():
     check("guard: exact 'shadow' component still refused",
           rc == 1 and not os.path.exists(dest)
           and "forbidden path" in err)
+
+    # (iv) format 3: the plain outer layer identifies nothing.
+    # Give this fixture a CONSISTENT onion identity (real key
+    # bytes + the address recomputed from them) so the real
+    # restore verifier can run its three-way identity check.
+    import backupkeys
+    dest = build_fixture("outer-min", {})
+    hs = os.path.join(ROOT, "fx-outer-min", "hs")
+    key32 = bytes(range(32))
+    address = backupkeys.onion_address_from_pubkey(key32)
+    with open(os.path.join(hs, "hs_ed25519_public_key"), "wb") as f:
+        f.write(b"\x00" * 32 + key32)
+    with open(os.path.join(hs, "hostname"), "w") as f:
+        f.write(address + ".onion\n")
+    rc, out, err = run_backup(dest)
+    check("outer: backup succeeds", rc == 0 and "BACKUP_OK" in out)
+    with tarfile.open(dest) as tar:
+        members = tar.getmembers()
+        meta_raw = tar.extractfile("meta.json").read()
+    meta = json.loads(meta_raw)
+    check("outer: format is 3", meta.get("format") == 3)
+    check("outer: meta carries no onion address",
+          "onion" not in meta
+          and (address + ".onion").encode() not in meta_raw)
+    check("outer: meta carries no creation time",
+          "created" not in meta)
+    check("outer: every outer tar member has mtime 0",
+          all(m.mtime == 0 for m in members))
+    # The real restore module reads the wrapper and verifies the
+    # decrypted payload (the age shim is a passthrough, so the
+    # payload bytes ARE the payload tar.gz).
+    rspec = importlib.util.spec_from_loader(
+        "onionhost_restore",
+        SourceFileLoader(
+            "onionhost_restore",
+            os.path.join(TREE, "onionhost/rootfs-overlay/usr/local/"
+                               "bin/onionhost-restore")))
+    rs = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rs)
+    meta2, payload = rs._read_wrapper(dest)
+    check("outer: restore accepts the format 3 wrapper",
+          meta2.get("format") == 3)
+    stage = os.path.join(ROOT, "fx-outer-min", "stage")
+    os.makedirs(stage)
+    payload_path = os.path.join(ROOT, "fx-outer-min",
+                                "payload.tar.gz")
+    with open(payload_path, "wb") as f:
+        f.write(payload)
+    manifest = rs._verify(payload_path, stage)
+    check("outer: restore verifies the payload and recovers the "
+          "address from the encrypted manifest",
+          manifest.get("onion") == address + ".onion"
+          and bool(manifest.get("created")))
 
     pwd_mod.getpwnam = _real_getpwnam
     print("ALL %d CHECKS PASS" % len(passed))

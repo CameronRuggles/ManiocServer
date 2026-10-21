@@ -29,6 +29,20 @@ randomized daily schedule. The box never reaches out on the clearnet.
   that the app is yours — updating it is your job (§4). The platform
   never changes an installed app.
 
+**What the update channel itself can see — the honest bound.** Your
+box stays anonymous: nothing in an update run carries your address,
+your site's name, or anything that identifies you. But the two ends
+of the channel each learn one narrow thing. The project's repository
+operator can see *that* an anonymous box polled, and when — the
+polls are deliberately randomised and spread across the day so they
+don't even reveal your timezone, and every box looks the same to
+the repository. And the Debian mirrors your box downloads from over
+Tor can see *which package versions* an anonymous box fetched, and
+when — which tells them roughly how current that box's software is,
+never whose it is or where it lives.
+That is the whole of it: timing and version freshness, visible to
+the channel's operators, attached to no identity.
+
 Two protections, automatic (they cover the system and the platform —
 your app is never touched by an update run, so it needs neither):
 
@@ -86,6 +100,11 @@ is a property of the wiring, not curation.
   inside wp-admin. That directory is fetched by the server, and the
   server has no internet. Download plugins elsewhere (phone, another
   computer) and bring the files over.
+- One habit worth forming for those downloads: a download ties the
+  software to whatever network and account fetched it. If that
+  association matters to you, fetch over Tor (Tor Browser is fine for
+  this) or from a device and account you don't mind being linked to
+  the software you run — the same applies to the app releases in §4.
 
 **Photos and location data — read this before uploading anything:**
 the location-metadata scrubbing in the product description belongs to

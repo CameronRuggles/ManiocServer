@@ -18,8 +18,8 @@ Order of operations is the safety story:
   HERE, before anything on the system has been touched),
   3. verify the decrypted payload against its manifest (sha256 of
   every file; the onion address recomputed from the restored
-  public key must match the manifest, the metadata and the
-  bundled hostname), 4. only then swap content, published trees
+  public key must match the manifest and the bundled hostname),
+  4. only then swap content, published trees
   and the onion identity into place (each a rename swap, so a
   failure leaves either the old or the new state, never a mix).
 
@@ -47,9 +47,12 @@ currently set up as an app site deselects the app slot again (the
 app data itself is left on disk, untouched); an app backup does
 the reverse.
 
-Backup formats: 1 (slice 5B, static only) and 2 (slice 6B) are
-both accepted; the install steps branch on the manifest's
-siteKind, which format 1 does not carry (absent = static).
+Backup formats: 1 (slice 5B, static only), 2 (slice 6B) and 3
+(deanonymization audit R-04: the plaintext outer metadata no
+longer carries the onion address or creation time - both are
+read from the encrypted manifest instead) are all accepted;
+the install steps branch on the manifest's siteKind, which
+format 1 does not carry (absent = static).
 
 Every outcome is appended to /var/lib/onionhost/maintenance-log.txt
 and sent to the journal (WALKTHROUGH C4: Maintenance use is
@@ -101,6 +104,32 @@ ALLOWED_PREFIXES = ("content/", "site/", "onion/", "system/",
                     "app/")
 
 
+def _cap_log(path):
+    """Bound the maintenance log this shares with
+    onionhost-maintenance (deanonymization audit R-24): past
+    1 MiB the file is rewritten to its newest 256 KiB (from a
+    line boundary) behind a rotation note, so a seized running
+    box does not hand over a complete dated history of every
+    session. Best effort, like the append it bounds."""
+    try:
+        if os.path.getsize(path) <= (1 << 20):
+            return
+        with open(path, "rb") as f:
+            f.seek(-(1 << 18), os.SEEK_END)
+            tail = f.read()
+        nl = tail.find(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        note = ("%s restore: log rotated - older entries "
+                "discarded by the size cap\n"
+                % datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")).encode()
+        with open(path, "wb") as f:
+            f.write(note + tail)
+    except OSError:
+        pass
+
+
 def _log_event(text):
     line = "%s restore: %s\n" % (
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -110,6 +139,7 @@ def _log_event(text):
             f.write(line)
     except OSError:
         pass
+    _cap_log(MAINT_LOG)
     subprocess.run(["logger", "-t", "onionhost-restore", text],
                    capture_output=True)
 
@@ -297,7 +327,7 @@ def _read_wrapper(path):
         raise RestoreError(
             "This file could not be read as an OnionHost backup. "
             "Nothing was changed.", 4)
-    if meta.get("format") not in (1, 2) or \
+    if meta.get("format") not in (1, 2, 3) or \
             meta.get("kind") != "onionhost-backup":
         raise RestoreError(
             "This backup was made by a different version and "
@@ -390,7 +420,7 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup has no readable checklist inside. Nothing "
             "was changed.", 4)
-    if manifest.get("format") not in (1, 2):
+    if manifest.get("format") not in (1, 2, 3):
         raise RestoreError(
             "This backup's checklist is from a different version. "
             "Nothing was changed.", 4)
@@ -427,9 +457,12 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup contains files that are not on its "
             "checklist. Nothing was changed.", 4)
-    # The onion identity must agree four ways: metadata, manifest,
+    # The onion identity must agree three ways: the manifest,
     # the bundled hostname file, and the address recomputed from
-    # the bundled public key.
+    # the bundled public key. (An earlier comment said four,
+    # counting the outer metadata's copy - the code never
+    # compared it, and format 3's metadata no longer carries the
+    # address at all, R-04.)
     pub_path = os.path.join(stage, "onion/hs_ed25519_public_key")
     with open(pub_path, "rb") as f:
         pubdata = f.read()
@@ -865,6 +898,7 @@ def main():
             stage = os.path.join(work, "stage")
             os.makedirs(stage)
             manifest = _verify(payload, stage)
+            restored_onion = manifest.get("onion", "")
             _say("The backup opened and checks out: \"%s\" "
                  "(%s)." % (manifest.get("siteTitle", ""),
                             manifest.get("onion", "")))
@@ -891,7 +925,10 @@ def main():
         if mountpoint:
             subprocess.run(["umount", mountpoint],
                            capture_output=True)
-    onion = meta.get("onion", "")
+    # The address for the report comes from the verified manifest
+    # (format 3's outer metadata does not carry it, R-04); older
+    # formats' metadata is the fallback.
+    onion = restored_onion or meta.get("onion", "")
     _log_event("backup restored: %s from file %s (user %s)"
                % (onion, os.path.basename(path), user))
     _say("")

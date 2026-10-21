@@ -8,7 +8,13 @@ Description=OnionHost update schedule (DESIGN-v3 A6/Y7)
 # count the fleet by the hour.
 OnCalendar=*-*-* 00:00:00 UTC
 RandomizedDelaySec=24h
-Persistent=true
+# Deliberately NOT Persistent (deanonymization audit R-13): a
+# persistent timer fires a missed run the moment the machine
+# powers on, so a box that was off through its window would
+# poll the mirror at power-on - exactly the moment an observer
+# of the household can already see. A missed window simply
+# waits for the next one; update freshness is not worth a
+# power-on-timed signal.
 Unit=onionhost-update.service
 
 [Install]

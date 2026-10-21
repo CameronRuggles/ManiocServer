@@ -26,6 +26,13 @@ http {
     # versionless). The FPM pool also sets expose_php = 0.
     more_clear_headers 'X-Powered-By';
     more_clear_headers 'Server';
+    # Deanonymization audit R-20: see the native (unix-socket)
+    # template - Last-Modified cleared on the app tier, and
+    # nginx-generated errors get a generic body (the stock 502
+    # names the stack when the app is down but nginx is up).
+    # The app's own responses pass through untouched.
+    more_clear_headers 'Last-Modified';
+    error_page 500 502 503 504 @onionhost_error;
     client_max_body_size 32m;
     client_body_temp_path /tmp/client_body;
     proxy_temp_path /tmp/proxy;
@@ -49,6 +56,12 @@ http {
             proxy_set_header X-Forwarded-For 127.0.0.1;
             proxy_set_header X-Real-IP 127.0.0.1;
             proxy_read_timeout 120s;
+        }
+
+        # Generic error body (R-20).
+        location @onionhost_error {
+            default_type text/plain;
+            return 503 "This site is not available right now.\n";
         }
 
         # Recipe seam (A23): see the PHP template - an optional

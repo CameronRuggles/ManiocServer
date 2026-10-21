@@ -39,14 +39,19 @@ Trust / anti-rollback rules (A6, DQ4, Y8):
     stack unhealthy. Only the budget changed: an update that
     still does not answer after it rolls back / fails closed
     exactly as before.
-  * The judgement is additionally preceded by a SETTLE drawn
-    per judgement from HEALTH_SETTLE_MIN..MAX (default 30 min
-    to 6 h) between the stack restart and the first probe run
-    (Repo Review 5 D-1): the probe's rendezvous to this box's
-    own onion is decoupled from the package fetch that began
-    the run, instead of following it within minutes. The probe
-    itself is executed argv-form, never through a shell
-    (Repo Review 5 F-P1-1).
+  * A SETTLE drawn from HEALTH_SETTLE_MIN..MAX (default
+    30 min to 6 h) decouples what an observer of the box's Tor
+    presence could time against the package fetch (Repo
+    Review 5 D-1; placement corrected by the deanonymization
+    audit, R-13): on the install path the settle now sits
+    BEFORE the stack restart, so the republication itself -
+    not just the local probe - lands at a drawn time unrelated
+    to the fetch. The rollback and fail-closed-recovery
+    restarts cannot wait out a settle (a judged-bad stack must
+    not keep serving; a down site's return is the recovery
+    duty), so their judgements keep the settle between the
+    restart and the first probe. The probe itself is executed
+    argv-form, never through a shell (Repo Review 5 F-P1-1).
   * A later good update (at/above the floor) recovers the machine
     from fail-closed automatically on the next run.
   * The fail-closed state is persisted in a dedicated marker file
@@ -162,20 +167,22 @@ HEALTH_ATTEMPTS = int(os.environ.get("ONIONHOST_HEALTH_ATTEMPTS",
                                      "2"))
 HEALTH_RETRY_DELAY = int(os.environ.get(
     "ONIONHOST_HEALTH_RETRY_DELAY", "45"))
-# Post-restart settle (Repo Review 5 D-1): the wait between a
-# stack restart and the health judgement, drawn fresh per
-# judgement from [SETTLE_MIN, SETTLE_MAX]. It decouples the
-# self-probe from the update run that fetched the packages:
-# without it, every update is followed within minutes by a
-# client rendezvous to this box's own onion, and an observer
-# who could see both the mirror fetch and the onion's
-# introduction activity could correlate them. The verdict the
-# probe drives is unchanged - a failed probe still rolls back
-# or fails closed exactly as before; it is simply reached at a
-# scattered time. The restarted stack serves (or, for a broken
-# update, fails to serve) during the settle, just as it already
-# did during the republication budget. Env-tunable for the
-# state-machine tests.
+# Settle (Repo Review 5 D-1; placement corrected by the
+# deanonymization audit, R-13): a wait drawn fresh per use from
+# [SETTLE_MIN, SETTLE_MAX]. It decouples the Tor-visible events
+# of an update run from the package fetch that began it:
+# without it, the republication that follows an install, and
+# the self-probe's rendezvous to this box's own onion, follow
+# the mirror fetch within minutes, and an observer who could
+# see both could correlate them. On the install path the
+# settle sits between the install and the restart, so the
+# republication itself is what lands at the scattered time;
+# rollback and recovery judgements keep it between their
+# restart and the probe, because those restarts cannot wait
+# (see health_ok_after_restart). The verdict the probe drives
+# is unchanged - a failed probe still rolls back or fails
+# closed exactly as before; it is simply reached at a scattered
+# time. Env-tunable for the state-machine tests.
 HEALTH_SETTLE_MIN = int(os.environ.get(
     "ONIONHOST_HEALTH_SETTLE_MIN", "1800"))
 HEALTH_SETTLE_MAX = int(os.environ.get(
@@ -188,6 +195,37 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+LOG_MAX_BYTES = 1 << 20         # 1 MiB writer-side cap (R-24)
+LOG_KEEP_BYTES = 1 << 18        # newest 256 KiB survive a rotation
+
+
+def _cap_log(path):
+    """Bound the update log (deanonymization audit R-24): left
+    alone it grows one timestamped line-set per run, forever -
+    a seized running box would hand over a complete dated
+    history of every update, recovery and failure. When the
+    file passes the cap it is rewritten to its newest slice
+    (from a line boundary) behind a rotation note, so the
+    recent operational record survives and the long tail does
+    not. Best effort, exactly like the append it bounds."""
+    try:
+        if os.path.getsize(path) <= LOG_MAX_BYTES:
+            return
+        with open(path, "rb") as f:
+            f.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+            tail = f.read()
+        nl = tail.find(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        note = ("%s onionhost-update: log rotated - older "
+                "entries discarded by the size cap\n"
+                % now()).encode()
+        with open(path, "wb") as f:
+            f.write(note + tail)
+    except OSError:
+        pass
+
+
 def log(msg):
     line = "%s onionhost-update: %s" % (now(), msg)
     print(line, flush=True)
@@ -196,6 +234,7 @@ def log(msg):
             f.write(line + "\n")
     except OSError:
         pass
+    _cap_log(LOG_PATH)
 
 
 # Golden files are never hand-edited on a healthy machine; force
@@ -436,7 +475,7 @@ def health_ok():
 
 
 def _settle_seconds():
-    """Draw this judgement's post-restart settle (D-1)."""
+    """Draw a settle from the D-1 window (per call)."""
     lo = HEALTH_SETTLE_MIN
     hi = max(HEALTH_SETTLE_MAX, lo)
     if hi <= 0:
@@ -444,23 +483,37 @@ def _settle_seconds():
     return random.SystemRandom().uniform(lo, hi)
 
 
+def _sleep_settle(context):
+    """Sleep one drawn settle, logged under the caller's label.
+
+    The settle is the D-1 decoupling: something an observer of
+    this box's Tor presence could time against the package fetch
+    is made to happen at a drawn, scattered time instead of
+    within minutes of the fetch that started the run."""
+    settle = _settle_seconds()
+    if settle > 0:
+        log("health: waiting %ds (%s - decoupled from this "
+            "update run)" % (int(settle), context))
+        time.sleep(settle)
+    return settle
+
+
 def health_ok_after_restart():
     """health_ok() with the D-1 settle in front of it.
 
-    Every health judgement in main() follows a stack restart
-    this run performed (install, rollback, or fail-closed
-    recovery). The settle is the decoupling: the probe's
-    rendezvous to this box's own onion happens at a drawn,
-    scattered time instead of within minutes of the package
-    fetch that started the run. The judgement itself - and
-    every rollback / fail-closed consequence hanging off it -
-    is health_ok() unchanged."""
-    settle = _settle_seconds()
-    if settle > 0:
-        log("health: waiting %ds before judging (post-restart "
-            "settle, drawn per judgement - the self-probe is "
-            "decoupled from this update run)" % int(settle))
-        time.sleep(settle)
+    Used by the restart paths where the restart itself cannot
+    wait out a settle: the rollback (a stack judged unhealthy
+    must not keep SERVING while a 30-minute-to-6-hour delay
+    runs - Y8) and fail-closed recovery (the site is off; its
+    return is the duty, and in the common recovery no package
+    fetch precedes that restart in the same run beyond the
+    index refresh). The INSTALL path is different: there the
+    restart is what republishes the onion, so the settle sits
+    BEFORE it and the judgement is plain health_ok() - see
+    main() (deanonymization audit R-13). The judgement itself -
+    and every rollback / fail-closed consequence hanging off
+    it - is health_ok() unchanged."""
+    _sleep_settle("post-restart settle, drawn per judgement")
     return health_ok()
 
 
@@ -781,8 +834,29 @@ def main():
                     % (pkg, prev_version, e))
         log("installing %s %s -> %s" % (pkg, inst, cand))
         rc = run(["apt-get", "install", "-y"] + DPKG_OPTS + [pkg], timeout=1800)
-        stackctl("restart")
-        healthy = (rc == 0) and health_ok_after_restart()
+        if rc == 0:
+            # R-13: the settle belongs BEFORE this restart. The
+            # restart is what republishes the onion - if it
+            # follows the package fetch within seconds, the new
+            # descriptors land on the network in the fetch's own
+            # time slot, and a settle placed between restart and
+            # probe only delays the local judgement, decoupling
+            # nothing an observer can see. Sleeping first, with
+            # the new version already installed, makes the
+            # republication itself land at a drawn time. The
+            # judgement then runs plain health_ok(): its probe
+            # budget is sized for republication tails, and a
+            # second settle would only double the delay.
+            _sleep_settle("pre-restart settle, drawn per install")
+            stackctl("restart")
+            healthy = health_ok()
+        else:
+            # Install failed: restart (the stack may be
+            # half-configured) and judge unhealthy without a
+            # probe - exactly the pre-R-13 behaviour, which the
+            # short-circuited expression did anyway.
+            stackctl("restart")
+            healthy = False
         if healthy:
             highwater[pkg] = cand
             save_json(hw_path, highwater)

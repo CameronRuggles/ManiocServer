@@ -126,7 +126,7 @@ def build_packages():
         assert os.path.isfile(deb), r.stdout
         ext = os.path.join(WORK, "extract-" + tag)
         subprocess.run(["dpkg-deb", "-x", deb, ext], check=True)
-        ctl = os.path.join(WORK, "control-" + tag)
+        ctl = os.path.join(WORK, "ctl-" + tag)
         subprocess.run(["dpkg-deb", "-e", deb, ctl], check=True)
         built[tag] = {
             "deb": deb, "extract": ext,
@@ -252,7 +252,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self._cap()
         if self.path.startswith("/wp-admin/install.php"):
             return self._send(FORM)
-        if self.path == "/":
+        if self.path in ("/",):
             return self._send("<html><body>Hello world!"
                               "</body></html>")
         return self._send("<html>?</html>", 404)

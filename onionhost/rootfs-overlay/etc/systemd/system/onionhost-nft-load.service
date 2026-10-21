@@ -1,7 +1,18 @@
 [Unit]
 Description=OnionHost - load golden nftables table
-After=local-fs.target
-Before=onionhost-nft-gate.service onionhost-a.service
+# The egress table exists before anything that could use the
+# network starts (deanonymization audit R-18): network-pre is
+# the standard pre-network ordering point, and the three early
+# network consumers are named explicitly so the table precedes
+# NetworkManager's first connection attempt, chrony's first
+# poll, and the display manager's session start. The golden
+# ruleset's own default-deny output policy is the containment
+# even in any residual window; this ordering closes the window
+# itself rather than relying on the policy to cover it. The
+# rig's boot pcap (ISO-BUILD-LOG rig list) is the proof.
+After=local-fs.target network-pre.target
+Wants=network-pre.target
+Before=onionhost-nft-gate.service onionhost-a.service NetworkManager.service chrony.service lightdm.service
 
 [Service]
 Type=oneshot

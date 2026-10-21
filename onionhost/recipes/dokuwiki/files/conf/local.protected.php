@@ -15,10 +15,22 @@
  * is faster, quieter, and honest.
  */
 
-// No phoning home about new releases. DokuWiki updates arrive
-// only through the platform's signed channel (the recipe
-// packages), like every other packaged app's.
+// No phoning home about new releases. The platform installed
+// DokuWiki once; updates after that are the owner's, by file
+// replacement (A26) - there is no platform update channel for
+// an installed app, here or anywhere else.
 $conf['updatecheck'] = 0;
+
+// Feed aggregation ({{rss>}} syntax) stays available, as an
+// editor-trust decision (deanonymization audit R-26): the
+// syntax is a core parser mode with no supported off-switch,
+// and the wiki has no network of its own, so a feed embed
+// fetches nothing today - it can only start fetching if a
+// future platform change gives the app network access, at
+// which point this decision is revisited. Until then the
+// residual trust is the one DokuWiki already runs on:
+// embedding a feed takes an account with edit rights - the
+// same trust as writing any other page content.
 
 // fetch.php never downloads remote media server-side: a page
 // that references an image by URL shows the visitor's browser

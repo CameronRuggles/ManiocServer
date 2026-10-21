@@ -32,6 +32,22 @@ http {
     # versionless). The FPM pool also sets expose_php = 0.
     more_clear_headers 'X-Powered-By';
     more_clear_headers 'Server';
+    # Deanonymization audit R-20: static files on the app tier
+    # carry real file mtimes (app installs are timestamped;
+    # Last-Modified would publish install/edit timing to every
+    # visitor, and ETag is derived from the same mtime+inode).
+    # Clear the header and switch ETag off; conditional requests
+    # simply get full answers. (The app itself may still set
+    # its own caching headers in PHP - that is the app's voice,
+    # not the filesystem's.)
+    more_clear_headers 'Last-Modified';
+    etag off;
+    # Generic error bodies (R-20): the stock nginx error page
+    # names the stack (e.g. the 502 body when the app is down
+    # but nginx is up). Only nginx-generated errors land here;
+    # the app's own error pages are untouched.
+    error_page 404 @onionhost_notfound;
+    error_page 500 502 503 504 @onionhost_error;
     sendfile on;
     # Forum-class apps accept uploads; the app data volume's quota is
     # the real bound, this just keeps single requests sane.
@@ -64,6 +80,17 @@ http {
         # lives in the docroot - it is mounted at /etc/onionhost/.)
         location ~* /\.(onionhost|env|git) {
             deny all;
+        }
+
+        # Generic error bodies (R-20): one plain sentence each,
+        # no server name, no version, no path detail.
+        location @onionhost_notfound {
+            default_type text/plain;
+            return 404 "Not found.\n";
+        }
+        location @onionhost_error {
+            default_type text/plain;
+            return 503 "This site is not available right now.\n";
         }
 
         # Recipe seam (A23): a future project-packaged app recipe

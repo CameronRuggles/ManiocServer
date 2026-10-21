@@ -31,6 +31,34 @@ UPDATE __PREFIX__settings SET value = '0' WHERE variable = 'gravatarEnabled';
 -- shown here regardless.)
 DELETE FROM __PREFIX__admin_info_files;
 
+-- Package servers (deanonymization audit R-26): SMF's install
+-- SQL seeds two package-server rows pointing at
+-- simplemachines.org, whose browse/download calls carry the
+-- forum's exact version in the URL - a version-stamped
+-- phone-home the moment an administrator opens the package
+-- manager's browse screens. Remove the seeded servers: the
+-- Package Manager's other door, uploading a package file, is
+-- the sealed room's update path anyway (Owner Guide section
+-- 3), and it needs no server list. (The language-pack download
+-- screen's endpoint is hardcoded in SMF's own code rather
+-- than seeded, so it cannot be unseeded; the attempt dies
+-- at the container wall (nft drops it).)
+DELETE FROM __PREFIX__package_servers;
+
+-- jQuery source (deanonymization audit R-02): with the setting
+-- unset, Sources/Load.php falls back to loading jQuery from
+-- Google's CDN into EVERY VISITOR's browser - the page tells a
+-- third party who read the site and when, and breaks outright
+-- for Tor Browser users at safer security levels. 'local' makes
+-- SMF serve the copy it already ships in its own theme scripts
+-- directory (jquery-2.1.4.min.js), which is what the setting's
+-- local branch loads. INSERT (not UPDATE) because the row's
+-- presence in a fresh install's settings table is not
+-- guaranteed; the duplicate-key form covers both shapes.
+INSERT INTO __PREFIX__settings (variable, value)
+	VALUES ('jquery_source', 'local')
+	ON DUPLICATE KEY UPDATE value = VALUES(value);
+
 -- The forum administrator, created with the account details the
 -- owner chose at setup time. Column set mirrors SMF's own
 -- installer exactly. The password is stored in SMF's legacy
