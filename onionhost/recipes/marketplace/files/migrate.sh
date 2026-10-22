@@ -22,6 +22,19 @@ DATA=/srv/appdata/native
 
 log() { echo "marketplace migrate: $*"; }
 
+# Per-install provisioning runs first (provision-secrets.sh,
+# shipped beside this step): the application's key file and
+# HT id file must exist before ANY start - the application
+# refuses to mint them outside its Development profile. The
+# step mints each file once and never touches an existing
+# one. A failure here fails this step, so the application is
+# not started against an unprovisioned instance.
+if ! sh "$DATA/provision-secrets.sh"; then
+    log "ERROR: per-install provisioning failed - the" \
+        "application will not be started"
+    exit 1
+fi
+
 if [ -z "${DATABASE_URL:-}" ]; then
     log "ERROR: DATABASE_URL is not set - the database leg" \
         "did not run, so there is nothing to migrate against"

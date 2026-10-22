@@ -4,25 +4,33 @@
 # after an apply; format:
 #   <octal mode> <path relative to the app-data volume>
 # marketplace.key is the instance's master key (it keys buyer
-# tokens and encrypts stored secrets): the application
-# creates it at mode 0600 and it must stay that way - the
-# uniform pass would leave it group-readable at 0664. The
+# tokens and encrypts stored secrets): the recipe's
+# provisioning step creates it at mode 0600 and it must stay
+# that way - the uniform pass would leave it group-readable
+# at 0664. marketplace.htid is the instance's Hidden Trades
+# id: public by design (the seller page prints it), but its
+# integrity is load-bearing - a replaced id orphans every
+# pinned terms statement - and it is likewise provisioned at
+# 0600. The
 # first-boot env copy holds the administrator password in
 # plaintext for the one boot it exists in; it is shredded by
 # the first-boot step itself, and pinned restrictive here
 # for the hours it may wait for a publish retry.
 0600 native/marketplace.key
+0600 native/marketplace.htid
 0400 native/.recipe-admin.env
 # The recipe's own executables. The uniform pass flattens
 # every file to 0664; the golden init re-chmods only the
 # archive binary (native/app) before exec, because it is the
 # one binary the platform contract knows about. The
 # media-worker is exec'd directly by the application (no
-# shell), and first-boot.sh / migrate.sh are declared 0755
-# in the manifest - all three keep their mode here. (Found
+# shell), and first-boot.sh / migrate.sh /
+# provision-secrets.sh are declared 0755 in the manifest -
+# all four keep their mode here. (Found
 # in the recipe's sandbox venue: without the media-worker
 # pin, image uploads failed with "Media worker error"
 # because the worker binary had lost its exec bit.)
 0755 native/media-worker
 0755 native/first-boot.sh
 0755 native/migrate.sh
+0755 native/provision-secrets.sh

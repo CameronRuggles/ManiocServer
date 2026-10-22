@@ -5,13 +5,13 @@
  "app": {
   "license": "AGPL-3.0-or-later",
   "name": "Polyculture Markets",
-  "source": "Cameron's Monero marketplace (spec v2, Stage 10 tree - the MVP-complete candidate frozen 2026-10-16), built from source for this recipe. Two binaries ship: marketplace-app (the server) and its media-worker helper, staged beside it. The application never migrates its own database: its migrations 0001-0009 ship in this recipe and are applied by the recipe's migrate step inside the app container, the same marker-ledger way the project's own deploy tooling applies them. Provenance: built from the public companion repository (https://github.com/CameronRuggles/polyculture-markets) at the pinned commit recorded in source_build below - the frozen Stage 10 tree (gate 487 passed / 0 failed); release build in the recipe venue; the .deb manifest carries the binary's sha256.",
+  "source": "Cameron's Monero marketplace (spec v2 - stages 0-10 MVP plus the October 2026 audit fix batches and Hidden Trades H1, merged to main as PR #1), built from source for this recipe. Two binaries ship: marketplace-app (the server) and its media-worker helper, staged beside it. The application never migrates its own database: its migrations 0001-0017 ship in this recipe and are applied by the recipe's migrate step inside the app container, the same marker-ledger way the project's own deploy tooling applies them. Provenance: built from the public companion repository (https://github.com/CameronRuggles/polyculture-markets) at the pinned commit recorded in source_build below; release build from a git archive of that commit in the recipe venue; the .deb manifest carries the binary's sha256. The recipe provisions the instance's per-install key and Hidden Trades id files (provision-secrets, run by the migrate step at every start): the application will not mint them outside its Development profile.",
   "version": "0.1.0"
  },
  "archive": {
   "file": "marketplace-app-0.1.0-linux-amd64",
   "format": "file",
-  "sha256": "f56191a01a07a1cf3acff5b9cc2c066fb8630438e58b5451139a4891dd0b0f25",
+  "sha256": "a9823cfa0fddbd13248fcce0ffeb9d0cdb7953610c7879613e4462347773b0e1",
   "url": "https://github.com/CameronRuggles/polyculture-markets"
  },
  "db": {
@@ -43,8 +43,14 @@
   {
    "dst": "migrate.sh",
    "mode": "0755",
-   "sha256": "57e77bde98ddd87c3c9daa660cbab3456c69303504df3c7aa20e35a672da3797",
+   "sha256": "51d3f838c1a67b8d705996b9cbc75f68623092f7f34e05f0610082516f8c2567",
    "src": "files/migrate.sh"
+  },
+  {
+   "dst": "provision-secrets.sh",
+   "mode": "0755",
+   "sha256": "ce3cb91d741d5ff709518b8d9cbe666bec2b2e662dec4366ab7c055cf2680249",
+   "src": "files/provision-secrets.sh"
   },
   {
    "dst": "migrations/0001_initial.sql",
@@ -99,6 +105,54 @@
    "mode": "0644",
    "sha256": "e965ea47d07513510f319b02af0f733e03f8c24e6a46d6bff83a9548999dbe5b",
    "src": "files/migrations/0009_stage9.sql"
+  },
+  {
+   "dst": "migrations/0010_payment_proofs.sql",
+   "mode": "0644",
+   "sha256": "c32aa24ad88c189272d1688e4e3f6a91b9acd918901bd35dc37a7a566cd01054",
+   "src": "files/migrations/0010_payment_proofs.sql"
+  },
+  {
+   "dst": "migrations/0011_account_security.sql",
+   "mode": "0644",
+   "sha256": "9d66b0e3e0d689f950ebcc9d98ca24e582eb66bf3f5151b634b8d8725f79e8ad",
+   "src": "files/migrations/0011_account_security.sql"
+  },
+  {
+   "dst": "migrations/0012_conversation_blocks.sql",
+   "mode": "0644",
+   "sha256": "f75428240e0cb95c42c2edc327169f2247f696b56d9c8dff78c0f8c7609ab1d7",
+   "src": "files/migrations/0012_conversation_blocks.sql"
+  },
+  {
+   "dst": "migrations/0013_media_disputes_audit.sql",
+   "mode": "0644",
+   "sha256": "dd02f7896b1cadb9729a64b2ca0658a9caae45528db6ae9797de2991d410ca10",
+   "src": "files/migrations/0013_media_disputes_audit.sql"
+  },
+  {
+   "dst": "migrations/0014_verification_fixes.sql",
+   "mode": "0644",
+   "sha256": "ef46c22d2aadd0713237250d15ff28638882691fa18086557ca233c6b5f46000",
+   "src": "files/migrations/0014_verification_fixes.sql"
+  },
+  {
+   "dst": "migrations/0015_disclosure_message_link.sql",
+   "mode": "0644",
+   "sha256": "0c58934bcaacb8e0314b82c10c37c6f18275c91a6fe0eec900b32bea98c1e475",
+   "src": "files/migrations/0015_disclosure_message_link.sql"
+  },
+  {
+   "dst": "migrations/0016_hidden_trades_terms.sql",
+   "mode": "0644",
+   "sha256": "74e6cb2b382873b873720507fd9c7ae6c8b89afd0937f042b0c9207bd319a2ba",
+   "src": "files/migrations/0016_hidden_trades_terms.sql"
+  },
+  {
+   "dst": "migrations/0017_ht_pause_unpinned_listings.sql",
+   "mode": "0644",
+   "sha256": "9cfd85f30a3acd3f6ec8b5549ec4e03112af8f36340a8a7f5a6fb702281816bb",
+   "src": "files/migrations/0017_ht_pause_unpinned_listings.sql"
   }
  ],
  "native_serve": {
@@ -108,8 +162,8 @@
  "runtime": "native",
  "source_build": {
   "build_command": "cd marketplace && cargo build --release --locked -p app -p media-worker",
-  "commit": "22a1eb587c4c587365b0816cb8a1db4e21b1e55f",
-  "commit_note": "The recipe was built 2026-10-17 from the frozen Stage 10 tree (MVP complete, frozen 2026-10-16) plus the 2026-10-17 fix batch, in a local workspace; that tree is recorded publicly as this commit (the companion repo's initial public commit, 'spec v2 MVP (stages 0-10) + Direct Payments v1 + 2026-10-17 fix batch'). Content match verified 2026-10-20: the nine shipped migrations are byte-identical to marketplace/migrations/ at this commit, and this commit's migration set is exactly 0001-0009 (0010+ arrived later). The two binaries are NOT byte-verifiable against the commit: Rust release builds are not byte-reproducible, so the archive.sha256 / native_files sha256 pins in this file are the record of what was built and shipped.",
+  "commit": "4d9db82f49e3e7beb5c7c24e2dbc78e1635151d2",
+  "commit_note": "The recipe was rebuilt 2026-10-22 (oh.3) from a git archive of this commit - PCM main at the merge of PR #1 (deployment-fix-batch: the October 2026 audit fix batches and the Hidden Trades H1 close-out) - taken from the local clone of the public repository; the PCM working tree was not modified or built in. Content match: the seventeen shipped migrations are byte-identical copies of marketplace/migrations/ at this commit, and this commit's migration set is exactly 0001-0017. The media-worker binary rebuilt byte-identical to the oh.1 build (sha256 90d33c5131ad8b561aaec67787c7aa5ad182a80bb7fd4e1536bbb496e49b75f8) - its source did not change between the two commits. The marketplace-app binary is NOT byte-verifiable against the commit: Rust release builds are not byte-reproducible, so the archive.sha256 / native_files sha256 pins in this file are the record of what was built and shipped. oh.4 (2026-10-22) ships this same binary build; its delta is recipe-side: per-install provisioning of the marketplace key file and the HT id file (provision-secrets, run by the migrate step), because the application at this commit refuses to start outside its Development profile when either is absent (audit fixes AL1 / HT F1) and the oh.1-era recipe provisioned neither.",
   "outputs": {
    "marketplace-app": "target/release/marketplace-app -> archive/marketplace-app-0.1.0-linux-amd64",
    "media-worker": "target/release/media-worker -> files/media-worker"
@@ -118,5 +172,5 @@
   "source_license": "AGPL-3.0-or-later - source for the shipped binaries is the repo above at the pinned commit",
   "toolchain": "Rust 1.99.0 (pinned by marketplace/rust-toolchain.toml at the commit above)"
  },
- "version": "0.1.0+oh.1"
+ "version": "0.1.0+oh.4"
 }
