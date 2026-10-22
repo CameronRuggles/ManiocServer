@@ -1,4 +1,4 @@
-# [Product name TBD — working title “OnionHost OS”]
+# Manioc Server
 ## What this is, how it works, and what it does not do
 ### Public explainer — DRAFT v0, 2026-10-11. Written for people exploring the project: curious users, reviewers, and future contributors. The full design record (design documents, external reviews, proof-of-concept results, build logs) lives in this repository alongside it.
 
@@ -12,7 +12,7 @@ You boot the installer USB, click through a short walkthrough, copy down one gen
 
 It is built for non-technical owners. The whole user-facing model is four ideas: a paper phrase, short login words, a status dashboard, and a repair path. Everything else is the machine's problem.
 
-**Version 1 hosts static sites only** — simple pages and a journal (a static site generator with a local editor; no comments, no database, no visitor logins). Dynamic sites (forums, PHP, databases) are a declared future goal with their own design pass, not a hidden v1 feature.
+**Version 1 hosts the Pages and Journal tiers, plus a dynamic app slot** — simple pages and a journal (a static site generator with a local editor; no comments, no database, no visitor logins), and one app slot where a signed recipe installs a packaged dynamic app — a forum, WordPress, a wiki, or Gitea. The platform installs the app once; from then on it is the owner's to run and maintain.
 
 ## 2. The one claim we make — and the ones we don't
 
