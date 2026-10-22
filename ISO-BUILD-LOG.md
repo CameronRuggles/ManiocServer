@@ -1,5 +1,88 @@
 # OnionHost OS — Skeleton ISO Build Log (ISO-BUILD-PLAN steps 1–2)
 
+## Index (added 2026-10-22)
+
+Section line numbers are for this file as it now stands, index
+included. Covers the log’s top-level (#) and second-level (##)
+sections; third-level (###) subsections are not listed.
+
+- L84 — OnionHost OS — Skeleton ISO Build Log (ISO-BUILD-PLAN steps 1–2)
+- L86 — Standing conventions for this log (adopted 2026-10-20, Repo Review 4)
+- L99 — Run date: 2026-10-11 · Host: Stage 1 rig (GCP onion-rig-1, nested KVM) · Working title paths only
+- L100 — Scope of this tranche: pipeline + bootable/installable skeleton. No wizard logic beyond stubs (none needed yet).
+- L104 — Final artifact
+- L114 — Pipeline (as built)
+- L117 — Test results (QEMU/KVM on the rig, OVMF Secure-Boot-capable firmware image, virtio disk 24 GiB)
+- L131 — Failures hit and fixed (in order)
+- L138 — Process/integrity notes
+- L144 — Exact next blockers for step 3 (onionhost package)
+- L152 — STEP 3, SLICE 1 (2026-10-12) — boot unblocked; onionhost package skeleton live end-to-end
+- L166 — TASK 1 — Boot past GRUB: SOLVED via encrypted /boot + PBKDF2 phrase slot (A19.1)
+- L279 — TASK 2 — Scaffolding strip: VERIFIED
+- L334 — TASK 3 — onionhost package skeleton: RUNS END-TO-END
+- L429 — Entropy-source gate (A19.1) — RECORDED, not implemented this slice
+- L438 — Rig / process notes for this slice
+- L461 — Blockers / next for the wizard tranche
+- L483 — STEP 3, SLICE 2 — the wizard tranche (2026-10-12)
+- L494 — Task 1 — GRUB passphrase retry loop: PASS
+- L511 — Task 2 — Generated-phrase installer module: PASS
+- L556 — Task 3 — Spare phrase step: PASS
+- L569 — Task 4 — First-boot wizard S0->S1->S2: PASS
+- L600 — Task 5 — onionhost-rekey: PASS
+- L620 — Process notes / deviations
+- L923 — FIELD REPORT — Cameron's phone-driven install, 2026-10-12
+- L942 — STEP 3, SLICE 4 — content tiers (Simple Pages + Journal) (2026-10-12)
+- L1153 — STEP 3, SLICE 5A — installer + editor fixes from Cameron's hands-on session (2026-10-12)
+- L1349 — STEP 3, SLICE 5B — backup / restore (2026-10-12/13)
+- L1499 — PROD REBUILD 2 + DOWNLOAD (2026-10-12)
+- L1662 — STEP 3, SLICE 6B — DYNAMIC PLUMBING (implementation; rig battery deferred)
+- L1862 — GATE 4 — UPDATE PIPELINE (implementation; rig/ISO battery deferred)
+- L2102 — A23 RECIPE 1 — SMF (implementation; rig/ISO battery deferred)
+- L2531 — GATE 4 FOLLOW-UP — fail-closed stickiness (2026-10-13)
+- L2619 — A23 RECIPE 2 — WORDPRESS (implementation; rig/ISO battery deferred)
+- L2899 — A23 RECIPES 3+4 — DOKUWIKI + GITEA (implementation; rig/ISO battery deferred)
+- L3283 — RIG BATTERY — DYNAMIC TIER + RECIPES (2026-10-14)
+- L3303 — Pre-battery integration work (workspace tree)
+- L3323 — PART 1 — ISO REBUILD
+- L3348 — PART 6 (pulled forward) — SMF OFFICIAL CHECKSUM ATTEMPT
+- L3356 — PART 2 — INSTALL + FORUM (first attempt on build #2: DEFECT FOUND)
+- L3412 — PART 6 — MUSL-STATIC RUST REFERENCE BUILD (checkbox)
+- L3420 — PART 1 (continued) — BUILD #3 WITH THE MODE FIX
+- L3451 — PART 2 — INSTALL + FORUM (build #3 ISO)
+- L3756 — PRODUCT FIX SLICE — D1–D6 + ENVELOPE (2026-10-14)
+- L3964 — RIG MINI RE-VERIFICATION + PUBLISH (2026-10-14)
+- L3974 — PART 1 — ISO REBUILD: PASS
+- L4163 — D7 FIX (2026-10-14)
+- L4305 — RIG PART-3 RE-RUN + PUBLISH (2026-10-14)
+- L4322 — PART A — ISO REBUILD WITH THE D7 FIX: PASS
+- L4356 — Part B — fresh Gitea install, zero guest workarounds: FAIL (NEW DEFECT D8)
+- L4405 — NEW DEFECT D8 (D7-residual) — native root unwritable through the production engine
+- L4438 — Part C — WordPress: NOT ATTEMPTED
+- L4443 — Part D — publish: WITHHELD
+- L4451 — Part E — teardown + poweroff
+- L4465 — D8 INVESTIGATION + FIX (2026-10-14)
+- L4475 — The mechanism, as measured (supersedes the Part-3 attribution)
+- L4542 — Truth table (venue; requester rows: root = container root)
+- L4579 — The fix
+- L4642 — Proofs (poc/d8-fix/proof/, phases run 2026-10-14)
+- L4701 — Rig-deferred (NOT proven by this slice)
+- L4730 — MARKETPLACE RECIPE — A23 RECIPE 5 (2026-10-17)
+- L4743 — What the recipe needed that no earlier recipe did
+- L4816 — Defects found (platform + recipe), all fixed in the tree
+- L4865 — A defect in the marketplace itself (tree untouched; reported)
+- L4884 — Proofs (sandbox venue; poc/recipes-marketplace/)
+- L4966 — Rig-deferred (NOT proven by this slice)
+- L4982 — PUBLIC REBRAND APPLIED — MANIOC SERVER / POLYCULTURE MARKETS (2026-10-17)
+- L5057 — REPO REVIEW 2 FIX BATCH (2026-10-20)
+- L5696 — REPO REVIEW 3 FIX BATCH (2026-10-20)
+- L6072 — REPO REVIEW 4 FIX BATCH (2026-10-20)
+- L6427 — SPARE FEATURE REMOVED — S13 CLOSED BY REMOVAL (2026-10-20)
+- L6613 — REPO REVIEW 5 FIX BATCH (2026-10-20)
+- L6801 — PUBLIC TREE CHANGE (2026-10-20) — GCP APPEAL DRAFT REMOVED
+- L6815 — RECIPES ARE INSTALLERS — A26 (2026-10-21)
+- L7011 — DEANON AUDIT FIX BATCH (2026-10-21)
+
+
 ## Standing conventions for this log (adopted 2026-10-20, Repo Review 4)
 - **Write-time phrase rule:** this log never records a generated
   passphrase (disk, spare, or login) at write time. Where an
