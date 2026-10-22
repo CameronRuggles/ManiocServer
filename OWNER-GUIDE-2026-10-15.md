@@ -14,7 +14,11 @@ in LOCAL-MODS-UPDATE-POLICY-BRIEF-2026-10-15.md.
 ## 1. How updates work — you don't run them
 
 Everything on the box updates through one signed channel, over Tor, on a
-randomized daily schedule. The box never reaches out on the clearnet.
+randomized daily schedule. Updates themselves always travel over Tor.
+The box still touches the clearnet in two narrow ways: it keeps its
+clock honest with time (NTS) connections, and it connects to the Tor
+network over the clearnet — unless bridges are turned on, which is what
+hides that second one.
 
 - **The system itself** (Debian, kernel, Podman, MariaDB, PHP, Tor)
   upgrades from Debian's own archive over Tor, on the same run. Proven on
