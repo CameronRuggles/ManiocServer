@@ -77,7 +77,8 @@ background update. That ships as a guided project migration.
    drive; making a backup needs no phrase. Restoring onto a new machine
    brings back the *same* .onion address — but the restore asks for the
    original disk phrase, so phrase + a backup stored somewhere sensible
-   is your disaster kit.
+   is your disaster kit. One heads-up: if your app keeps its data in a
+   SQLite database, a backup briefly pauses the site while it runs.
 5. **Glance at the Dashboard occasionally.** Green means live. In the
    rare fail-closed case there is a Repair path in Maintenance mode, and
    the forgotten-login-words fix lives there too — the disk phrase
