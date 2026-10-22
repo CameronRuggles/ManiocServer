@@ -1,0 +1,13 @@
+[Unit]
+Description=OnionHost - loopback-only network namespace for the app container
+After=local-fs.target
+Before=onionhost-app.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onionhost-loopback-netns start
+ExecStop=/usr/local/bin/onionhost-loopback-netns stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

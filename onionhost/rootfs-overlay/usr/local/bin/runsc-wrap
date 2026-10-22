@@ -31,12 +31,40 @@ run"; DESIGN-v3-amendments A18):
     runsc's own default applies; production Quadlets always carry
     the bridge netns entry.)
   * For website-class bundles (the nginx container B and the
-    combined app container) it strips the netns entry if one ever
-    appears and passes --network=none: the website gets a private
-    loopback-only gVisor netns. It must never have a route anywhere.
+    combined app container) it passes --network=none with any
+    netns entry stripped: the website gets a private gVisor
+    netns with no route anywhere. ONE exception, added 2026-10-22
+    after a real-install defect (below): a website bundle whose
+    netns entry names the platform loopback namespace EXACTLY
+    (/run/netns/onionhost-loopback, created by
+    onionhost-loopback.service) keeps its entry and gets NO
+    --network flag, so runsc mirrors that namespace into the
+    sandbox netstack. The namespace's only interface is lo,
+    raised, so the mirror gives the sandbox a working loopback
+    and nothing else - no external interface exists to mirror.
+    Any OTHER netns entry in a website bundle is still stripped.
     Unrecognised bundles get the same strip and --network=none
     (Repo Review 5 B-2): no network is the only safe default for
     a bundle this wrapper cannot classify.
+
+    Why the exception exists (measured on the rig, 2026-10-22,
+    production runtime path, runsc release-20251006.0): the
+    --network=none netstack contains NO interfaces at all - not
+    even a loopback device (/proc/net/dev empty inside the
+    sandbox; SIOCGIFFLAGS on "lo" answers ENODEV). Every
+    TCP-loopback consumer the platform itself specifies then
+    dies at bind time with EADDRNOTAVAIL: PostgreSQL's
+    listen_addresses = '127.0.0.1' (the marketplace recipe's
+    first boot), start_pg's psql -h 127.0.0.1, the assembled
+    DATABASE_URL, a native_serve app's BIND_ADDR. The MariaDB
+    recipes never noticed (unix sockets only), and neither did
+    the recipe harness (the host's loopback is normal). The
+    loopback cannot be created or raised from inside the
+    sandbox, so the namespace has to be prepared on the host;
+    mirroring a loopback-only namespace is the smallest shape
+    that keeps the isolation absolute (no external interface,
+    no route, no new egress) while making the platform's own
+    loopback contract true.
 
 Host-UDS modes (Repo Review 2 task 21 / finding S3; U narrowed
 by the 2026-10-21 deanonymization audit, register R-01):
@@ -85,6 +113,12 @@ import os
 import sys
 
 REAL_RUNSC = "/usr/local/bin/runsc"
+
+# The platform loopback namespace (onionhost-loopback.service):
+# the ONLY netns a website-class bundle may keep. The match is
+# the exact path - a website bundle naming any other namespace
+# is stripped and forced to --network=none as before.
+LOOPBACK_NETNS = "/run/netns/onionhost-loopback"
 
 # The verbs that CREATE a sandbox. Only these must present a
 # bundle: the containment decision (network + UDS mode) is made at
@@ -159,6 +193,11 @@ def main():
     prog = os.path.basename(cmd[0]) if cmd else ""
     ns = cfg.get("linux", {}).get("namespaces", [])
     has_netns = any(n.get("type") == "network" for n in ns)
+    netns_path = None
+    for n in ns:
+        if n.get("type") == "network":
+            netns_path = n.get("path")
+            break
     # The combined app container's Exec is the app-init script (it
     # starts nginx itself); it is website-class: no network, ever,
     # exactly like the static website.
@@ -178,11 +217,24 @@ def main():
             extra = ["--host-uds=all"]
     elif is_website:
         # Website class: create-only UDS (it creates b1.sock; it
-        # never connects to a host socket) and no network, ever.
-        # Strip a netns entry if one ever appears and force
-        # gVisor's loopback-only mode.
-        _strip_netns(cfg, cfg_path, bundle, ns, has_netns)
-        extra = ["--host-uds=create", "--network=none"]
+        # never connects to a host socket) and no external
+        # network, ever. Two shapes:
+        #  - the bundle's netns entry is EXACTLY the platform
+        #    loopback namespace: keep it and pass no --network
+        #    flag, so runsc mirrors the loopback-only namespace
+        #    into the sandbox netstack (the app container's
+        #    TCP-loopback contract; see the header). The mirror
+        #    can only contain what the namespace contains, and
+        #    the namespace contains lo alone.
+        #  - anything else (another namespace, or none): strip
+        #    a netns entry if one ever appears and force
+        #    --network=none, the pre-2026-10-22 behaviour B and
+        #    every socket-only website still runs.
+        if has_netns and netns_path == LOOPBACK_NETNS:
+            extra = ["--host-uds=create"]
+        else:
+            _strip_netns(cfg, cfg_path, bundle, ns, has_netns)
+            extra = ["--host-uds=create", "--network=none"]
     else:
         # Unrecognised bundle: no network and create-only UDS is
         # the only safe default. It still runs under gVisor (this

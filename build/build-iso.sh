@@ -707,7 +707,7 @@ systemctl mask tor.service tor@default.service || true
 systemctl enable onionhost-config.service onionhost-images.service \
   onionhost-nft-load.service onionhost-nft-gate.service onionhost-nft-gate.timer \
   onionhost-runtime-gate.timer \
-  onionhost-appdata-guard.timer
+  onionhost-appdata-guard.timer onionhost-loopback.service
 # Maintenance console: only reachable via the Maintenance GRUB entry
 # (systemd.unit=onionhost-maintenance.target); enabling the service
 # just creates its WantedBy symlink under that target.

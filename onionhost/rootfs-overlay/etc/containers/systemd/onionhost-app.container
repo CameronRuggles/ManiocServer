@@ -4,8 +4,10 @@
 # This is container B's successor for "app" sites: ONE combined
 # gVisor sandbox running nginx + the app runtime (PHP-FPM, or an
 # owner-supplied native program) + MariaDB as processes, started by
-# /etc/onionhost/app-init.sh. Like B it has NO network (Network=none
-# here AND runsc-wrap forces --network=none for app-init bundles).
+# /etc/onionhost/app-init.sh. Like B it has no EXTERNAL network;
+# unlike B it carries the platform loopback namespace (see the
+# Networking note below) because its database and native-app
+# contracts run over sandbox loopback TCP.
 # The PHP-FPM and MariaDB sockets are sandbox-internal; the only
 # socket that crosses the boundary is the nginx edge listener on
 # b1.sock in /run/onionhost/web - the same name the static B uses,
@@ -18,17 +20,32 @@
 # negated condition). Read-only rootfs; everything writable lives
 # on the app-data volume (/srv/appdata: www/ the docroot owners
 # fill, db/ MariaDB's datadir, native/ the native slot).
+#
+# Networking (REVISED 2026-10-22, real-install defect): this unit
+# previously declared Network=none, and runsc-wrap forced
+# --network=none - a gVisor netstack with NO interfaces at all,
+# not even loopback, so the platform's own TCP-loopback consumers
+# (PostgreSQL listen_addresses, psql -h 127.0.0.1, DATABASE_URL,
+# a native_serve app's BIND_ADDR) all failed at bind time with
+# EADDRNOTAVAIL. The unit now joins the platform loopback
+# namespace by path: a host netns whose ONLY interface is lo,
+# raised by onionhost-loopback.service. runsc-wrap keeps exactly
+# that netns entry (any other is stripped) and runsc mirrors it
+# into the sandbox - the app gets a working loopback and nothing
+# else: no external interface exists in the namespace, so there
+# is no route anywhere and no new egress. Isolation is unchanged;
+# only the long-claimed loopback is now real.
 [Unit]
-Description=OnionHost app - dynamic website (no network)
+Description=OnionHost app - dynamic website (loopback only)
 ConditionPathExists=/var/lib/onionhost/app-site
-Wants=onionhost-config.service onionhost-images.service
-After=onionhost-config.service onionhost-images.service
+Wants=onionhost-config.service onionhost-images.service onionhost-loopback.service
+After=onionhost-config.service onionhost-images.service onionhost-loopback.service
 
 [Container]
 Image=localhost/onionhost-app:latest
 ContainerName=onionhost-app
 PodmanArgs=--runtime=runsc-wrap
-Network=none
+Network=ns:/run/netns/onionhost-loopback
 # Same fixed userns map as B (container root is always host uid
 # 2300000): the app container occupies B's slot in the design.
 UIDMap=0:2300000:65536

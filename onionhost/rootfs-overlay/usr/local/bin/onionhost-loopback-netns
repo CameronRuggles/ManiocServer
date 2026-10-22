@@ -1,0 +1,84 @@
+#!/bin/sh
+# OnionHost - the app container's loopback-only network namespace.
+#
+# Why this exists (defect found on a real ISO install, rig session
+# 2026-10-22, tree 6f659b1): the app container's sandbox netstack
+# had NO network interfaces at all - not even loopback - so every
+# TCP-loopback consumer the platform itself specifies died at bind
+# time (PostgreSQL 17: 'could not bind IPv4 address "127.0.0.1":
+# Cannot assign requested address'; the same bind is made by
+# start_pg's psql -h 127.0.0.1, the assembled DATABASE_URL, and a
+# native_serve app's BIND_ADDR). Root cause, measured on the rig
+# with the production runtime path (runsc-wrap + runsc
+# release-20251006.0): with no netns entry in the bundle spec,
+# runsc --network=none creates a Sentry netstack with zero
+# interfaces; /proc/net/dev inside the sandbox is empty and
+# SIOCGIFFLAGS on "lo" answers ENODEV. Loopback cannot be created
+# or raised from inside the sandbox either (the device does not
+# exist there; netlink changes to mirrored devices are refused).
+#
+# The fix keeps the isolation absolute and gives the sandbox the
+# loopback the design always claimed it had ("a private
+# loopback-only gVisor netns", runsc-wrap): a dedicated host
+# network namespace whose ONLY interface is lo, raised, holding
+# 127.0.0.1/8 and ::1 and no route anywhere. The app Quadlet unit
+# joins it by path (Network=ns:...); runsc in its default sandbox
+# mode mirrors exactly those interfaces into the Sentry netstack,
+# so the app sandbox sees one loopback interface and nothing else
+# - no external interface exists in the namespace, so there is
+# nothing to route to and no new egress. runsc-wrap keeps the
+# bundle's netns entry ONLY when its path is this namespace; any
+# other netns entry in a website bundle is still stripped and
+# forced to --network=none, as before.
+#
+# Managed by onionhost-loopback.service (oneshot, boot time);
+# the app unit Wants/After it. Idempotent: start on an existing,
+# healthy namespace just re-asserts lo up.
+set -u
+NS=onionhost-loopback
+NSDIR=/run/netns
+NSPATH=$NSDIR/$NS
+
+die() { echo "onionhost-loopback-netns: $*" >&2; exit 1; }
+
+lo_healthy() {
+    [ -e "$NSPATH" ] || return 1
+    ip -n "$NS" addr show dev lo 2>/dev/null \
+        | grep -q 'inet 127\.0\.0\.1/8' || return 1
+    ip -n "$NS" link show dev lo 2>/dev/null \
+        | grep -q 'LOOPBACK,UP' || return 1
+    return 0
+}
+
+start() {
+    mkdir -p "$NSDIR"
+    if [ ! -e "$NSPATH" ]; then
+        ip netns add "$NS" || die "ip netns add $NS failed"
+    fi
+    # A fresh netns has lo DOWN with no addresses; the Sentry
+    # mirrors the state it finds, so lo must be raised HERE -
+    # raising it assigns 127.0.0.1/8 and ::1 (kernel behaviour
+    # for the loopback device).
+    ip -n "$NS" link set lo up || die "cannot raise lo in $NS"
+    if ! ip -n "$NS" addr show dev lo 2>/dev/null \
+            | grep -q 'inet 127\.0\.0\.1/8'; then
+        # Not every kernel auto-assigns on raise; assert it.
+        ip -n "$NS" addr add 127.0.0.1/8 dev lo \
+            || die "cannot assign 127.0.0.1/8 in $NS"
+    fi
+    lo_healthy || die "namespace $NS is not loopback-healthy after setup"
+    echo "onionhost-loopback-netns: $NSPATH ready (lo up, 127.0.0.1/8)"
+}
+
+stop() {
+    if [ -e "$NSPATH" ]; then
+        ip netns del "$NS" || die "ip netns del $NS failed"
+    fi
+    exit 0
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    *) echo "usage: $0 start|stop" >&2; exit 2 ;;
+esac
