@@ -26,6 +26,8 @@
 # not on that list until owner decision 3 is met). OH_RECIPES may
 # select a different set ONLY together with OH_NONRELEASE_BUILD=1,
 # which banners the build and stamps BUILD-INFO as non-release.
+# OH_SRC (the source-tree override) is held to the same rule, and
+# the source commit / tree hash are stamped into BUILD-INFO.
 # See README.md ("Recipe ship list and the non-release override").
 #
 # Pipeline: mmdebstrap (Debian 13/trixie, pinned snapshot) -> chroot
@@ -119,6 +121,29 @@ if [ -n "${OH_RECIPES:-}" ]; then
 elif [ "${OH_NONRELEASE_BUILD:-}" = "1" ]; then
   RELEASE_STATUS="non-release"
 fi
+
+# --- source-tree provenance (doc batch 2026-10-22, item 5) --------
+# OH_SRC overrides the source tree this build consumes (the rig's
+# historical rsync layout). It is held to the same rule as the
+# OH_RECIPES override above: allowed only for a clearly-marked
+# NON-RELEASE build. Without OH_NONRELEASE_BUILD=1 it is FATAL
+# here, before any image work; with it, the build is stamped
+# non-release by the same machinery, so an overridden-source build
+# can no longer produce release paperwork. The source commit /
+# tree hash are computed here and stamped into BUILD-INFO below;
+# an overridden tree that is not a git checkout records "unknown"
+# — which is itself the disclosure.
+if [ -n "${OH_SRC:-}" ]; then
+  if [ "$RELEASE_STATUS" != "non-release" ]; then
+    echo "FATAL: OH_SRC is set ('${OH_SRC}') but OH_NONRELEASE_BUILD=1 is not. A source-tree override is allowed only for a clearly-marked NON-RELEASE build: unset OH_SRC for a release build, or set OH_NONRELEASE_BUILD=1 to build non-release from this source tree." >&2
+    exit 1
+  fi
+  SRC_SOURCE="OH_SRC override"
+else
+  SRC_SOURCE="tracked clone default"
+fi
+SRC_COMMIT="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+SRC_TREE="$(git -C "$SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || echo unknown)"
 [ "${#SELECTED_RECIPES[@]}" -gt 0 ] || { echo "FATAL: recipe selection is empty (the SHIPPING list / OH_RECIPES named no recipes) - refusing to build an image with no factory recipes." >&2; exit 1; }
 _seen=" "
 for _id in "${SELECTED_RECIPES[@]}"; do
@@ -362,6 +387,9 @@ IMG_APP=$(build_image_tar app "nginx,libnginx-mod-http-headers-more-filter,php-f
   echo "release_status=${RELEASE_STATUS}"
   echo "recipes_source=${RECIPES_SOURCE}"
   echo "recipes_selected=${SELECTED_RECIPES[*]}"
+  echo "src_source=${SRC_SOURCE}"
+  echo "src_commit=${SRC_COMMIT}"
+  echo "src_tree=${SRC_TREE}"
   echo "runsc=${RUNSC_VERSION} sha512=${RUNSC_SHA512}"
   echo "img_tor_sha256=$(sha256sum "$IMG_TOR" | awk '{print $1}')"
   echo "img_web_sha256=$(sha256sum "$IMG_WEB" | awk '{print $1}')"
