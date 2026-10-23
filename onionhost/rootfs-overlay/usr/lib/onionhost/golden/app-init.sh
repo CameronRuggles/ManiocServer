@@ -663,8 +663,19 @@ rm -f /run/onionhost/web/b1.sock
 # implement FIONREAD properly. Tor, the socket name and the
 # rotation story are unchanged; socat is the only process that
 # touches b1.sock.
+#
+# umask=0000 on the listener is load-bearing, not decoration:
+# connecting to a unix socket needs write permission on its
+# file, and container A's tor runs under a different uid in a
+# different user namespace than this container. nginx's own
+# listener inherited a connectable mode from the unit's
+# UMask=0000; socat instead stamps its socket 0755 by default,
+# which refuses tor outright - the whole site drops while every
+# process inside this container looks healthy (measured on a
+# live install: tor logged 'Onion service connection to
+# /run/onionhost/web/http.sock:1 failed (connection refused)').
 echo "app-init: starting edge splice (edge socket -> nginx loopback)"
-socat UNIX-LISTEN:/run/onionhost/web/b1.sock,fork \
+socat UNIX-LISTEN:/run/onionhost/web/b1.sock,fork,umask=0000 \
       TCP:127.0.0.1:18080 &
 echo "app-init: starting nginx (loopback, runtime=$RUNTIME)"
 exec nginx -c "$CFG/nginx-app.conf" -g "daemon off;"
