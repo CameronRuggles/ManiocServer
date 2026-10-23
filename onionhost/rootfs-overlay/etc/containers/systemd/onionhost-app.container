@@ -9,9 +9,12 @@
 # Networking note below) because its database and native-app
 # contracts run over sandbox loopback TCP.
 # The PHP-FPM and MariaDB sockets are sandbox-internal; the only
-# socket that crosses the boundary is the nginx edge listener on
+# socket that crosses the boundary is the edge listener on
 # b1.sock in /run/onionhost/web - the same name the static B uses,
 # behind the same host-owned http.sock symlink container A targets.
+# The listener is a socat splice started by app-init, which hands
+# connections to nginx on the sandbox loopback (the FIONREAD fix;
+# see app-init.sh and the app nginx templates).
 # A, the torrc and the firewall story are unchanged.
 #
 # Selection by site kind: this unit starts only when the app-site

@@ -645,5 +645,26 @@ esac
 # A SIGKILLed predecessor can leave a stale edge socket that blocks
 # the bind (gate-round operational finding); the name is ours alone.
 rm -f /run/onionhost/web/b1.sock
-echo "app-init: starting nginx (edge socket, runtime=$RUNTIME)"
+# Edge splice (FIONREAD fix; the full story is in the app nginx
+# templates): nginx must not read visitor requests from the
+# host-backed edge socket itself. The gVisor Sentry answers
+# ioctl(FIONREAD) with ENOTTY for host-file-backed endpoints, and
+# nginx treats that answer as a fatal connection error - in its
+# header read when a flight exactly fills the header buffer, and
+# in its request-body reader on ANY body that arrives in more than
+# one flight, because that reader caps its final read at exactly
+# the remaining Content-Length (measured on a real install:
+# one-shot requests of any size passed, the same bytes dripped in
+# 500-byte writes all died). socat owns the edge socket instead:
+# it copies bytes with plain reads and writes, which the Sentry
+# serves correctly at any size and pacing, and hands each
+# connection to nginx on the sandbox loopback (127.0.0.1:18080,
+# the platform edge port), whose Sentry-native TCP endpoints
+# implement FIONREAD properly. Tor, the socket name and the
+# rotation story are unchanged; socat is the only process that
+# touches b1.sock.
+echo "app-init: starting edge splice (edge socket -> nginx loopback)"
+socat UNIX-LISTEN:/run/onionhost/web/b1.sock,fork \
+      TCP:127.0.0.1:18080 &
+echo "app-init: starting nginx (loopback, runtime=$RUNTIME)"
 exec nginx -c "$CFG/nginx-app.conf" -g "daemon off;"

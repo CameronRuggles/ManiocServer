@@ -5,8 +5,10 @@
 # One combined sandbox (gate-round recommendation): nginx, PHP-FPM and
 # MariaDB are processes in THIS container. The FPM and DB sockets are
 # sandbox-internal (/run/*.sock); the ONLY socket that crosses the
-# boundary is the edge listener below, in the shared /run/onionhost/web
-# directory, on the same b1.sock name container A's http.sock symlink
+# boundary is the edge socket below, in the shared /run/onionhost/web
+# directory (terminated by the socat splice app-init starts; nginx
+# itself listens on the sandbox loopback - the FIONREAD fix), on the
+# same b1.sock name container A's http.sock symlink
 # already points at - so A, the torrc and the rotation story are
 # unchanged from the static tier.
 #
@@ -52,25 +54,32 @@ http {
     # Forum-class apps accept uploads; the app data volume's quota is
     # the real bound, this just keeps single requests sane.
     client_max_body_size 32m;
-    # Edge read-buffer sizing (FIONREAD fix): nginx sizes its first
-    # read of a request to client_header_buffer_size (1k default)
-    # and its request-body reads to client_body_buffer_size. When a
-    # read fills its buffer exactly, ngx_readv_chain() calls
-    # ioctl(FIONREAD) to size the remainder - and the gVisor Sentry
-    # answers ENOTTY for the host-backed edge socket, which nginx
-    # treats as a fatal connection error (the error log shows
-    # 'ioctl(FIONREAD) failed (25: Inappropriate ioctl for device)'
-    # on the connections it kills). The result was a hard cliff:
-    # any request whose first flight exceeded the 1k default header
-    # buffer was torn down mid-flight, so forum posts and uploads
-    # could never complete. Sizing both buffers to the largest body
-    # this server accepts means an admissible request is read
-    # without ever exactly filling a buffer, and the FIONREAD path
-    # is never reached. (Theoretical residue: a body of exactly
-    # 32 MiB arriving with zero bytes prefetched - outside every
-    # client flow this platform serves.) The buffers are allocated
-    # per request and only touched as data arrives, so the large
-    # caps cost no resident memory on small requests.
+    # Edge reads and FIONREAD (the serving-path fix, two parts):
+    #
+    # nginx must never read a visitor request from the host-backed
+    # edge socket directly. When one of its reads fills the offered
+    # buffer exactly, ngx_readv_chain() calls ioctl(FIONREAD) to
+    # size the remainder; the gVisor Sentry answers ENOTTY for
+    # host-file-backed endpoints, and nginx treats that as a fatal
+    # connection error (the error log shows 'ioctl(FIONREAD) failed
+    # (25: Inappropriate ioctl for device)' on the connections it
+    # kills). Two distinct reads can fill exactly: the header read
+    # (client_header_buffer_size, 1k in the stock build -
+    # the original cliff, hit by any request whose first flight
+    # exceeded it), and the request-body reader's final read, which
+    # it caps at exactly the remaining Content-Length - so ANY body
+    # arriving in more than one flight fills it, and every real Tor
+    # request is multi-flight. No buffer size fixes that read.
+    #
+    # 1. The edge socket is therefore terminated by the socat
+    #    splice app-init starts; nginx listens on the sandbox
+    #    loopback (127.0.0.1:18080, the platform edge port), whose
+    #    Sentry-native TCP endpoints implement FIONREAD properly.
+    # 2. These buffers, sized to the largest body this server
+    #    accepts, keep the header read from ever filling even on
+    #    a leg whose FIONREAD regressed. They are allocated per
+    #    request and only touched as data arrives, so the caps
+    #    cost no resident memory on small requests.
     client_header_buffer_size 32m;
     client_body_buffer_size 32m;
     client_body_temp_path /tmp/client_body;
@@ -79,7 +88,7 @@ http {
     uwsgi_temp_path /tmp/uwsgi;
     scgi_temp_path /tmp/scgi;
     server {
-        listen unix:/run/onionhost/web/b1.sock;
+        listen 127.0.0.1:18080;
         root /srv/appdata/www;
         index index.php index.html index.htm;
 
