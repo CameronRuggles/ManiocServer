@@ -31,6 +31,16 @@ http {
     error_page 404 @onionhost_notfound;
     error_page 500 502 503 504 @onionhost_error;
     sendfile on;
+    # Edge read-buffer sizing (FIONREAD fix): see the app
+    # templates for the full story - on the gVisor host-backed
+    # edge socket, a request whose first flight exactly fills
+    # nginx's 1k default header buffer dies on a failed
+    # ioctl(FIONREAD). This tier accepts the (previously
+    # implicit) default 1m body cap, now stated; size the read
+    # buffers to it so the FIONREAD path is never reached.
+    client_max_body_size 1m;
+    client_header_buffer_size 1m;
+    client_body_buffer_size 1m;
     client_body_temp_path /tmp/client_body;
     proxy_temp_path /tmp/proxy;
     fastcgi_temp_path /tmp/fastcgi;

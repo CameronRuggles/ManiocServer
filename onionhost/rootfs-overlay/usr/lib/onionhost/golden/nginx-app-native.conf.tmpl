@@ -41,6 +41,27 @@ http {
     more_clear_headers 'Last-Modified';
     error_page 500 502 503 504 @onionhost_error;
     client_max_body_size 32m;
+    # Edge read-buffer sizing (FIONREAD fix): nginx sizes its first
+    # read of a request to client_header_buffer_size (1k default)
+    # and its request-body reads to client_body_buffer_size. When a
+    # read fills its buffer exactly, ngx_readv_chain() calls
+    # ioctl(FIONREAD) to size the remainder - and the gVisor Sentry
+    # answers ENOTTY for the host-backed edge socket, which nginx
+    # treats as a fatal connection error (the error log shows
+    # 'ioctl(FIONREAD) failed (25: Inappropriate ioctl for device)'
+    # on the connections it kills). The result was a hard cliff:
+    # any request whose first flight exceeded the 1k default header
+    # buffer was torn down mid-flight, so armored key registrations
+    # and terms posts could never complete. Sizing both buffers to
+    # the largest body this server accepts means an admissible
+    # request is read without ever exactly filling a buffer, and
+    # the FIONREAD path is never reached. (Theoretical residue: a
+    # body of exactly 32 MiB arriving with zero bytes prefetched -
+    # outside every client flow this platform serves.) The buffers
+    # are allocated per request and only touched as data arrives,
+    # so the large caps cost no resident memory on small requests.
+    client_header_buffer_size 32m;
+    client_body_buffer_size 32m;
     client_body_temp_path /tmp/client_body;
     proxy_temp_path /tmp/proxy;
     fastcgi_temp_path /tmp/fastcgi;
