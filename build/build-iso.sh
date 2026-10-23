@@ -59,9 +59,9 @@ if [ "$FLAVOUR" = "test" ]; then
       exit 1 ;;
   esac
 fi
-SNAPSHOT="20251011T143150Z"                       # snapshot.debian.org pin
+SNAPSHOT="20261023T142942Z"                       # snapshot.debian.org pin
 MIRROR="https://snapshot.debian.org/archive/debian/${SNAPSHOT}"
-export SOURCE_DATE_EPOCH=1760193110               # 2025-10-11T14:31:50Z (== snapshot)
+export SOURCE_DATE_EPOCH=1792765782               # 2026-10-23T14:29:42Z (== snapshot)
 WORK="${WORK:-$HOME/iso-build-$FLAVOUR}"
 ROOTFS="$WORK/rootfs"
 ISOTREE="$WORK/iso-tree"
