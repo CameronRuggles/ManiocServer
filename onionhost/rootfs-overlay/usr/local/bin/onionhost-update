@@ -940,8 +940,25 @@ def main():
         log("Debian apt-get update failed for at least one source "
             "- logged only; upgrading from whatever lists did "
             "arrive (e.g. security), the rest retries next run")
-    rc = run(["apt-get", "-y"] + DPKG_OPTS + ["upgrade"],
+    # Audit H2 (T1): the upgrade is split in two. The download
+    # runs first, alone, under the timeout - killing a download
+    # is safe (apt resumes or re-fetches; nothing is unpacked
+    # yet). The install then runs with NO timeout: a kill
+    # mid-install is what wedges dpkg (M2), so this call must
+    # not be able to receive one. --with-new-pkgs lets both
+    # calls take new package names: Debian ships kernel fixes
+    # as new ABI packages behind linux-image-amd64, and plain
+    # apt-get upgrade holds those back forever. The flag never
+    # removes anything.
+    dl = run(["apt-get", "--download-only", "-y",
+              "--with-new-pkgs"] + DPKG_OPTS + ["upgrade"],
              timeout=3600)
+    if dl != 0:
+        log("Debian download phase returned %d - the install "
+            "phase re-fetches what it needs and is judged by "
+            "its own result" % dl)
+    rc = run(["apt-get", "-y", "--with-new-pkgs"] + DPKG_OPTS
+             + ["upgrade"], timeout=None)
     for pkg in held:
         run(["apt-mark", "unhold", pkg])
     if rc != 0:

@@ -120,3 +120,30 @@ filesystem rejects uid 2300000 — mechanism identical):
 **Rig acceptance (outstanding — rig blocked):** the audit's
 canary publish on a guest, planted per R1, and the pre-fix-box
 first-publish migration check on a guest, have not run.
+
+## T1 — Kernel updates actually install (H2, Debian phase)
+
+**Code change** (one commit, task ID in message):
+`onionhost-update`'s Debian phase now runs the upgrade in two
+calls: `apt-get --download-only -y --with-new-pkgs upgrade`
+under the existing 3600 s timeout (a killed download is safe),
+then the same install with `timeout=None` — `run()` passes the
+value straight to `subprocess.run`, so the install call cannot
+receive a kill. `--with-new-pkgs` admits new package names
+(kernel ABI packages behind `linux-image-amd64`) and never
+removes. Floor logic and the HELD set across the phase are
+unchanged. The T2 surface was not touched: `run()`'s
+TimeoutExpired behaviour, start-of-run `dpkg --configure -a`
+and `DPkg::Lock::Timeout` remain exactly as they were (the
+split landed without needing any of them).
+
+**Local evidence:** `py_compile` clean; the two new call sites
+are the only `upgrade` invocations in the file. A mechanism demo
+on the sandbox's own apt was inconclusive (the sandbox has no
+pending upgrades and no kept-back packages), recorded as such —
+the flag's semantics are standard apt behaviour, but this batch
+does not claim the demo as evidence.
+
+**Rig acceptance (outstanding — rig blocked):** on a guest with
+a pending kernel ABI bump, one `onionhost-update` run installs
+the new `linux-image-*` (`dpkg -l` before/after). Not run.
