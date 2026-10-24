@@ -34,7 +34,29 @@ mkdir -p /var/lib/onionhost/tor/data /var/lib/onionhost/tor/hs
 mkdir -p /var/lib/onionhost/client/data
 mkdir -p /var/lib/onionhost/site
 chown -R 2100000:2100000 /var/lib/onionhost/tor
-chmod 0700 /var/lib/onionhost/tor /var/lib/onionhost/tor/hs /var/lib/onionhost/tor/data
+# The mode assertion on the tor state dirs goes through
+# descriptors (audit H4, T8): these names live inside
+# container A's own tree, and a path chmod would follow a
+# symlink planted there onto a host path. Open each directory
+# O_NOFOLLOW and fchmod the descriptor; anything that is not
+# a real directory refuses and stops config generation.
+python3 - <<'EOF'
+import os, sys
+for p in ("/var/lib/onionhost/tor", "/var/lib/onionhost/tor/hs",
+          "/var/lib/onionhost/tor/data"):
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_DIRECTORY
+                     | os.O_NOFOLLOW)
+    except OSError as e:
+        print("onionhost-generate-configs: refusing "
+              "non-directory at %s: %s" % (p, e),
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+EOF
 chown -R 2200000:2200000 /var/lib/onionhost/client
 chmod 0700 /var/lib/onionhost/client /var/lib/onionhost/client/data
 chown 2300000:2300000 /var/lib/onionhost/site
@@ -244,13 +266,20 @@ except Exception:
     # and a fresh native install died at first boot both times).
     # (The id base is env-overridable for test venues only, as
     # in onionhost-app-provision; production never sets it.)
-    for d in /var/lib/onionhost/appdata /var/lib/onionhost/appdata/db; do
-        if [ ! -d "$d" ]; then
-            mkdir -p "$d"
-            chown "$OH_BASE:$OH_BASE" "$d"
-            chmod 0755 "$d"
-        fi
-    done
+    # appdata itself is born HOST-ROOT owned (audit H4, T8):
+    # the app writes inside www/db/native, but it must not own
+    # their parent - owning it is what used to let the app
+    # rename those names (and swap one for a symlink).
+    if [ ! -d /var/lib/onionhost/appdata ]; then
+        mkdir -p /var/lib/onionhost/appdata
+        chown 0:0 /var/lib/onionhost/appdata
+        chmod 0755 /var/lib/onionhost/appdata
+    fi
+    if [ ! -d /var/lib/onionhost/appdata/db ]; then
+        mkdir -p /var/lib/onionhost/appdata/db
+        chown "$OH_BASE:$OH_BASE" /var/lib/onionhost/appdata/db
+        chmod 0755 /var/lib/onionhost/appdata/db
+    fi
     for d in /var/lib/onionhost/appdata/www \
              /var/lib/onionhost/appdata/native; do
         if [ ! -d "$d" ]; then

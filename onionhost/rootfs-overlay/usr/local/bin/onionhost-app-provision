@@ -96,7 +96,21 @@ CONTAINER_WWW_GID = CONTAINER_UID + 33
 DEFAULT_QUOTA = 20 * 1024 * 1024 * 1024  # 20 GiB
 
 
-def _grant_owner_acl(path, owner_uid, is_dir=True):
+def _dir_fd(path):
+    """Open a directory by descriptor, never following a final
+    symlink. All ownership, mode and ACL work on the app-data
+    skeleton goes through descriptors obtained here (audit
+    H4): the names www/db/native sit in a directory the app
+    container's root owns on a pre-fix box, so a path-based
+    chown/chmod/setxattr could be steered onto a host path by
+    swapping one of those names for a symlink. An O_NOFOLLOW
+    open of anything that is not a real directory raises, and
+    the publish fails closed."""
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY
+                   | os.O_NOFOLLOW)
+
+
+def _grant_owner_acl(fd, owner_uid, is_dir=True):
     """Give the desktop owner rwx on a platform-managed app
     tree root via a named-user POSIX ACL (and, for a
     directory, a default ACL so entries created later inherit
@@ -106,7 +120,10 @@ def _grant_owner_acl(path, owner_uid, is_dir=True):
     an external setfacl binary existing. Best-effort: a
     filesystem without ACL support leaves the mode/group
     state, which still satisfies the app - only the owner's
-    desktop write access degrades, and the caller warns."""
+    desktop write access degrades, and the caller warns.
+    The grant goes through the caller's O_NOFOLLOW descriptor
+    (audit H4), so it can only land on the directory the
+    caller verified."""
     def blob(named_uid, owner_p, group_p, other_p):
         out = struct.pack("<I", 2)
         out += struct.pack("<HHI", 1, owner_p, 0xFFFFFFFF)
@@ -116,13 +133,12 @@ def _grant_owner_acl(path, owner_uid, is_dir=True):
         out += struct.pack("<HHI", 32, other_p, 0xFFFFFFFF)
         return out
     try:
-        st = os.stat(path)
-        mode = st.st_mode
+        mode = os.fstat(fd).st_mode
         data = blob(owner_uid, (mode >> 6) & 7, (mode >> 3) & 7,
                     mode & 7)
-        os.setxattr(path, "system.posix_acl_access", data)
+        os.setxattr(fd, "system.posix_acl_access", data)
         if is_dir:
-            os.setxattr(path, "system.posix_acl_default", data)
+            os.setxattr(fd, "system.posix_acl_default", data)
         return True
     except OSError:
         return False
@@ -151,11 +167,25 @@ def provision(user, runtime, db_mode=None):
     os.makedirs(APPDATA, exist_ok=True)
     for name in ("www", "db", "native"):
         os.makedirs(os.path.join(APPDATA, name), exist_ok=True)
-    os.chown(APPDATA, CONTAINER_UID, CONTAINER_UID)
-    os.chmod(APPDATA, 0o755)
-    dbdir = os.path.join(APPDATA, "db")
-    os.chown(dbdir, CONTAINER_UID, CONTAINER_UID)
-    os.chmod(dbdir, 0o750)
+    # Audit H4 (T8): from here on, nothing under appdata is
+    # touched by path - descriptors only (see _dir_fd).
+    # appdata itself becomes HOST-ROOT owned: the application
+    # writes inside www/db/native, whose roots keep the
+    # container mappings below, but renaming those names needs
+    # write access to their parent, and the parent is root's
+    # now. (On a pre-fix box appdata belongs to the container
+    # root; this fchown is the migration, and it lands at the
+    # first publish after the update.) A managed name the app
+    # swapped for a symlink refuses the open and fails the
+    # publish closed.
+    appdata_fd = _dir_fd(APPDATA)
+    os.fchown(appdata_fd, 0, 0)
+    os.fchmod(appdata_fd, 0o755)
+    dir_fds = {}
+    for name in ("www", "db", "native"):
+        dir_fds[name] = _dir_fd(os.path.join(APPDATA, name))
+    os.fchown(dir_fds["db"], CONTAINER_UID, CONTAINER_UID)
+    os.fchmod(dir_fds["db"], 0o750)
     # Owner-managed dirs: owned by the app user's mapping -
     # uid AND group (setgid so new entries inherit the group).
     #
@@ -187,13 +217,17 @@ def provision(user, runtime, db_mode=None):
     # also heals a root an older build created.
     for name in ("www", "native"):
         path = os.path.join(APPDATA, name)
-        os.chown(path, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-        os.chmod(path, 0o2775)
-        if not _grant_owner_acl(path, pw.pw_uid):
+        fd = dir_fds[name]
+        os.fchown(fd, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+        os.fchmod(fd, 0o2775)
+        if not _grant_owner_acl(fd, pw.pw_uid):
             print("app-provision: WARNING: could not grant "
                   "the owner an ACL on %s; desktop write "
                   "access to the app folder may be limited"
                   % path, file=sys.stderr)
+    for fd in dir_fds.values():
+        os.close(fd)
+    os.close(appdata_fd)
     # L1 healer (D8): a directory anywhere under the two
     # owner-managed trees whose uid or gid sits OUTSIDE the
     # container's id map - dropped there by the owner's file
@@ -203,17 +237,20 @@ def provision(user, runtime, db_mode=None):
     # directories (only directories, only when an id is
     # unmapped) to the app user's mapping. Directories the
     # platform or the application made carry mapped ids and
-    # are untouched.
+    # are untouched. Traversal and re-owning are by descriptor
+    # (os.fwalk, never following symlinks - audit H4): the
+    # walk itself must not be steerable either.
     for name in ("www", "native"):
         base = os.path.join(APPDATA, name)
-        for dirpath, _dirnames, _filenames in os.walk(base):
-            st = os.lstat(dirpath)
+        for _dirpath, _dirnames, _filenames, dirfd in \
+                os.fwalk(base, follow_symlinks=False):
+            st = os.fstat(dirfd)
             if not (CONTAINER_UID <= st.st_uid
                     < CONTAINER_UID + 65536) or \
                not (CONTAINER_UID <= st.st_gid
                     < CONTAINER_UID + 65536):
-                os.chown(dirpath, CONTAINER_WWW_UID,
-                         CONTAINER_WWW_GID)
+                os.fchown(dirfd, CONTAINER_WWW_UID,
+                          CONTAINER_WWW_GID)
 
     _atomic_write(RUNTIME_FILE, runtime + "\n")
     _atomic_write(MARKER, "runtime=%s\ndb=%s\n" % (runtime,
@@ -319,6 +356,13 @@ def main():
     except KeyError:
         print("app-provision: unknown user %r" % args.user,
               file=sys.stderr)
+        return 1
+    except OSError as e:
+        # A refusal from the descriptor checks (audit H4): a
+        # managed name under appdata that is not a real
+        # directory. Fail the publish closed, with the reason
+        # on the log.
+        print("app-provision: refused: %s" % e, file=sys.stderr)
         return 1
 
 

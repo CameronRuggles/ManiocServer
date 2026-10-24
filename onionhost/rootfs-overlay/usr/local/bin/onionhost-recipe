@@ -603,6 +603,18 @@ def _owner_uid():
         return None
 
 
+def _dir_fd(path):
+    """Open a directory by descriptor, never following a final
+    symlink (audit H4, T8). The tree-root assertions below run
+    on names inside the app volume - names the app container's
+    root can try to swap for symlinks - so ownership and mode
+    work goes through descriptors, and anything that is not a
+    real directory raises and aborts the apply rather than
+    steering a host-root write onto a host path."""
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY
+                   | os.O_NOFOLLOW)
+
+
 def _grant_owner_acl(path, is_dir=True):
     """Give the desktop owner rwx on a platform-managed app
     tree root via a named-user POSIX ACL (plus a default ACL
@@ -632,13 +644,19 @@ def _grant_owner_acl(path, is_dir=True):
         out += struct.pack("<HHI", 32, other_p, 0xFFFFFFFF)
         return out
     try:
-        mode = os.stat(path).st_mode
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        mode = os.fstat(fd).st_mode
         data = blob((mode >> 6) & 7, (mode >> 3) & 7, mode & 7)
-        os.setxattr(path, "system.posix_acl_access", data)
+        os.setxattr(fd, "system.posix_acl_access", data)
         if is_dir:
-            os.setxattr(path, "system.posix_acl_default", data)
+            os.setxattr(fd, "system.posix_acl_default", data)
     except OSError:
         pass
+    finally:
+        os.close(fd)
 
 
 def _own_native_root(native):
@@ -657,8 +675,12 @@ def _own_native_root(native):
     the root refuse every create (D8) - the mode is
     provision's setgid steady state, and the owner's desktop
     access is re-asserted as the named-user ACL."""
-    os.chown(native, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-    os.chmod(native, 0o2775)
+    fd = _dir_fd(native)
+    try:
+        os.fchown(fd, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+        os.fchmod(fd, 0o2775)
+    finally:
+        os.close(fd)
     _grant_owner_acl(native)
 
 
@@ -671,8 +693,12 @@ def _own_www_root(www):
     silently demotes the root provision left at 02775 to
     the archive's 0755. Same doctrine as the tree roots:
     (www-data mapping, 02775) plus the owner's ACL."""
-    os.chown(www, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-    os.chmod(www, 0o2775)
+    fd = _dir_fd(www)
+    try:
+        os.fchown(fd, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+        os.fchmod(fd, 0o2775)
+    finally:
+        os.close(fd)
     _grant_owner_acl(www)
 
 
@@ -697,12 +723,20 @@ def _own_data_dirs(www, manifest):
     directory roots."""
     for dirname in manifest.get("data_dirs", []):
         root = os.path.join(www, dirname)
+        if os.path.islink(root):
+            # A declared data directory swapped for a symlink
+            # must not steer the assertions below onto a host
+            # path (audit H4, T8): abort the apply.
+            raise ValueError(
+                "data directory %r is a symlink - refusing"
+                % root)
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirnames, _filenames in os.walk(root):
-            os.chown(dirpath, CONTAINER_WWW_UID,
-                     CONTAINER_WWW_GID)
-            os.chmod(dirpath, 0o2775)
+        for _dirpath, _dirnames, _filenames, dirfd in \
+                os.fwalk(root, follow_symlinks=False):
+            os.fchown(dirfd, CONTAINER_WWW_UID,
+                      CONTAINER_WWW_GID)
+            os.fchmod(dirfd, 0o2775)
         _grant_owner_acl(root)
 
 
