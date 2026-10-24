@@ -10,7 +10,9 @@ diff, `MANIOC-AUDIT-FIX-BATCH-REPORT-2026-10-24.md`.
   delivery form per the batch's commission; clone the pinned
   tree from this branch).
 - **Base:** `1d0d86c` (the audited commit).
-- **Head:** `e09f0198f07dc7bb4ed01e410df22e683c92caf4`.
+- **Code head:** `e09f0198f07dc7bb4ed01e410df22e683c92caf4`
+  (the branch tip adds only this pack and its pin fix on top;
+  the code diff is unchanged).
 - **Diff range:** `1d0d86c..e09f019`.
 - **Commits:** `3accd51` T8 · `6265f64` T1 · `f637a03` T3 ·
   `e09f019` report/closing.
