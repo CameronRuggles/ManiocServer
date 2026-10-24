@@ -188,3 +188,46 @@ reboot is pending; marker silences the card).
 update pending reboot on a guest, status.json says a restart
 is needed and the Dashboard shows the card and the check's
 age. Not run.
+
+## Closing gate status (brief §7)
+
+1. **Commits:** one per task, task ID in the message, on top of
+   `1d0d86c`: T8 `3accd51`, T1 `6265f64`, T3 `f637a03` (this
+   report's closing commit follows). Tracked tree clean.
+   T5/T7/T18 are **not** in the branch: T5 and T7 remain
+   PROVISIONAL on Cameron's Fork A / Fork B rulings (neither
+   ruling was given to this batch), and T18 waits on Cameron's
+   hardware-token step. The gate therefore applies to the
+   executed remainder, as the brief allows when the forks are
+   explicitly deferred by the owner.
+2. **Acceptance checks:** every in-scope code task's check was
+   run locally as far as the sandbox allows (T8 harness 16/16
+   incl. the baseline positive control; T3 harness 16/16; T1
+   compile + call-site verification, its apt mechanism demo
+   inconclusive locally). The rig-side halves of all three
+   acceptance checks, B0's guest captures, R1 and R2 are
+   recorded as **not run — rig blocked**, with the evidence at
+   the top of this report. Nothing is recorded as passed that
+   did not run.
+3. **R1/R2:** no verdicts (rig blocked). R2 in particular —
+   whether the published ISO's build reused stale caches —
+   remains an OPEN question bearing on the live ISO; it is not
+   answered, cleared, or buried by this batch.
+4. **Delta pack:** `MANIOC-AUDIT-FIX-DELTA-PACK-2026-10-24.md`
+   (diff range `1d0d86c..HEAD`) accompanies this report.
+   **Closure belongs to the external auditor's re-verification
+   of that pack, and the outstanding rig checks must complete
+   before the next public ISO is built from this tree** — the
+   release sequence's own rule.
+
+**Regression note.** No in-tree automated suite covers these
+platform scripts (verification has always been the rig battery
+plus targeted harnesses, as here). The untouched surfaces were
+kept untouched deliberately: T1 changed only the Debian phase's
+two upgrade calls; T3's updater change is additive fields on
+every status write plus one global set mid-main; T3's wizard
+change adds one label and one age suffix; T8 replaces the
+mechanism of assertions whose end-state values (owners, modes,
+ACL contents) are byte-for-byte the ones the pre-fix code
+produced on legitimate trees — pinned by the harnesses'
+happy-path assertions.
