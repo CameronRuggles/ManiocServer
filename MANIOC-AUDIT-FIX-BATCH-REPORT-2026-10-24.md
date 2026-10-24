@@ -147,3 +147,44 @@ does not claim the demo as evidence.
 **Rig acceptance (outstanding — rig blocked):** on a guest with
 a pending kernel ABI bump, one `onionhost-update` run installs
 the new `linux-image-*` (`dpkg -l` before/after). Not run.
+
+## T3 — Restart state and check age reach the owner (H2, M3)
+
+**Code changes** (one commit, task ID in message):
+
+- `onionhost-update`: `write_status` now records in status.json
+  `reboot_required`, `reboot_reason` (from `/run/reboot-required`
+  and its `.pkgs` sibling, contents named; plus a needrestart
+  KCUR/KEXP mismatch when needrestart exists) and
+  `reboot_required_since` (first recorded observation, carried
+  across runs), and maintains `last_successful_check`, which
+  advances only on runs whose repository check succeeded
+  (`CHECK_SUCCEEDED`, set by main() after the project-repo
+  check passes) — a fetch-failed run leaves the previous stamp
+  standing, which is the M3 fix. The reboot path is
+  env-overridable (`ONIONHOST_REBOOT_REQUIRED`) like the other
+  test-venue paths.
+- `wizard.py`: the Dashboard's up-to-date line carries the
+  check's age ("last checked today / 1 day ago / N days ago",
+  from `last_successful_check`, falling back to `checked_at`
+  for pre-T3 status files), and a new `reboot_status_text()`
+  restart card (own label, refreshed with the other status
+  lines) shows the pending restart and its waiting age, silent
+  when nothing is pending and silenced by the fail-closed
+  marker. **No escalation colours or thresholds** — owner
+  question 4 stays parked, as the brief directs.
+
+**Local acceptance evidence** (harness `/tmp/t3/harness.py`,
+16/16 PASS): updater field lifecycle (no-success leaves the
+stamp null; success stamps it; a later failed check does not
+refresh it; reboot appears with the requesting package named
+in the reason; `reboot_required_since` is stamped once and
+carried, then cleared with the flag) and wizard rendering
+(stale check shows "last checked 9 days ago"; fresh says
+"today"; restart card shows "waiting 3 days"; no card when no
+reboot is pending; marker silences the card).
+
+**Rig acceptance (outstanding — rig blocked):** with a kernel
+update pending reboot on a guest, status.json says a restart
+is needed and the Dashboard shows the card and the check's
+age. Not run.

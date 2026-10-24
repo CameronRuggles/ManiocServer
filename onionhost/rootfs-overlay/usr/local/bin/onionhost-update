@@ -107,6 +107,11 @@ STATE_DIR = os.environ.get("ONIONHOST_UPDATE_STATE",
                            "/var/lib/onionhost/update")
 ARCHIVES = os.environ.get("ONIONHOST_APT_ARCHIVES",
                           "/var/cache/apt/archives")
+# The pending-reboot flag package scripts leave behind; the
+# Dashboard's restart card keys on the record this tool makes
+# of it (audit H2/M3, task T3).
+REBOOT_REQUIRED_PATH = os.environ.get(
+    "ONIONHOST_REBOOT_REQUIRED", "/run/reboot-required")
 # The managed set: the platform package ONLY (A26). The install /
 # rollback / fail-closed machinery below judges this set and
 # nothing else. Recipe packages are discovered separately and are
@@ -524,12 +529,83 @@ def health_ok_after_restart():
 # information, never as an error.
 OWNER_MAINTAINED = []
 
+# Set by main() once this run's repository check has succeeded;
+# write_status maintains last_successful_check from it (audit
+# M3): a run that could not reach the repository must not make
+# an old result look freshly checked.
+CHECK_SUCCEEDED = False
+
+
+def _reboot_state():
+    """(required, reason) for the pending-reboot record.
+
+    Sources: /run/reboot-required - the flag package scripts
+    write, whose sibling .pkgs file (and on some releases the
+    file itself) names what asked for the reboot - and
+    needrestart's batch report when the image carries it (a
+    running kernel older than the newest installed one means a
+    reboot is pending whether or not a package script flagged
+    it). Nothing here may raise: the record is written on every
+    status path, including failure paths."""
+    required = False
+    reasons = []
+    pkgs = []
+    for path in (REBOOT_REQUIRED_PATH,
+                 REBOOT_REQUIRED_PATH + ".pkgs"):
+        try:
+            with open(path) as f:
+                pkgs += [ln.strip() for ln in f if ln.strip()]
+            required = True
+        except OSError:
+            continue
+    if pkgs:
+        reasons.append("requested by "
+                       + ", ".join(sorted(set(pkgs))[:8]))
+    try:
+        import shutil
+        exe = shutil.which("needrestart")
+        if exe:
+            proc = subprocess.run(
+                [exe, "-b"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=30)
+            fields = {}
+            for line in proc.stdout.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    fields[k.strip()] = v.strip()
+            cur = fields.get("NEEDRESTART-KCUR")
+            exp = fields.get("NEEDRESTART-KEXP")
+            if cur and exp and cur != exp:
+                required = True
+                reasons.append("a newer kernel is installed "
+                               "than the one running")
+    except Exception:  # noqa: BLE001 - best-effort record
+        pass
+    return required, "; ".join(reasons)
+
 
 def write_status(state, detail, packages):
-    save_json(os.path.join(STATE_DIR, "status.json"),
+    status_path = os.path.join(STATE_DIR, "status.json")
+    prev = load_json(status_path, {})
+    reboot_required, reboot_reason = _reboot_state()
+    if reboot_required:
+        # The pending restart's age is measured from when this
+        # updater first recorded it, carried across runs.
+        since = prev.get("reboot_required_since") \
+            if prev.get("reboot_required") else None
+        if not since:
+            since = now()
+    else:
+        since = None
+    save_json(status_path,
               {"state": state, "detail": detail, "checked_at": now(),
                "packages": packages,
-               "owner_maintained": OWNER_MAINTAINED})
+               "owner_maintained": OWNER_MAINTAINED,
+               "reboot_required": reboot_required,
+               "reboot_reason": reboot_reason,
+               "reboot_required_since": since,
+               "last_successful_check": now() if CHECK_SUCCEEDED
+               else prev.get("last_successful_check")})
 
 
 def _installed_recipe(recipe_id):
@@ -609,6 +685,7 @@ def disk_floor_for(pkg):
 
 
 def main():
+    global CHECK_SUCCEEDED
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
     hw_path = os.path.join(STATE_DIR, "highwater.json")
@@ -678,6 +755,10 @@ def main():
                      "Your site is unaffected.", packages)
         log("fetch failed - updates pause, site untouched")
         return 3
+
+    # The repository check succeeded: status writes from here
+    # may advance last_successful_check (audit M3).
+    CHECK_SUCCEEDED = True
 
     # A26: observe recipe packages - never touch them. For each
     # recipe whose app is INSTALLED on this box (the applier's
