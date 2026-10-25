@@ -4,5 +4,13 @@ After=onionhost-nft-load.service
 Requires=onionhost-nft-load.service
 
 [Service]
+# F9 candidate hardening (Manioc review 2026-10-25) - RIG-VALIDATE BEFORE MERGE.
+# This checker was verified to use no /tmp paths and no privilege transitions;
+# its systemctl calls go to the system manager and are unaffected by these.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 Type=oneshot
 ExecStart=/usr/local/bin/onionhost-nft-gate-check
