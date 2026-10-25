@@ -62,13 +62,15 @@ your app is never touched by an update run, so it needs neither):
 One honest limit: a major Debian jump (13 → 14 someday) is not a
 background update. That ships as a guided project migration.
 
-One more honest limit, for now: the site containers themselves —
-the Tor gateway, the web server, and the software inside your app
-container — are not yet updated by this channel. They stay at the
-versions in the ISO you installed from. To refresh them today,
-back up your site, then reinstall from the current ISO. Delivering
-container updates through the same signed channel is planned;
-until it ships, a reinstall is the refresh path.
+The site containers themselves — the Tor gateway, the web
+server, and the software inside your app container — update
+through this same signed channel, as their own signed package.
+When a new set of container images arrives, the box checks every
+file against the signed manifest before loading anything, keeps
+the previous set on hand, and restarts the containers. The same
+health check and automatic rollback as a platform update decide
+whether the new set stays. A reinstall from the current ISO
+remains the fallback refresh path.
 
 ## 2. Your responsibilities — the whole list
 
