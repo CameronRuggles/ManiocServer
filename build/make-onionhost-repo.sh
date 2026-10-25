@@ -31,6 +31,15 @@ for deb in "$DEBDIR"/onionhost-recipe-*_*.deb; do
   mkdir -p "$OUTDIR/pool/main/o/$pkg"
   cp "$deb" "$OUTDIR/pool/main/o/$pkg/"
 done
+# The container-images package (review 2026-10-25, F2) publishes
+# the same way: its own pool directory, the same signing. It does
+# not match the onionhost_* glob above (hyphen, not underscore),
+# so without this block it would silently never reach the repo.
+for deb in "$DEBDIR"/onionhost-images_*.deb; do
+  [ -e "$deb" ] || continue
+  mkdir -p "$OUTDIR/pool/main/o/onionhost-images"
+  cp "$deb" "$OUTDIR/pool/main/o/onionhost-images/"
+done
 cd "$OUTDIR"
 apt-ftparchive packages pool > "$BIN/Packages"
 xz -kf "$BIN/Packages"

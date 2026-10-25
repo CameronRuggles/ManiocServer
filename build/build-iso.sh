@@ -432,6 +432,24 @@ mkdir -p "$ROOTFS/usr/lib/onionhost/images"
 cp "$IMG_TOR" "$ROOTFS/usr/lib/onionhost/images/onionhost-tor.tar"
 cp "$IMG_WEB" "$ROOTFS/usr/lib/onionhost/images/onionhost-web.tar"
 cp "$IMG_APP" "$ROOTFS/usr/lib/onionhost/images/onionhost-app.tar"
+# The images manifest (review 2026-10-25, F2): the identical
+# IMAGES-VERSION the onionhost-images package delivers (same
+# format, same content identity - see build-onionhost-images-deb.sh),
+# so a fresh install's import record starts at the version of the
+# images actually on this ISO and a later package delivery is
+# judged as the change it is, not as a first import.
+{
+  for t in onionhost-tor.tar onionhost-web.tar onionhost-app.tar; do
+    printf '%s: %s\n' "$t" \
+      "$(sha256sum "$ROOTFS/usr/lib/onionhost/images/$t" | awk '{print $1}')"
+  done
+} > "$ROOTFS/usr/lib/onionhost/images/.hashlines"
+_oh_img_combined=$(sha256sum "$ROOTFS/usr/lib/onionhost/images/.hashlines" | awk '{print $1}')
+{
+  printf 'version: img-%s\n' "${_oh_img_combined:0:12}"
+  cat "$ROOTFS/usr/lib/onionhost/images/.hashlines"
+} > "$ROOTFS/usr/lib/onionhost/images/IMAGES-VERSION"
+rm -f "$ROOTFS/usr/lib/onionhost/images/.hashlines"
 install -m 0755 "$WORK/cache/runsc" "$ROOTFS/usr/local/bin/runsc"
 chmod 0755 "$ROOTFS"/usr/local/bin/runsc-wrap \
            "$ROOTFS"/usr/local/bin/onionhost-generate-configs \
