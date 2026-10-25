@@ -62,7 +62,7 @@ Helper scripts the entry point drives (all under `build/`):
 
 | Endpoint | Used for |
 | --- | --- |
-| `https://snapshot.debian.org/archive/debian/20251011T143150Z` (the pinned snapshot; `SNAPSHOT` in `build-iso.sh`) | Every mmdebstrap tree (rootfs, container images, plugin-build chroot) and the Calamares source tarball from its `pool/main/c/calamares/` path. The chroot customisation phase's own `apt-get` calls also use this mirror, inherited from the mmdebstrap sources. |
+| `https://snapshot.debian.org/archive/debian/20261023T142942Z` (the pinned snapshot; `SNAPSHOT` in `build-iso.sh`) | Every mmdebstrap tree (rootfs, container images, plugin-build chroot) and the Calamares source tarball from its `pool/main/c/calamares/` path. The chroot customisation phase's own `apt-get` calls also use this mirror, inherited from the mmdebstrap sources. |
 | `https://storage.googleapis.com/gvisor/releases/release/20251006/x86_64/runsc` and the same URL + `.sha512` | The pinned gVisor `runsc` binary (`release-20251006.0`); its sha512 must equal the `RUNSC_SHA512_PIN` constant in `build-iso.sh`, not merely the served `.sha512`. |
 | The host's configured apt repositories (`apt-get update`) | Only when host build dependencies are missing (see above). |
 | `https://download.dokuwiki.org/src/dokuwiki/dokuwiki-2026-07-14c.tgz` | DokuWiki recipe archive (fetch step; skipped when the vendored archive already matches its pin). |
@@ -93,7 +93,7 @@ Every variable `build/build-iso.sh` and the scripts it drives
 | `OH_RECIPES` | `build-iso.sh`, `fetch-recipe-archives.sh` | Non-release recipe-selection override, e.g. `OH_RECIPES=wordpress,dokuwiki,gitea`. **FATAL unless `OH_NONRELEASE_BUILD=1` is also set.** See "Recipe ship list" below. |
 | `OH_NONRELEASE_BUILD` | `build-iso.sh`, `fetch-recipe-archives.sh` | Must be exactly `1` to permit an `OH_RECIPES` override. Any build with this set is bannered NON-RELEASE and stamped `release_status=non-release` in `BUILD-INFO`. |
 | `OH_OVERLAY` | `build-onionhost-deb.sh` (set by `build-iso.sh`) | The rootfs-overlay tree the platform package is built from. `build-iso.sh` sets it to `$SRC/rootfs-overlay` for its own call; standalone use defaults to a maintainer path. |
-| `SOURCE_DATE_EPOCH` | `build-iso.sh` | **Set by the script itself**, not an input: `build-iso.sh` exports the pinned value `1760193110` (2025-10-11T14:31:50Z, == the Debian snapshot) and passes it into the chroot build/customise phases, so two builds of one commit can be byte-identical. Inside the chroot script a fallback to the same constant applies. |
+| `SOURCE_DATE_EPOCH` | `build-iso.sh` | **Set by the script itself**, not an input: `build-iso.sh` exports the pinned value `1792765782` (2026-10-23T14:29:42Z, == the Debian snapshot) and passes it into the chroot build/customise phases, so two builds of one commit can be byte-identical. Inside the chroot script a fallback to the same constant applies. |
 
 Set internally / passed through phases (not builder inputs):
 `OH_FLAVOUR` (the chroot customise script's copy of `FLAVOUR`,

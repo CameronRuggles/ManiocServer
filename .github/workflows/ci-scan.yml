@@ -6,6 +6,12 @@ name: ci-scan
 on:
   push:
   pull_request:
+# Least privilege (review 2026-10-25, F6; Checkov CKV2_GHA_1): the
+# scan only reads the checked-out tree. Without an explicit block,
+# the GITHUB_TOKEN's permissions are whatever the repository
+# defaults allow.
+permissions:
+  contents: read
 jobs:
   ci-scan:
     runs-on: ubuntu-latest

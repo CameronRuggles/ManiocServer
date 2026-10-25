@@ -22,7 +22,11 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TREE = os.path.expanduser("~/workspace/onion-host-os")
+# Tree under test (review 2026-10-25, F7): derived from this file's
+# location, so the harness tests the checkout that contains it -
+# never a hardcoded home-directory path. MANIOC_TREE overrides.
+TREE = os.environ.get(
+    "MANIOC_TREE", os.path.abspath(os.path.join(HERE, "..", "..")))
 TOOL = os.path.join(
     TREE, "onionhost/rootfs-overlay/usr/local/bin/onionhost-recipe")
 UNIT = os.path.join(HERE, "unit")

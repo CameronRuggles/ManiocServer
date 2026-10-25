@@ -25,6 +25,7 @@ poc/*
 !poc/backup-proof/
 !poc/runsc-wrap/
 !poc/installer-policy/
+!poc/recipe-extract/
 
 # Security-audit working bulk (the audit reports at audit/*.md stay in)
 audit/iso/

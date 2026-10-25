@@ -508,6 +508,36 @@ def _extract_tree(archive_path, workdir, manifest):
     lower = archive_path.lower()
     if lower.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as z:
+            # Explicit member validation (review 2026-10-25, F4):
+            # the tar path below fails closed via filter="data",
+            # but the zip path relied on zipfile's implicit name
+            # sanitisation. Reject, before extracting anything:
+            # members whose target would escape dest, symlink /
+            # special-file entries (a staged tree must never gain
+            # a live symlink the later root-side tree walks could
+            # follow out of the sandbox), and archives whose total
+            # uncompressed size is absurd for a recipe payload
+            # (decompression-bomb backstop).
+            total = 0
+            for info in z.infolist():
+                target = os.path.realpath(
+                    os.path.join(dest, info.filename))
+                if target != os.path.realpath(dest) and \
+                        not target.startswith(
+                            os.path.realpath(dest) + os.sep):
+                    raise ValueError(
+                        "zip member escapes destination: %r"
+                        % info.filename)
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode and mode not in (0o100000, 0o040000):
+                    raise ValueError(
+                        "zip member is not a regular file or "
+                        "directory: %r" % info.filename)
+                total += info.file_size
+                if total > (1 << 31):
+                    raise ValueError(
+                        "zip archive uncompressed size exceeds "
+                        "2 GiB - refusing to extract")
             z.extractall(dest)
     elif lower.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar.bz2",
                          ".tar")):

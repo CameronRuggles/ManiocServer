@@ -422,7 +422,12 @@ fi
 
 # --- phase B0: onionhost overlay + assets -----------------------------------
 log "applying onionhost overlay from $SRC"
-rsync -a "$SRC/rootfs-overlay/" "$ROOTFS/"
+# __pycache__ is never image content (review 2026-10-25, F5): the
+# .deb builder already strips it, but this rsync did not - a build
+# tree in which anyone had imported the overlay's Python (the poc
+# harnesses do exactly that) would ship stale bytecode, including
+# compiled test-vector constants that read as secrets to scanners.
+rsync -a --exclude '__pycache__' "$SRC/rootfs-overlay/" "$ROOTFS/"
 mkdir -p "$ROOTFS/usr/lib/onionhost/images"
 cp "$IMG_TOR" "$ROOTFS/usr/lib/onionhost/images/onionhost-tor.tar"
 cp "$IMG_WEB" "$ROOTFS/usr/lib/onionhost/images/onionhost-web.tar"
@@ -479,7 +484,7 @@ done
 # holds module CONFIG files only. (Verified from the live session log:
 # modules placed in /etc/calamares/modules fail startup.)
 mkdir -p "$ROOTFS/usr/lib/calamares/modules"
-rsync -a "$SRC/calamares/modules/" "$ROOTFS/usr/lib/calamares/modules/"
+rsync -a --exclude '__pycache__' "$SRC/calamares/modules/" "$ROOTFS/usr/lib/calamares/modules/"
 # The compiled viewstep plugins come from $WORK (task 6), replacing
 # any stale copy the source tree might still carry.
 for m in onionhostphrase onionhostguard; do
@@ -626,7 +631,7 @@ else
   # day to SOURCE_DATE_EPOCH so the whole shadow entry is a
   # constant across builds.
   usermod -p '!' user
-  sed -i -r "s|^(user:!):[0-9]+:|\1:$(( ${SOURCE_DATE_EPOCH:-1760193110} / 86400 )):|" /etc/shadow
+  sed -i -r "s|^(user:!):[0-9]+:|\1:$(( ${SOURCE_DATE_EPOCH:-1792765782} / 86400 )):|" /etc/shadow
 fi
 # live session: LightDM autologin of "user" into XFCE. This is LIVE-ONLY
 # mechanics: the onionhostcleanup Calamares job strips the drop-in, the

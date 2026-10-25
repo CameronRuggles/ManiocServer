@@ -6,8 +6,13 @@ keys exist and how the partition data is structured, so the real
 onionhostbootkey module can be written against facts instead of
 assumptions. SECRET DISCIPLINE: it never writes secret VALUES to disk -
 for passphrase-like fields it records only presence, type and length.
-Output: /tmp/gsprobe.txt in the live session.
+Output: /tmp/gsprobe.txt in the live session. The file is created
+with O_EXCL|O_NOFOLLOW at mode 0600: a pre-planted symlink or file
+at that predictable path makes the probe fail loudly instead of
+writing through it (review 2026-10-25, finding F3).
 """
+import os
+
 import libcalamares
 
 
@@ -55,6 +60,9 @@ def run():
                 lines.append("  VALUE: %r" % _describe(gs.value(probe_key)))
             except Exception as e:
                 lines.append("  describe failed: %r" % e)
-    with open("/tmp/gsprobe.txt", "w") as f:
+    fd = os.open("/tmp/gsprobe.txt",
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines) + "\n")
     return None

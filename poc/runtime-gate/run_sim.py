@@ -19,10 +19,22 @@ import sys
 
 REPO = os.path.abspath(sys.argv[1])
 MODE = sys.argv[2] if len(sys.argv) > 2 else "all"
-GATE = os.path.join(REPO, "onionhost/rootfs-overlay/usr/local/bin/onionhost-runtime-gate")
-CHECK = os.path.join(REPO, "onionhost/rootfs-overlay/usr/local/bin/onionhost-runtime-gate-check")
 BIN = "/tmp/rgate/bin"
 BASE = "/tmp/rgate/work"
+# Self-stage the stub tools (review 2026-10-25, F7): BIN must hold
+# this harness's own podman/systemctl/logger stubs (poc/runtime-gate/
+# bin/). Previously nothing populated it, so a fresh run failed
+# nearly every case for an environmental reason that looked like a
+# product failure.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(BIN, exist_ok=True)
+for _stub in os.listdir(os.path.join(_HERE, "bin")):
+    _src = os.path.join(_HERE, "bin", _stub)
+    _dst = os.path.join(BIN, _stub)
+    shutil.copyfile(_src, _dst)
+    os.chmod(_dst, 0o755)
+GATE = os.path.join(REPO, "onionhost/rootfs-overlay/usr/local/bin/onionhost-runtime-gate")
+CHECK = os.path.join(REPO, "onionhost/rootfs-overlay/usr/local/bin/onionhost-runtime-gate-check")
 
 FAILS = []
 COUNT = {"n": 0}

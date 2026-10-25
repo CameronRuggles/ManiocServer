@@ -7065,7 +7065,7 @@ restated at the end.
    FIXED by relocation. The marker is now written by
    _save_state() into the recipe's state directory
    (STATE_ROOT/<id>/RECIPE-VERSION.txt, beside state.json),
-   so every state writer (tree apply, native apply, both
+   so every state writer (each apply mode, both
    rollbacks, the install hook) keeps it truthful and it
    never enters the served tree; the staging write is gone.
    Consumer check first: the only tracked-tree reference
@@ -7426,7 +7426,7 @@ the exposure itself stands reserved).
   boundary) and two pre-existing in poc/installer-policy/
   run_proofs.py (a five-word run across a line pair in the
   fake installer handler, and a three-word bracketed
-  segment "work control tag"). All three were REWORDED,
+  segment naming a scratch dir). All three were REWORDED,
   not allowlisted - the seed comment's closing sentence,
   a scratch-dir name ("control-" -> "ctl-"), and an
   equivalent comparison form - each verified against a

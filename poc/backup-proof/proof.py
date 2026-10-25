@@ -33,7 +33,14 @@ import sys
 import tarfile
 from collections import namedtuple
 
-TREE = os.path.expanduser("~/workspace/onion-host-os")
+# Tree under test (review 2026-10-25, F7): derived from this file's
+# location - poc/backup-proof/ lives two levels below the tree root -
+# so the harness always tests the checkout that contains it. The old
+# hardcoded ~/workspace/onion-host-os silently tested a DIFFERENT
+# checkout on any other machine (or clone). MANIOC_TREE overrides.
+HERE = os.path.dirname(os.path.abspath(__file__))
+TREE = os.environ.get(
+    "MANIOC_TREE", os.path.abspath(os.path.join(HERE, "..", "..")))
 LIB = os.path.join(TREE, "onionhost/rootfs-overlay/usr/lib/onionhost")
 sys.path.insert(0, LIB)
 import sitegen  # noqa: E402
@@ -49,7 +56,23 @@ bk = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bk)
 
 ROOT = "/tmp/backup-proof"
+# Self-stage the PATH shims (review 2026-10-25, F7): the age/systemctl
+# stubs live in this harness's own bin/ and must be the copies the
+# product code invokes; previously an operator had to copy them by
+# hand or the proof failed (or worse, used the host's real tools).
+os.makedirs(os.path.join(ROOT, "bin"), exist_ok=True)
+for _stub in os.listdir(os.path.join(HERE, "bin")):
+    _src = os.path.join(HERE, "bin", _stub)
+    _dst = os.path.join(ROOT, "bin", _stub)
+    shutil.copyfile(_src, _dst)
+    os.chmod(_dst, 0o755)
 os.environ["PATH"] = os.path.join(ROOT, "bin") + ":" + os.environ["PATH"]
+# onionhost-backup stages its work dir under /var/lib/onionhost
+# (hardcoded product path); make sure it exists on the proof host.
+try:
+    os.makedirs("/var/lib/onionhost", exist_ok=True)
+except OSError:
+    pass
 
 Pw = namedtuple("Pw", "pw_name pw_passwd pw_uid pw_gid pw_gecos "
                       "pw_dir pw_shell")
