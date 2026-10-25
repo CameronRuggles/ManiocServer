@@ -1,27 +1,203 @@
 #!/bin/sh
-# OnionHost image import: the ISO ships container rootfs tarballs under
-# /usr/lib/onionhost/images/ (built locally by the ISO build from signed
-# Debian packages - DESIGN-v3 A6: podman import, no registry is ever
-# contacted). This oneshot imports them into rootful Podman storage
-# once (marker file) so the Quadlet units can reference stable tags.
+# OnionHost image import: the container rootfs tarballs under
+# /usr/lib/onionhost/images/ (built locally by the ISO build from
+# signed Debian packages - DESIGN-v3 A6: podman import, no
+# registry is ever contacted) are imported into rootful Podman
+# storage under stable tags the Quadlet units reference.
+#
+# Versioned since the F2 fix (review 2026-10-25): the tarballs
+# also arrive as the signed onionhost-images package, and this
+# tool is what moves a delivered set into Podman. The delivered
+# IMAGES-VERSION manifest is the content identity of a set; the
+# import record (/var/lib/onionhost/images-imported-version) is
+# what this machine has actually loaded. When they differ:
+#
+#   1. the running images are tagged :rollback FIRST, and the
+#      current record's version is remembered as "previous";
+#   2. every tarball's sha256 is verified against the manifest -
+#      a mismatch FAILS CLOSED: nothing is loaded, nothing is
+#      restarted, the record is untouched;
+#   3. the tarballs are imported, the container units are
+#      restarted, and only then is the new version recorded.
+#
+# Whether the new set stays up is not this tool's judgement:
+# onionhost-update health-checks after an import it requested
+# and calls this tool's --rollback mode when the check fails.
+# --rollback re-points :latest at the :rollback tags, restarts
+# the units, and restores the previous version record. Rollback
+# depth is one set - the same single-step depth as the
+# platform package's rollback copy.
+#
+# First install: no record exists, so the delivered set is
+# imported and recorded, and nothing is restarted (at boot the
+# container units start after this service, on the tags it just
+# made). The pre-F2 once-marker (.images-imported) is migrated:
+# the ISO's images count as imported at the ISO manifest's
+# version, so the first packaged delivery is judged as the
+# change it is.
+#
+# Test seams (same names as the rest of the platform):
+#   ONIONHOST_PODMAN / ONIONHOST_SYSTEMCTL  tool binaries
+#   ONIONHOST_IMAGES_DIR                    tarball + manifest dir
+#   ONIONHOST_IMAGES_STATE_DIR              state dir (record)
 set -eu
-MARKER=/var/lib/onionhost/.images-imported
-IMGDIR=/usr/lib/onionhost/images
-if [ -f "$MARKER" ]; then
+PODMAN=${ONIONHOST_PODMAN:-podman}
+SYSTEMCTL=${ONIONHOST_SYSTEMCTL:-systemctl}
+IMGDIR=${ONIONHOST_IMAGES_DIR:-/usr/lib/onionhost/images}
+STATEDIR=${ONIONHOST_IMAGES_STATE_DIR:-/var/lib/onionhost}
+RECORD=$STATEDIR/images-imported-version
+OLD_MARKER=$STATEDIR/.images-imported
+MANIFEST=$IMGDIR/IMAGES-VERSION
+UNITS="onionhost-a.service onionhost-b.service onionhost-app.service onionhost-u.service"
+
+err() { echo "onionhost-import-images: $*" >&2; }
+
+# A manifest/record field: lines are "name: value".
+field() {
+    # field <file> <name>
+    [ -f "$1" ] || return 0
+    sed -n "s/^$2: //p" "$1" | head -n 1
+}
+
+delivered_version() { field "$MANIFEST" version; }
+recorded_version() { field "$RECORD" version; }
+recorded_previous() { field "$RECORD" previous; }
+
+write_record() {
+    # write_record <version> <previous> - tmp + rename, so a
+    # killed run never leaves a half-written record behind.
+    tmp=$RECORD.tmp
+    {
+        printf 'version: %s\n' "$1"
+        printf 'previous: %s\n' "$2"
+    } > "$tmp"
+    mv "$tmp" "$RECORD"
+}
+
+import_one() {
+    # import_one <tarball> <image> <cmd-json>
+    if [ -f "$IMGDIR/$1" ]; then
+        "$PODMAN" import --change "CMD $3" "$IMGDIR/$1" "$2"
+    fi
+}
+
+import_all() {
+    import_one onionhost-tor.tar localhost/onionhost-tor:latest \
+        '["tor","-f","/etc/tor/torrc"]'
+    import_one onionhost-web.tar localhost/onionhost-web:latest \
+        '["nginx","-c","/etc/nginx/nginx.conf","-g","daemon off;"]'
+    import_one onionhost-app.tar localhost/onionhost-app:latest \
+        '["/bin/sh","/etc/onionhost/app-init.sh"]'
+}
+
+verify_all() {
+    # Every tarball present and matching the manifest, or the
+    # whole set is refused. Only runs when a manifest exists.
+    for t in onionhost-tor.tar onionhost-web.tar onionhost-app.tar; do
+        want=$(field "$MANIFEST" "$t")
+        if [ -z "$want" ]; then
+            err "manifest $MANIFEST has no entry for $t - refusing the set"
+            return 1
+        fi
+        if [ ! -f "$IMGDIR/$t" ]; then
+            err "delivered tarball $IMGDIR/$t is missing - refusing the set"
+            return 1
+        fi
+        got=$(sha256sum "$IMGDIR/$t" | awk '{print $1}')
+        if [ "$got" != "$want" ]; then
+            err "$t sha256 $got != manifest $want - refusing the set (nothing loaded, nothing restarted)"
+            return 1
+        fi
+    done
+    return 0
+}
+
+tag_rollbacks() {
+    for img in localhost/onionhost-tor localhost/onionhost-web \
+               localhost/onionhost-app; do
+        if "$PODMAN" image exists "$img:latest"; then
+            "$PODMAN" tag "$img:latest" "$img:rollback"
+        fi
+    done
+}
+
+restart_units() {
+    # Deliberately one call with all four units (compare
+    # onionhost-update's stop path): the set changes together.
+    # shellcheck disable=SC2086
+    "$SYSTEMCTL" restart $UNITS
+}
+
+do_rollback() {
+    found=0
+    for img in localhost/onionhost-tor localhost/onionhost-web \
+               localhost/onionhost-app; do
+        if "$PODMAN" image exists "$img:rollback"; then
+            "$PODMAN" tag "$img:rollback" "$img:latest"
+            found=1
+        fi
+    done
+    if [ "$found" != 1 ]; then
+        err "no rollback images are recorded - nothing to roll back to"
+        exit 2
+    fi
+    restart_units
+    prev=$(recorded_previous)
+    if [ -n "$prev" ] && [ "$prev" != "-" ]; then
+        write_record "$prev" "-"
+    fi
+    echo "onionhost-import-images: rolled back to the previous image set"
+}
+
+case "${1:-}" in
+    --rollback) do_rollback; exit 0 ;;
+    "") ;;
+    *) err "usage: onionhost-import-images [--rollback]"; exit 2 ;;
+esac
+
+mkdir -p "$STATEDIR"
+delivered=$(delivered_version)
+
+if [ ! -f "$RECORD" ] && [ -f "$OLD_MARKER" ]; then
+    # Pre-F2 install: the ISO's images were imported once behind
+    # the old marker. Record them at the ISO manifest's version
+    # (or as pre-manifest when the ISO predates manifests) and
+    # retire the marker - from here the record is the truth.
+    write_record "${delivered:-pre-manifest}" "-"
+    rm -f "$OLD_MARKER"
+    echo "onionhost-import-images: migrated the pre-F2 import marker (recorded version ${delivered:-pre-manifest})"
+    if [ -z "$delivered" ]; then
+        exit 0
+    fi
+fi
+
+if [ ! -f "$RECORD" ]; then
+    # First import: load the delivered set and record it. No
+    # restarts - nothing is running on these tags yet.
+    if [ -f "$MANIFEST" ]; then
+        verify_all || exit 2
+    fi
+    import_all
+    write_record "${delivered:-pre-manifest}" "-"
+    echo "onionhost-import-images: imported image set ${delivered:-pre-manifest}"
     exit 0
 fi
-mkdir -p /var/lib/onionhost
-if [ -f "$IMGDIR/onionhost-tor.tar" ]; then
-    podman import --change 'CMD ["tor","-f","/etc/tor/torrc"]' \
-        "$IMGDIR/onionhost-tor.tar" localhost/onionhost-tor:latest
+
+imported=$(recorded_version)
+if [ -z "$delivered" ]; then
+    err "no delivered manifest at $MANIFEST - cannot judge the on-disk set against the imported $imported; refusing"
+    exit 2
 fi
-if [ -f "$IMGDIR/onionhost-web.tar" ]; then
-    podman import --change 'CMD ["nginx","-c","/etc/nginx/nginx.conf","-g","daemon off;"]' \
-        "$IMGDIR/onionhost-web.tar" localhost/onionhost-web:latest
+if [ "$delivered" = "$imported" ]; then
+    exit 0
 fi
-if [ -f "$IMGDIR/onionhost-app.tar" ]; then
-    podman import --change 'CMD ["/bin/sh","/etc/onionhost/app-init.sh"]' \
-        "$IMGDIR/onionhost-app.tar" localhost/onionhost-app:latest
-fi
-touch "$MARKER"
-echo "onionhost-import-images: done"
+
+# A new set was delivered. Rollback tags first (so even a failed
+# verification leaves a named copy of what is running), then
+# verify, then load, then restart, then - only then - record.
+tag_rollbacks
+verify_all || exit 2
+import_all
+restart_units
+write_record "$delivered" "$imported"
+echo "onionhost-import-images: imported image set $delivered (previous $imported kept as :rollback)"
