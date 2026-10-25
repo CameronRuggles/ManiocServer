@@ -545,8 +545,12 @@ def _reboot_state():
     needrestart's batch report when the image carries it (a
     running kernel older than the newest installed one means a
     reboot is pending whether or not a package script flagged
-    it). Nothing here may raise: the record is written on every
-    status path, including failure paths."""
+    it). The shipped image carries no needrestart and Debian
+    kernel packages do not write the flag file, so when neither
+    source fires, the running release is compared against the
+    installed kernels directly (one /lib/modules directory per
+    installed kernel). Nothing here may raise: the record is
+    written on every status path, including failure paths."""
     required = False
     reasons = []
     pkgs = []
@@ -581,6 +585,27 @@ def _reboot_state():
                                "than the one running")
     except Exception:  # noqa: BLE001 - best-effort record
         pass
+    if not required:
+        try:
+            modules_dir = os.environ.get(
+                "ONIONHOST_MODULES_DIR", "/lib/modules")
+            running = os.environ.get(
+                "ONIONHOST_RUNNING_RELEASE", os.uname().release)
+
+            def _vkey(rel):
+                head = rel.split("+")[0].split("-")[0]
+                return tuple(int(p) for p in head.split(".")
+                             if p.isdigit())
+
+            installed = [d for d in os.listdir(modules_dir)
+                         if d[:1].isdigit()]
+            if installed and _vkey(max(installed, key=_vkey)) \
+                    > _vkey(running):
+                required = True
+                reasons.append("a newer kernel is installed "
+                               "than the one running")
+        except Exception:  # noqa: BLE001 - best-effort record
+            pass
     return required, "; ".join(reasons)
 
 
