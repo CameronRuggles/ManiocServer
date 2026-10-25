@@ -261,3 +261,48 @@ question about the published artifact; the M5 code fix itself
 remains an uncommissioned audit task (T-series scope-out).
 Rig checklist items still outstanding: B0, R1, T1/T3/T8 rig-side
 acceptance, regression rows R-27/R-31.
+
+## Addendum 2026-10-24 (main session) — B0, R1, T8 rig results
+
+Method: the five fixed files from this branch (onionhost-update,
+onionhost-app-provision, onionhost-generate-configs,
+onionhost-recipe, wizard.py) were staged onto the proof guest via
+the 9p share and installed over the pre-fix copies; installed
+sha256s match the branch files exactly; originals preserved in
+the guest at /root/prefix-backup/. Guest driven through its root
+file-agent on the share; demo guest untouched throughout.
+
+B0 baseline (pre-fix guest, captured before the fix install):
+- apt simulation: linux-image-amd64 KEPT BACK, 17 packages
+  upgradable — the H2 condition live on a real install.
+- podman images: onionhost-tor/-web/-app all present; a re-run
+  of onionhost-import-images exited 0 and the image ID set was
+  byte-identical before/after (the H1 no-op behaviour).
+- Install user `owner` is in group sudo; `sudo -l` shows
+  (ALL : ALL) ALL plus the NOPASSWD wizard-helper rule — the H3
+  baseline state (T7 itself remains parked on Fork B).
+- No status.json existed before the fixed updater's first run.
+
+R1 VERDICT: gVisor's gofer DOES let the app plant symlinks.
+From inside the running app container, two symlinks planted in
+the shared appdata www (to /root/canary-test and to /etc) were
+created successfully and were immediately visible on the host
+with app-mapped ownership. The H4 plant route is real, so T8's
+host-side no-follow enforcement is the load-bearing mitigation.
+Plants removed after recording.
+
+T8 RIG ACCEPTANCE: PASS. With appdata/www replaced by a symlink
+to a root-owned canary directory, the fixed
+`onionhost-app-provision --user owner --runtime native --db
+postgres` refused — "app-provision: refused: [Errno 20] Not a
+directory: '/var/lib/onionhost/appdata/www'", exit 1 (fails
+closed) — and the canary was untouched (root:root 700/644, marker
+only). The same run performed the first-publish migration:
+appdata re-rooted from app-mapped ownership to 0:0 0755. www was
+restored afterwards; all three containers remained up.
+
+In flight at this addendum: the fixed onionhost-update run
+(kernel pending at start: running 6.12.107+deb13, meta
+6.12.107-1) — T1 acceptance, T3 status.json evidence, and the
+brief's update happy-path regression row ride on it; the
+unlock-once regression row follows on the post-update reboot.
