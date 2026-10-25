@@ -81,6 +81,24 @@ below, so the generic upgrade cannot fire a recipe postinst
 behind this tool's back (and the A26 postinst gate refuses to
 re-apply over an installed app even if one is upgraded by hand).
 
+Container images (review 2026-10-25, F2): the onionhost-images
+package rides the same signed repository, but apt installing it
+only lays new rootfs tarballs on disk - the running containers
+change when onionhost-import-images loads them. A dedicated
+phase after the platform phase bridges the two: when the
+repository offers a different images package it is installed
+(the same high-water refusal applies), the importer runs, and
+the SAME health judgement as the platform phase decides - the
+importer's :rollback tags are the way back, exit 4 when that
+rollback is healthy, fail-closed (5) when it is not. The change
+test is content, not version arithmetic: the manifest the
+package delivered vs the importer's record of what is loaded.
+The images package is held across the Debian phase like the
+recipes, so the generic upgrade can never install it behind
+this phase's back. Images carry no security floor and never
+enter the fail-closed marker's package record - the marker
+stays the platform package's, as it always was.
+
 Debian base packages ride the same run (same apt invocation config,
 same timing): apt-get upgrade after the managed packages, best
 effort - a Debian failure is logged but never blocks or rolls back
@@ -113,6 +131,16 @@ ARCHIVES = os.environ.get("ONIONHOST_APT_ARCHIVES",
 # observe-only - see _recipe_packages() and the header's A26 rules.
 PLATFORM_PACKAGE = "onionhost"
 MANAGED = [PLATFORM_PACKAGE]
+# The container-images package (F2): judged by its own phase
+# after the platform loop, never by the MANAGED machinery - its
+# rollback lives in Podman tags, not in a saved .deb.
+IMAGES_PACKAGE = "onionhost-images"
+IMAGES_CMD = os.environ.get("ONIONHOST_IMAGES_CMD",
+                            "/usr/local/bin/onionhost-import-images")
+IMAGES_MANIFEST = os.environ.get(
+    "ONIONHOST_IMAGES_MANIFEST", "/usr/lib/onionhost/images/IMAGES-VERSION")
+IMAGES_RECORD = os.environ.get(
+    "ONIONHOST_IMAGES_RECORD", "/var/lib/onionhost/images-imported-version")
 
 
 def _recipe_packages():
@@ -142,8 +170,10 @@ RECIPE_PKGS = _recipe_packages()
 # covers recipe packages too, so a hold leaked by a killed run
 # (or by a pre-A26 updater, which held them as managed packages)
 # cannot wedge anything, and the Debian phase never upgrades
-# them behind the managed phase's back.
-ALL_KNOWN = MANAGED + RECIPE_PKGS
+# them behind the managed phase's back. The images package is
+# in the set for the same reason: the Debian phase must never
+# install it behind the images phase's back.
+ALL_KNOWN = MANAGED + [IMAGES_PACKAGE] + RECIPE_PKGS
 # The applier's state root and the payload root (manifest names),
 # with the same env override names onionhost-recipe uses.
 RECIPE_STATE_ROOT = os.environ.get("ONIONHOST_RECIPE_STATE",
@@ -321,6 +351,30 @@ def repo_best_version(pkg):
         if best is None or dpkg_compare(v, "gt", best):
             best = v
     return best
+
+
+def _version_field(path):
+    """The "version: X" line of an images manifest or import
+    record (both are "name: value" text), or None."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("version:"):
+                    return line.split(":", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def _run_images_importer(*args):
+    """Run onionhost-import-images argv-form (the F-P1-1
+    discipline the health probe follows): the env override names
+    the command, it is split to a fixed argv, never a shell."""
+    argv = shlex.split(IMAGES_CMD) + list(args)
+    if not argv:
+        log("images: no importer command configured")
+        return 2
+    return run(argv, timeout=1200)
 
 
 def load_json(path, default):
@@ -643,6 +697,14 @@ def main():
             floors[pkg] = disk_floor
         packages[pkg] = {"installed": inst}
 
+    # Images baseline (F2): the high-water mark starts at the
+    # installed package, exactly as the platform's does. No floor
+    # is read: images carry none.
+    img_base = installed_version(IMAGES_PACKAGE)
+    if img_base and IMAGES_PACKAGE not in highwater:
+        highwater[IMAGES_PACKAGE] = img_base
+    packages[IMAGES_PACKAGE] = {"installed": img_base}
+
     # A26 observation baseline: recipe packages are recorded for
     # the Dashboard record only. No high-water mark is seeded and
     # no floor is read for them: nothing about a recipe package
@@ -914,6 +976,123 @@ def main():
             "update is available.", packages)
         write_marker(packages, floors)
         return 5
+
+    # Container images phase (F2). The platform loop above has
+    # settled the platform package; this phase does the same
+    # job for the running containers' software, whose delivery
+    # is a package but whose activation is an import.
+    img_inst = installed_version(IMAGES_PACKAGE)
+    img_cand = repo_best_version(IMAGES_PACKAGE)
+    packages[IMAGES_PACKAGE] = {"installed": img_inst,
+                                "candidate": img_cand,
+                                "highwater": highwater.get(IMAGES_PACKAGE)}
+    img_mark = highwater.get(IMAGES_PACKAGE)
+    if img_cand is not None and img_mark and \
+            dpkg_compare(img_cand, "lt", img_mark):
+        log("REFUSED %s: repository's best version %s is below "
+            "the high-water mark %s - a replayed or rolled-back "
+            "repository cannot downgrade this machine"
+            % (IMAGES_PACKAGE, img_cand, img_mark))
+        write_status("refused-downgrade",
+                     "An out-of-date update source was refused.",
+                     packages)
+        worst = max(worst, 2)
+    elif img_cand is not None and img_cand != img_inst:
+        log("installing %s %s -> %s" % (IMAGES_PACKAGE, img_inst,
+                                        img_cand))
+        if run(["apt-get", "install", "-y"] + DPKG_OPTS +
+               [IMAGES_PACKAGE], timeout=1800) != 0:
+            # Nothing was imported and nothing restarted: the
+            # site is still serving the previous image set.
+            log("%s: package install failed - the running "
+                "containers are untouched" % IMAGES_PACKAGE)
+            write_status(
+                "update-failed",
+                "A container software update could not be "
+                "installed. Your site is running the previous "
+                "version.", packages)
+            worst = max(worst, 4)
+        else:
+            img_inst = installed_version(IMAGES_PACKAGE)
+            packages[IMAGES_PACKAGE].update({"installed": img_inst})
+    # Judge by content, not by what apt just did: the manifest
+    # on disk against the importer's record of what is loaded.
+    # (A package whose tarballs are unchanged - a rebuild -
+    # delivers the manifest already recorded and ends here.)
+    delivered = _version_field(IMAGES_MANIFEST)
+    imported = _version_field(IMAGES_RECORD)
+    if delivered and not imported:
+        # No import record: a fresh install whose boot-time
+        # import has not run yet, or a pre-F2 box whose first
+        # boot under the new platform is still ahead. First
+        # import is the images service's job at boot; this tool
+        # does not race it.
+        log("container images: delivered %s, no import record "
+            "yet - first import belongs to the boot service"
+            % delivered)
+    elif delivered and imported and delivered != imported:
+        log("container images: delivered %s, imported %s - "
+            "importing" % (delivered, imported))
+        # R-13, same as the platform install path: the settle
+        # sits before the importer's restart, so the onion's
+        # republication lands at a drawn time, and the
+        # judgement is then plain health_ok().
+        _sleep_settle("pre-restart settle, drawn per install")
+        if _run_images_importer() != 0:
+            # The importer refused (a tarball failed its
+            # manifest hash) or failed before restarting
+            # anything: the previous set is still what serves.
+            log("container images: the importer refused or "
+                "failed - the previous image set still serves")
+            write_status(
+                "update-failed",
+                "A container software update could not be "
+                "applied. Your site is running the previous "
+                "version.", packages)
+            worst = max(worst, 4)
+        elif health_ok():
+            if img_inst:
+                highwater[IMAGES_PACKAGE] = img_inst
+                save_json(hw_path, highwater)
+                packages[IMAGES_PACKAGE].update(
+                    {"highwater": img_inst})
+            packages[IMAGES_PACKAGE].update({"images": delivered})
+            log("container images: updated to %s and healthy"
+                % delivered)
+            recovering = False  # a healthy import IS a recovery
+            write_status("updated",
+                         "Updated container software to %s."
+                         % delivered, packages)
+            clear_marker()
+        else:
+            log("container images: update to %s FAILED its "
+                "health check - rolling back" % delivered)
+            if _run_images_importer("--rollback") == 0 and \
+                    health_ok_after_restart():
+                packages[IMAGES_PACKAGE].update(
+                    {"images": imported})
+                recovering = False  # healthy rollback is a recovery
+                write_status(
+                    "update-failed",
+                    "An update did not work and was undone. Your "
+                    "site is running the previous version.",
+                    packages)
+                clear_marker()
+                worst = max(worst, 4)
+            else:
+                log("container images: rollback to %s is ALSO "
+                    "unhealthy - failing closed" % imported)
+                stop_gateway()
+                stackctl("stop")
+                write_status(
+                    "fail-closed",
+                    "An update could not be applied safely, so "
+                    "your site was turned off rather than left "
+                    "running out-of-date software. It will come "
+                    "back automatically when a fixed update is "
+                    "available.", packages)
+                write_marker(packages, floors)
+                return 5
 
     # Debian base packages: same Tor path, same run, best effort -
     # a Debian mirror failure is logged and changes nothing about
