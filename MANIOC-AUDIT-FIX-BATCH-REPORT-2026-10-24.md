@@ -306,3 +306,63 @@ In flight at this addendum: the fixed onionhost-update run
 6.12.107-1) — T1 acceptance, T3 status.json evidence, and the
 brief's update happy-path regression row ride on it; the
 unlock-once regression row follows on the post-update reboot.
+
+---
+
+# ADDENDUM 3 - RIG ACCEPTANCE (2026-10-24 evening, proof guest)
+
+Executed from the main session (the coordinator's session had been
+denied SSH egress; the main session reaches the rig). All rows run
+against guest manioc-proof with the batch's five fixed files
+installed (sha256-verified against the branch).
+
+- B0 baseline (pre-fix state captured first): linux-image-amd64
+  KEPT BACK + 17 upgradable (H2 live); install user in sudo with
+  (ALL: ALL) ALL (H3 baseline); image import re-run a byte-
+  identical no-op (H1); no status.json existed.
+- R1 VERDICT: the gofer DOES let the app plant symlinks in
+  appdata (links to /root/canary-test and /etc created from inside
+  the container, host-visible, app-owned). H4's plant route is
+  real; T8's host-side enforcement is the load-bearing fix.
+- T8 RIG ACCEPTANCE: PASS. With appdata/www replaced by a symlink
+  to a root-owned canary, the fixed app-provision REFUSED (exit 1,
+  fails closed); canary untouched. First-publish migration re-
+  rooted appdata to 0:0 0755 in the same run; containers healthy.
+- R2 VERDICT: the published ISO is CLEAN of M5. Every cache
+  artifact timestamps inside the release build window; the image
+  tarballs extracted from the ISO itself hash-match the build
+  cache; BUILD-INFO at all three levels records the refreshed
+  snapshot 20261023T142942Z. The code defect is real; this build
+  did not hit it.
+- T1 RIG ACCEPTANCE: PASS. One run of the fixed updater: fetch
+  over Tor, download-only split with --with-new-pkgs, then the
+  install with no timeout kill. linux-image-6.12.113+deb13-amd64
+  installed, meta-package advanced 6.12.107-1 -> 6.12.113-1, a
+  fresh simulation shows 0 kept back. Exit 0. This run is also
+  the brief's update happy-path regression row: recipes held as
+  owner_maintained throughout (A26 intact), platform current.
+- T3: status.json created with the new fields - and the first
+  run recorded reboot_required=false with a kernel pending. ROOT
+  CAUSE FOUND ON THE RIG: Debian kernel packages never write
+  /run/reboot-required and the shipped image carries no
+  needrestart, so both original sources are dark on real
+  installs. AMENDMENT (commit after addendum 2's branch state):
+  _reboot_state() gains the fallback its docstring promised -
+  running release vs installed kernels via /lib/modules;
+  7/7 standalone tests pass (poc/scripts/t3-reboot-
+  state-test.py). RE-VERIFIED ON THE GUEST: the amended updater's
+  run recorded reboot_required=true, reason "a newer kernel is
+  installed than the one running", since set. T3 PASS as amended.
+- UNLOCK-ONCE REGRESSION ROW: PASS. Guest rebooted; the early-
+  boot prompt appeared exactly once ("Enter passphrase for
+  hd0,gpt2"); one entry carried the boot to the graphical login;
+  the owner session's Dashboard then showed the site up and
+  reachable, software up to date (last checked today), and the
+  restart card standing from the pre-reboot record - the
+  designed behaviour; it clears on the next check after the
+  restart it asked for.
+
+The executed scope of the brief (B0/T1/T3/T8 + R1/R2) is now
+rig-verified end to end. T5/T7/T18 remain parked on Fork A,
+Fork B, and the owner's hardware-key step. Closure of the
+findings themselves remains the external auditor's call.
