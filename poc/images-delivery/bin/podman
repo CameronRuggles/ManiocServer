@@ -1,0 +1,27 @@
+#!/bin/bash
+# Stub podman for the images-delivery suite. The store is
+# $PODMAN_STUB_DIR: one file per image ref (ref with / and :
+# flattened to _), whose content is the image's fake id - for
+# an import, the tarball's first line. Every invocation is
+# appended to $PODMAN_LOG verbatim so the suite can assert
+# call order (rollback tags BEFORE imports, and so on).
+D=${PODMAN_STUB_DIR:?}
+LOG=${PODMAN_LOG:?}
+echo "$*" >> "$LOG"
+flat() { printf '%s' "$1" | tr '/:' '__'; }
+if [ "$1" = "image" ] && [ "$2" = "exists" ]; then
+  [ -e "$D/$(flat "$3")" ] && exit 0
+  exit 1
+fi
+if [ "$1" = "tag" ]; then
+  src=$D/$(flat "$2"); dst=$D/$(flat "$3")
+  [ -e "$src" ] || { echo "stub podman: no such image $2" >&2; exit 1; }
+  cp "$src" "$dst"; exit 0
+fi
+if [ "$1" = "import" ]; then
+  # argv: import --change <json> <file> <ref>
+  eval "file=\${$(( $# - 1 ))}"; eval "ref=\${$#}"
+  [ -f "$file" ] || { echo "stub podman: no such file $file" >&2; exit 1; }
+  head -n 1 "$file" > "$D/$(flat "$ref")"; exit 0
+fi
+echo "stub podman: unhandled $*" >&2; exit 125

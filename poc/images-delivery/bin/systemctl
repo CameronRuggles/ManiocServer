@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stub systemctl for the images-delivery suite: records every
+# invocation to $SYSTEMCTL_LOG and succeeds.
+echo "$*" >> "${SYSTEMCTL_LOG:?}"
+exit 0
