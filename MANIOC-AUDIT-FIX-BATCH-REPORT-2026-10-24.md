@@ -231,3 +231,33 @@ mechanism of assertions whose end-state values (owners, modes,
 ACL contents) are byte-for-byte the ones the pre-fix code
 produced on legitimate trees — pinned by the harnesses'
 happy-path assertions.
+
+## Addendum 2026-10-24 (main session) — R2 verdict: NOT STALE
+
+R2 executed from the main session (the coordinator session's SSH
+egress was denied; this session's is not). Evidence, all gathered
+2026-10-24 against rig $WORK=/home/rig/iso-build-release:
+
+- Rig ISO sha256 f6a5cc331bcfcbee08b1e28e957501e4b49d79b3e73ad32026e33ff19dea1bff
+  — identical to the published ISO verified live at publishing.
+- Every cache artifact in $WORK/cache is timestamped inside the
+  release build window (2026-10-23 19:47–20:17 UTC), i.e. after
+  the pin-refresh commit: runsc 19:48, tor tar 20:02, web tar
+  20:02, app tar 20:04. The per-image build logs (img-tor,
+  img-web, img-app, mmdebstrap) are likewise in-window: the
+  images were built in this run, not carried from an old-pin build.
+- The three image tarballs extracted from the ISO's own squashfs
+  (usr/lib/onionhost/images/) hash-match the $WORK cache tarballs
+  exactly: app 492670e6b1b9668471b16f70cbcb229d9bd7f46ff71e730952e3105bb76f8565,
+  tor 4adff7465ab6b97c0585568faaea8c70c0f69449018e1ed1d82f2f590d34095d,
+  web 89125a9f646b26600013ea248306d9aea3f7f875ca4c234a76dff677f3e89699.
+- BUILD-INFO at workdir, image, and assembled iso-tree level all
+  record snapshot=20261023T142942Z, epoch 1792765782.
+
+Conclusion: the M5 filename-keyed-cache defect is real in code,
+but it did NOT touch the published ISO — this build's caches were
+populated during the run at the refreshed pin. R2 is closed as a
+question about the published artifact; the M5 code fix itself
+remains an uncommissioned audit task (T-series scope-out).
+Rig checklist items still outstanding: B0, R1, T1/T3/T8 rig-side
+acceptance, regression rows R-27/R-31.
