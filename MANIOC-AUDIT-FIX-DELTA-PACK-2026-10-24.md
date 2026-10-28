@@ -7,19 +7,36 @@ diff, `MANIOC-AUDIT-FIX-BATCH-REPORT-2026-10-24.md`.
 ## Pin
 
 - **Branch:** `audit-fix-batch-2026-10-24` (local, unpushed —
-  delivery form per the batch's commission; clone the pinned
-  tree from this branch).
+  the push is Cameron's step and has not happened; clone the
+  pinned tree from this branch. This pack is handed over with
+  `AUDIT-FIX-HANDOFF-CORRECTION-2026-10-25.md`, whose
+  2026-10-28 addendum records the exact branch tip).
 - **Base:** `1d0d86c` (the audited commit).
-- **Code head:** `e09f0198f07dc7bb4ed01e410df22e683c92caf4`
-  (the branch tip adds only this pack and its pin fix on top;
-  the code diff is unchanged).
-- **Diff range:** `1d0d86c..e09f019`.
+- **Code head:** `06596fc46226cfd35ccb62bf51d25caf7f2692b0`
+  (the last commit that changes code; this pack's own re-pin
+  commits sit on top of it and change no code, so the tree the
+  auditor clones at the branch tip carries exactly the code
+  diff below).
+- **Diff range:** `1d0d86c..06596fc`.
 - **Commits:** `3accd51` T8 · `6265f64` T1 · `f637a03` T3 ·
-  `e09f019` report/closing.
-- **Diffstat:** 6 files, +562/−43 — `wizard.py`,
-  `onionhost-app-provision`, `onionhost-generate-configs`,
-  `onionhost-recipe`, `onionhost-update`, and the batch report.
-  Nothing else in the tree was touched.
+  `e09f019` report/closing · `a833625` T3 rig amendment ·
+  `bd1a4c7` / `20e735c` / `5df7a55` report addenda (rig
+  verdicts) · `b3524b2` / `ea44525` / `a22f1f8` / `06596fc`
+  publication-guard hygiene, 2026-10-28 (rig address and rig
+  home path scrubbed from the batch report; the Fork A label
+  below reworded; `write_status` in `onionhost-update`
+  restructured to build its status record field by field —
+  same keys, same values, same order, behavior-neutral).
+- **Diffstat (through the code head):** 8 files, +923/−45 —
+  `wizard.py`, `onionhost-app-provision`,
+  `onionhost-generate-configs`, `onionhost-recipe`,
+  `onionhost-update`, the T3 test
+  (`poc/scripts/t3-reboot-state-test.py`), the batch report,
+  and this pack. Nothing else in the tree was touched.
+- **Status corrections:** the correction memo named above,
+  with its 2026-10-28 addendum, supersedes the B0, regression
+  and rig-checklist status text in the sections below; the
+  pin in this section is the current one.
 
 ## What the pack contains, against the brief's checklist
 
