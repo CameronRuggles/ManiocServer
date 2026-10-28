@@ -622,15 +622,19 @@ def write_status(state, detail, packages):
             since = now()
     else:
         since = None
-    save_json(status_path,
-              {"state": state, "detail": detail, "checked_at": now(),
-               "packages": packages,
-               "owner_maintained": OWNER_MAINTAINED,
-               "reboot_required": reboot_required,
-               "reboot_reason": reboot_reason,
-               "reboot_required_since": since,
-               "last_successful_check": now() if CHECK_SUCCEEDED
-               else prev.get("last_successful_check")})
+    status = {}
+    status["state"] = state
+    status["detail"] = detail
+    status["checked_at"] = now()
+    status["packages"] = packages
+    status["owner_maintained"] = OWNER_MAINTAINED
+    status["reboot_required"] = reboot_required
+    status["reboot_reason"] = reboot_reason
+    status["reboot_required_since"] = since
+    status["last_successful_check"] = (
+        now() if CHECK_SUCCEEDED
+        else prev.get("last_successful_check"))
+    save_json(status_path, status)
 
 
 def _installed_recipe(recipe_id):
