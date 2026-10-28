@@ -1,5 +1,13 @@
 # Manioc external-audit fix batch — report (2026-10-24)
 
+**Correction note (2026-10-28, hygiene pass).** Two operational details
+in the original text have been scrubbed for publication, at the direction
+of the project's publication guard (build/ci-scan.sh): the rig host's
+public IP address (one occurrence, in "Rig access" below) and the rig
+account's home-directory path (one occurrence, in the R2 addendum) are
+replaced with neutral descriptions. Nothing else in this report was
+altered; the rig evidence and verdicts stand as recorded.
+
 **Pin / branch.** `main` @ `1d0d86c`; work on branch
 `audit-fix-batch-2026-10-24` (local only, not pushed). Brief:
 `MANIOC-AUDIT-FIX-BRIEF-2026-10-23.md`. Audit:
@@ -12,7 +20,9 @@ brief's §6 list were not touched.
 ## Rig access — BLOCKED (evidenced)
 
 Every rig item (B0 guest captures, R1, R2, and the rig-side acceptance
-checks for T1/T3/T8) needs SSH to `rig@34.185.89.126`. In this session
+checks for T1/T3/T8) needs SSH to the rig host at its public IP
+address (withheld from this public copy — see the correction note
+below). In this session
 raw SSH egress is denied by the sandbox harness on every attempt
 (four attempts, 2026-10-24): the connection is reset by the egress
 proxy (`198.19.0.1:3128`) and each attempt is flagged
@@ -236,7 +246,7 @@ happy-path assertions.
 
 R2 executed from the main session (the coordinator session's SSH
 egress was denied; this session's is not). Evidence, all gathered
-2026-10-24 against rig $WORK=/home/rig/iso-build-release:
+2026-10-24 against the rig, in its iso-build-release work directory:
 
 - Rig ISO sha256 f6a5cc331bcfcbee08b1e28e957501e4b49d79b3e73ad32026e33ff19dea1bff
   — identical to the published ISO verified live at publishing.
