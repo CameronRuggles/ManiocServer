@@ -60,7 +60,7 @@ diff, `MANIOC-AUDIT-FIX-BATCH-REPORT-2026-10-24.md`.
   ACL. Verified in the local harness (migration + ACL grant
   asserted); the rig-booted confirmation is outstanding
   with B0.
-- **Fork rulings:** Fork A (image delivery shape) and Fork B
+- **Fork rulings:** Fork A (the F2 image channel) and Fork B
   (owner root) were NOT ruled on for this batch; T5 and T7
   are therefore absent from the diff, as is T18 (maintainer
   hardware step — Cameron's). The brief's delta gate applies
