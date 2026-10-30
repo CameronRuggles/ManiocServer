@@ -265,6 +265,9 @@ def _load_manifest(recipe_id):
     path = os.path.join(PAYLOAD_ROOT, recipe_id, "manifest.json")
     with open(path) as f:
         manifest = json.load(f)
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest for recipe %s is not a JSON "
+                         "object" % recipe_id)
     if manifest.get("id") != recipe_id:
         raise ValueError("manifest id %r does not match %r"
                          % (manifest.get("id"), recipe_id))
@@ -279,9 +282,10 @@ def _state_path(recipe_id):
 def _load_state(recipe_id):
     try:
         with open(_state_path(recipe_id)) as f:
-            return json.load(f)
+            state = json.load(f)
     except (OSError, ValueError):
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def _save_state(recipe_id, state):
@@ -375,6 +379,10 @@ def _debver_cmp(a, b):
     for this: it runs in minimal contexts where no dpkg binary
     exists (proven by the D8 proof machine), and the A26 floor
     check must work there too."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        raise ValueError("version values must be strings: "
+                         "%r, %r" % (a, b))
+
     def parse(v):
         epoch = 0
         if ":" in v:
@@ -410,6 +418,8 @@ def _check_install_floor(recipe_id, manifest, payload_dir):
         with open(os.path.join(payload_dir, "floor.json")) as f:
             floors = json.load(f)
     except (OSError, ValueError):
+        return None
+    if not isinstance(floors, dict):
         return None
     floor = floors.get("onionhost-recipe-" + recipe_id)
     if not floor:
