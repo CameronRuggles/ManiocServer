@@ -361,7 +361,7 @@ def _version_field(path):
             for line in f:
                 if line.startswith("version:"):
                     return line.split(":", 1)[1].strip() or None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
     return None
 
@@ -599,6 +599,8 @@ def _installed_recipe(recipe_id):
     version - the app is still installed."""
     state = load_json(os.path.join(RECIPE_STATE_ROOT, recipe_id,
                                    "state.json"), {})
+    if not isinstance(state, dict):
+        return None
     if state.get("installed") and state.get("version"):
         return state
     return None
@@ -610,6 +612,8 @@ def _recipe_app_name(recipe_id):
     manifest = load_json(os.path.join(RECIPE_PAYLOAD_ROOT,
                                       recipe_id, "manifest.json"),
                          {})
+    if not isinstance(manifest, dict):
+        return recipe_id
     return manifest.get("name") or recipe_id
 
 
@@ -655,7 +659,8 @@ def disk_floor_for(pkg):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if pkg in data:
+            if isinstance(data, dict) and pkg in data \
+                    and isinstance(data[pkg], str):
                 return data[pkg]
         except (OSError, ValueError):
             continue
