@@ -325,13 +325,21 @@ def _site_db_engine(model, runtime):
             with open("/usr/share/onionhost/recipes/%s/"
                       "manifest.json" % recipe) as f:
                 manifest = json.load(f)
+        except (OSError, ValueError):
+            manifest = None
+        if isinstance(manifest, dict):
             db = manifest.get("db", {})
+            if not isinstance(db, dict):
+                # A db record of the wrong shape (null, a bare
+                # string) reads as no record at all: the {}
+                # default decides, exactly as for a manifest
+                # that omits the key - {"db": null} must not
+                # defeat the default.
+                db = {}
             if not db.get("required", True):
                 return None
             if db.get("engine") == "postgres":
                 return "postgres"
-        except (OSError, ValueError):
-            pass
     return "mariadb" if runtime == "php" else None
 
 
@@ -580,12 +588,21 @@ def create_backup(user, dest):
                      "(no backup key record)")
     except ValueError:
         return _fail("the backup key record is damaged")
+    if not isinstance(keys, dict):
+        return _fail("the backup key record is damaged")
     entry = keys.get("main")
     if not entry:
         return _fail("backups are not set up on this computer "
                      "(no backup recipients)")
-    recipients = [entry["recipient"]]
-    salts = {"main": entry["salt"]}
+    if not isinstance(entry, dict):
+        return _fail("the backup key record is damaged")
+    recipient = entry.get("recipient")
+    salt = entry.get("salt")
+    if not isinstance(recipient, str) or not recipient or \
+            not isinstance(salt, str) or not salt:
+        return _fail("the backup key record is damaged")
+    recipients = [recipient]
+    salts = {"main": salt}
 
     skipped = []
     _SKIPPED_LINKS.clear()
