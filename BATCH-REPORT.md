@@ -1,238 +1,189 @@
-# Manioc Server — T8 rework follow-up batch (2026-10-31)
+# Manioc Server — WS1 parser-hardening batch (2026-10-31)
 
-Source brief: the fresh external auditor's T8 rework
-re-verification of 2026-10-31
-(`MANIOC-T8-REWORK-REVERIFICATION-2026-10-31`), which verified
-the rework's T8-B six sites, T3-1 and T1-1, and returned three
-NEW findings: §3 (a seventh T8-B site — the native apply path),
-§5 (a T8-A migration residual in the rework's own new code),
-and §8 (the T1-2 kernel purge mis-selecting "newest" on
-Debian `+deb13` names). This batch is the fix path for exactly
-those three. Nothing here is closed until the auditor
-re-verifies it; the harnesses are the fix author's evidence,
-offered for re-run. (This file replaces the parent batch's
-report, which remains in history at the branch base.)
+Source brief: the additive verification pass of 2026-10-31,
+WS1 (fuzz of the backup/restore metadata parsers) plus the
+WS3 app-init nit. This batch is the fix path for those
+findings. Nothing here is closed until the auditor
+re-verifies it; the harness and suite runs below are the
+fix author's evidence, offered for re-run.
 
 ## Baseline
 
 - Fresh clone of github.com/CameronRuggles/ManiocServer,
-  branch `t8-rework-followups-2026-10-31` off the pushed
-  rework tip `67832e05643b73a62a886331504d3fa6d8cac5d6`
-  (code head `44200856070dbd76fe067d3bcf5e5f673dac30ac`).
-  Cameron's checkout (~/workspace/onion-host-os) and the
-  rework clone were not worked in.
-- Commits, one per fix (harness extensions in the same
-  commits):
-  - `dd3c602` — Fix 1, §3 seventh T8-B site (native apply).
-  - `9797183` — Fix 2, §8 T1-2 kernel ordering.
-  - `60398a9` — Fix 3, §5 migration quarantine. **Code head.**
-  - This report is the tip commit; it adds no code.
-- Diff vs the rework tip: 5 files, +706/−89 (3 production
-  files +413/−83, 2 harness files).
-- Local only: not pushed, not merged. Merge path unchanged:
-  followups → `t8-rework-2026-10-30` →
-  `audit-fix-batch-2026-10-24` → `main`.
+  branch `ws1-parser-hardening-2026-10-31` off the
+  t8-rework-followups tip `a0e935c` (code head `60398a9`).
+- Code head of this batch: `7ea0192`. Commits:
+  - `bb14636` — restore (R1–R6, plus the unused-import nit)
+  - `f84b059` — backup + sitegen (B1, B2, S1)
+  - `7ea0192` — golden app-init.sh env validator (WS3 nit)
+  - this report (tip, no code)
+- Diff vs the followups tip: 4 files, +110/−21.
 
-## Positive controls (BEFORE each fix, unmodified branch head)
+## Positive control (before any fix)
 
-All three findings reproduced against the real code:
+The additive pass's own harness (`harness-ws1-fuzz.py`,
+copied to scratch outside the tree) run against the
+unmodified head reproduced the report exactly: **73 recorded
+outcomes — 39 CRASH, 2 WRONG, 1 uncaught OSError** (a
+FileNotFoundError out of `_verify`'s onion stage).
 
-1. **Native apply follows links.** Driving the real
-   `apply_recipe → apply_native` on a non-first apply with
-   three destination names in `native/` pre-planted as
-   symlinks to markers outside the tree (no system paths):
-   all three markers ended with the recipe's bytes, mode
-   0o755, and container-mapping owners, and `native/app` was
-   left as a symlink to the outside binary target.
-   Verdict: FOLLOWS.
-2. **Kernel victim selection.** Driving the real
-   `_purge_superseded_kernels` with the production name form:
-   A (installed 6.12.107+deb13 / 6.12.113+deb13, running 107)
-   purged **113 — the new kernel**; B (three kernels, running
-   107) purged **both newer**; C (classic 6.1.0-15/-21/-23,
-   running -21) correctly purged only -15.
-3. **Migration resurrection.** The auditor's 5-step sequence
-   through the real provision (fresh → OLD root copy + NEW
-   import/ staging → publish, conflict warns → consume
-   import/ → publish again) ended with `import/` = OLD-DUMP:
-   RESURRECTED.
+## The fix shape
 
-## Fix 1 — §3: apply_native places files through descriptors
+The pattern S7 ratified for onionhost-update, applied per
+tool: close it in the parser, not per call site. A parsed
+JSON root must be a dict before any `.get`; every value
+consumed as a string is isinstance-checked at the point of
+parse; failures raise the tool's existing shaped error
+(RestoreError in restore, the `_fail` return in backup,
+ValueError in sitegen) or degrade exactly as the site's
+valid-input error path already does.
 
-`onionhost-recipe`: `apply_native`, `_makedirs_owned`, and
-the native half of `rollback_recipe` placed/chmodded/chowned
-by path over the app-writable `native/` tree; commit
-`42300a5` (the T8-B rework) never touched them. The auditor
-rates the site High (integrity/DoS; pre-existing in main).
+## Per-site results
 
-- New `_place_file_fd(dir_fd, name, src, mode, uid, gid)`:
-  the source is opened O_NOFOLLOW and must be regular; the
-  destination is handled through the `native/` directory
-  descriptor. **Semantics chosen at an existing destination
-  name** (the platform's fail-closed stance on planted
-  names, as in provision and the staged import): a REGULAR
-  file is an ordinary refresh — unlinked through the fd and
-  recreated `O_CREAT|O_EXCL`; **any other name (symlink,
-  fifo, directory) refuses the apply with OSError, target
-  never touched.** Mode/owner are asserted through the fd
-  before the bytes land; managed files keep the payload's
-  times (the old `shutil.copy2` behaviour).
-- The `native_files` loop and the binary staging both go
-  through it (parents via `_native_parent_fd` /
-  `_ensure_dir_fd`, created parents owned as before). The
-  `app` / `.app-prev` swap is now an fd-relative rename,
-  which acts on the directory entry itself — a link sitting
-  at that name is replaced, not followed. A planted `.app.new` link
-  therefore refuses the apply and the live binary is not
-  swapped.
-- `_makedirs_owned` rewritten component-safe: an fd walk
-  with O_NOFOLLOW opens, creating and chowning only the
-  directories the call itself creates (its original
-  contract); a planted component raises.
-- `_atomic_write` at its two apply_native uses (config
-  render, first-boot env): **assessed and left unchanged** —
-  it never opens the destination by path for writing; it
-  unlinks the temp name, creates the temp `O_CREAT|O_EXCL`
-  (a planted temp link fails with EEXIST rather than being
-  followed), fsyncs, and renames over the destination name.
-  The by-path `os.chown` calls that followed it WERE in the
-  §3 pattern and are now `_fchown_nofollow` (fd-based,
-  regular-file-only, raises on a link).
-- `rollback_recipe`: the restored binary's chown is
-  fd-based through the native dir fd; when the restored
-  name is a link or cannot be opened no-follow, it is
-  skipped with a warning (the auditor's suggested shape)
-  instead of landing on the target.
-- Honest case preserved: same end modes/owners (managed
-  files container-root mapping with manifest mode, binary
-  www mapping 0755, `.app-prev` kept one generation),
-  first-install gating and publish flow unchanged — harness
-  leg D applies twice (install + refresh) and asserts all
-  of it.
+### Restore (onionhost-restore)
 
-## Fix 2 — §8: kernel purge orders by dpkg's comparison
+- **R1 `_read_wrapper`:** a non-dict meta.json raises the
+  shaped "could not be read as an OnionHost backup"
+  RestoreError; previously `meta.get` ran after the try and
+  escaped as AttributeError (4 shapes).
+- **R2 `_decrypt`:** `salts` must be a dict and `salts.main`
+  a string before `.get`/`fromhex`; failures raise the
+  existing damaged-key-information RestoreError (4 shapes).
+- **R3 `_verify`:** the staged manifest must be a dict,
+  `entries` a list of dicts, and each entry's `path` a
+  string before `startswith`; failures raise a
+  damaged-checklist RestoreError in the neighbouring
+  wording (9 shapes). The app section now reuses the
+  validated `entries` list instead of re-reading the raw
+  manifest value.
+- **R4 `_verify` structural:** a manifest that omits the
+  onion files now meets a shaped RestoreError ("website
+  identity is damaged") on the public-key and hostname
+  reads instead of an uncaught FileNotFoundError. The
+  site section's `current.txt` read got the same wrap
+  ("published website is incomplete").
+- **R5 `_write_recipe_selection` (the Medium placement,
+  mid-`_install`):** a non-dict staged site model raises
+  RestoreError before anything is written. The `recipe`
+  value must be a string matching the recipe-id rule
+  sitegen enforces — first char `[a-z0-9]`, rest
+  `[a-z0-9-]*`, checked with `re.fullmatch` on the same
+  pattern — or RestoreError is raised and nothing is
+  written and nothing is cleared. This closes the crash
+  shapes (3) and both WRONG shapes (an int recipe was
+  written as `123`, a list as `['gitea']`). A missing or
+  unreadable site.json, and a model with no recipe key,
+  keep the old behaviour exactly (selection cleared, no
+  error). One judgement call, stated plainly: a `recipe`
+  of `""` or `false` now raises instead of silently
+  clearing — sitegen's validation rejects both as a bad
+  recipe id, so neither can appear in a platform-written
+  record.
+- **R6 `_root_disk_prefix`:** a non-dict luks-roles.json
+  or a non-string `device` degrades to the function's
+  existing fallback for unreadable files (return None,
+  exclude nothing) instead of crashing (4 shapes).
+- Nit from the same WS3 list: the unused `io` import is
+  removed; `re` is added for the R5 match.
 
-`onionhost-update`: `_purge_superseded_kernels`' nested
-`_kkey` stopped at the first non-pure-digit component, so
-`6.12.107+deb13` and `6.12.113+deb13` both keyed to `(6, 12)`
-and `max()` returned the oldest; the purge then removed the
-newest kernel. Introduced by the rework batch itself;
-production naming confirmed `+deb13` (rig record:
-`linux-image-6.12.113+deb13-amd64`).
+### Backup (onionhost-backup)
 
-- "Newest" is now `max()` over `functools.cmp_to_key` with
-  `_debver_cmp` — dpkg's full version ordering (epoch,
-  upstream, revision). Note on the brief's premise:
-  `_verrevcmp`/`_debver_cmp` ship in **onionhost-recipe**,
-  not in this module (this module has only the subprocess
-  `dpkg_compare`); they were ported verbatim into
-  onionhost-update, the platform tools being standalone
-  with no shared module to import, rather than shelling out
-  to dpkg once per comparison inside a best-effort helper.
-- The comparison runs over the version part: `_kversion`
-  strips the `linux-image-` prefix and the trailing flavour
-  tail (the same tail the running release carries, e.g.
-  `-amd64`), leaving `6.1.0-23` / `6.12.113+deb13`.
-- Running-kernel protection, the purge invocation, and the
-  log lines are unchanged.
+- **B1 `create_backup` key record:** a parsed record that
+  is not a dict, a `main` entry that is not a dict, or a
+  recipient/salt that is missing or not a string now
+  returns the existing shaped `_fail("the backup key
+  record is damaged")` — the same outcome invalid JSON
+  already produced. This tool has no catch-all, so the 7
+  shapes were raw tracebacks; now every backup attempt on
+  a damaged record ends with that one line.
+- **B2 `_site_db_engine`:** a recipe manifest that parses
+  to a non-dict now takes the function's documented
+  unreadable-manifest outcome (MariaDB for php, none for
+  native). A `db` value of the wrong shape (null, a bare
+  string, a list) reads as no record at all, so the `{}`
+  default decides — `{"db": null}` no longer defeats the
+  default. Valid manifests decide exactly as before
+  (required false → none, engine postgres → postgres).
 
-## Fix 3 — §5: migration conflict quarantines the root copy
+### Site model (sitegen.py)
 
-`onionhost-app-provision`: in the migration conflict case
-(root staging AND `import/` staging both present), the root
-copy was warned about and left in place; after the container
-consumed the `import/` copy, the next publish migrated the
-stale root copy in, and it was imported over live data.
+- **S1 `validate_model`:** `pages`/`entries` must be
+  lists before `len()` and iteration; an item `id`, an
+  entry `photo`, and an entry `date` must be strings
+  before their regex matches. The four TypeError leaks
+  now raise the designed ValueError with the neighbouring
+  messages ("bad or duplicate item id", "bad photo name",
+  "bad entry date"), so callers catching
+  (ValueError, OSError) see the shaped error.
 
-- The conflict case now **renames the root copy through the
-  appdata fd** to `db-import.sql.gz.superseded` and fsyncs
-  the appdata fd, keeping the warning (reworded to say what
-  happened). Chosen over unlink-first because the stale
-  dump stays recoverable by hand while being inert.
-- The name is safe: every reader of the root-level name was
-  checked — provision's migration and `onionhost-recipe`'s
-  `_staged_import_exists` read the exact name
-  `db-import.sql.gz` only, `onionhost-restore` uses that
-  name only inside `import/`, and app-init reads only
-  `import/db-import.sql.gz`. Nothing treats the
-  `.superseded` name as a staged import (harness-checked).
-- If the rename raises, the fallback unlinks the root copy
-  through the fd after the warning — either way it can
-  never be migrated later. The non-conflict migration path
-  is unchanged.
+### App-init nit (golden app-init.sh, WS3 Info)
 
-## Gates (all run at the code head 60398a9)
+- The app.env line validator's malformed arm now also
+  matches `[0-9]*`: a name beginning with a digit is
+  reported as a malformed line and skipped, like every
+  other malformed line, instead of being admitted and
+  then silently refused by `export`. Valid identifiers
+  and the platform-managed names are untouched (checked
+  against a case-statement replica: `1BAD`/`9` malformed;
+  `GOOD_1`, `_X`, `X9` still exported; `PATH` still
+  platform-managed).
 
-- **Positive controls, post-fix:** ctl1 — apply refuses
-  (OSError), all three outside markers byte/mode/owner
-  identical, `native/app` untouched. ctl2 — A: no purge;
-  B: purges only 113; C: purges only -15 (classic unchanged).
-  ctl3 — step 5 leaves `import/` empty; the root copy sits
-  quarantined as `db-import.sql.gz.superseded` with its
-  bytes intact.
-- **poc/scripts/t8-rework-test.py — 56 checks, ALL PASS.**
-  The same harness run against the pre-fix tree records
-  exactly 12 FAILs (the 8 native planted-link checks and 4
-  quarantine/conflict checks); every other check passes on
-  both trees, including the honest apply/refresh guards.
-- **poc/scripts/t3-debian-status-test.py — 15/15.**
-- **poc/scripts/t1-followups-test.py — 14 checks, ALL
-  PASS** (11 original + 3 new `+deb13`). Against the pre-fix
-  tree the 3 new checks FAIL and the 11 original pass.
-- **poc/scripts/t3-reboot-state-test.py — FAILURES: 0.**
-- **poc/runtime-gate/test_runtime_dashboard.py — 11 PASS,
-  0 failed** (same at base).
-- **Prior auditor's T8-B demos at the new head:** copytree
-  demo copies only the valid file, both planted links
-  skipped with warnings; mode-exceptions demo leaves the
-  host file 0600 before and after. Both clean.
-- **poc/installer-policy/run_proofs.py — 0 assertions
-  failed. poc/runsc-wrap/run_tests.py — 0 assertions
-  failed** (same at base).
-- **ci-scan: exactly 2 findings, both the pre-existing
-  ISO-BUILD-LOG.md hits inherited from the branch base;
-  zero in touched files.**
+## Final gate — WS1 harness
 
-## Disclosures — suites that do not complete in this sandbox
+Same harness, final head: **69 recorded outcomes, 0 CRASH,
+0 WRONG.** The count drops from 73 because the R6 fallback
+and the B2 fallback return by design (the harness records
+returns only for its named controls, which all pass). The
+lines the harness labels OTHER are the shaped outcomes it
+has no clean-type registered for at those two sites: the
+R5 RestoreError (5 lines) and the B1 `_fail` return
+(7 lines) — both are the designed shaped paths, named in
+its own detail text. Valid-input controls are unchanged
+across every site: valid meta/decrypt/verify controls,
+the valid recipe selection still writes `gitea`, the
+valid luks-roles record still returns `vda`, the db
+controls still return postgres / mariadb / none as before,
+and the valid site model still loads.
 
-Named, not claimed (each verified identical at the branch
-base, so none is a regression of this batch):
+## Existing suites
 
-- **poc/runtime-gate/run_sim.py** aborts partway in this
-  sandbox (9 passes, then the all-wrapper judge leg fails,
-  then an assertion) — IDENTICALLY at base and at the code
-  head. This batch touches no runtime-gate file.
-- **poc/backup-proof/proof.py** cannot run here: the `age`
-  binary is not installed in this sandbox (the auditor hit
-  the same wall in his §9). Identical failure at base.
-- **poc/recipes-marketplace/unit-test.py** fails
-  identically at base and head inside its fixture stage
-  (`dpkg-deb -x` on the fixture .deb exits 2) — the
-  pre-existing fixture failure prior batches recorded.
+- `poc/scripts/t8-rework-test.py` — ALL CHECKS PASSED.
+- `poc/scripts/t1-followups-test.py` — ALL CHECKS PASSED.
+- `poc/scripts/t3-debian-status-test.py` — ALL CHECKS
+  PASSED.
+- `poc/scripts/t3-reboot-state-test.py` — FAILURES: 0.
+- `poc/runtime-gate/run_sim.py` — aborts with the same
+  AssertionError (line 253, marker assert) at the branch
+  base `a0e935c` and at this head, run both ways in this
+  session; a sandbox environment limit, and this batch
+  touches no runtime-gate file. Not claimed.
+- `poc/backup-proof/proof.py` — cannot run against this
+  branch in this sandbox: the script hardcodes its tree
+  to another checkout (line 36) and needs an `age`
+  binary and `/var/lib/onionhost`, both absent here.
+  Not run, not claimed; the same wall the auditor and
+  the followups batch recorded. The backup/restore
+  valid-input behaviour control for this batch is the
+  WS1 harness's valid controls plus the suites above.
 
-Further honest limits:
+## ci-scan
 
-- Harness venues lower the container uid base to 10000
-  (the sandbox's user namespace does not map the production
-  base 2300000) — the same workaround every prior batch
-  used; the planted-link and quarantine legs are
-  uid-base-independent in shape.
-- Fix 1's semantics refuse the whole apply on a planted
-  native destination name. A compromised app can therefore
-  block its own re-publish until the owner clears the name
-  by hand — accepted deliberately: the alternative
-  (unlinking a planted link and proceeding) would let the
-  app silently trade names inside a security assertion,
-  and every other planted-name site in the platform fails
-  closed the same way.
-- Adjacent observation, NOT fixed (outside the brief):
-  `_reboot_state`'s `_vkey` in onionhost-update splits on
-  "+" before "-", so it orders `+deb13` names correctly,
-  but on classic names it keys only the upstream part
-  (6.1.0-21 and 6.1.0-23 compare equal there). It only
-  feeds the reboot-required heuristic, never a purge;
-  flagged here for the auditor's judgement.
-- The T8-A rig legs from the rework pack are still pending
-  (the GCP rig hold is the owner's appeal); this batch
-  neither runs nor claims them. Fix 3 is statically and
-  harness verified only, like the rest of T8-A.
+To be run on a pristine `git archive` export of the
+branch tip (including this report) before the ferry; the
+result is stated in the ferry note. The expectation,
+from the branch base's own scan profile, is exactly the
+2 inherited ISO-BUILD-LOG.md hits and zero in touched
+files, this report included.
+
+## Disclosures
+
+- Harness venues use the additive pass's own staging
+  (faked `open` where a path is hardcoded); the parse code
+  under test is the real code, as in the source pass.
+- The R5 judgement call on `""`/`false` recipe values is
+  the one place behaviour changes for an input the old
+  code tolerated; it is argued above and flagged for the
+  auditor.
+- T8-A rig legs remain pending on the GCP hold and are
+  not claimed here. This branch is local only; the push
+  is Cameron's tap.
