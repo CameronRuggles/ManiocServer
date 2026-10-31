@@ -63,10 +63,10 @@ open the backup; 4 the backup is damaged or invalid; 1 other.
 """
 import glob
 import hashlib
-import io
 import json
 import os
 import pwd
+import re
 import shutil
 import struct
 import subprocess
@@ -208,8 +208,13 @@ def _root_disk_prefix():
     the stick scan. Falls back to excluding nothing on error."""
     try:
         with open("/etc/onionhost/luks-roles.json") as f:
-            device = json.load(f).get("device", "")
+            roles = json.load(f)
     except (OSError, ValueError):
+        return None
+    if not isinstance(roles, dict):
+        return None
+    device = roles.get("device", "")
+    if not isinstance(device, str):
         return None
     base = os.path.basename(device)
     parent = "".join(ch for ch in base if not ch.isdigit())
@@ -327,6 +332,10 @@ def _read_wrapper(path):
         raise RestoreError(
             "This file could not be read as an OnionHost backup. "
             "Nothing was changed.", 4)
+    if not isinstance(meta, dict):
+        raise RestoreError(
+            "This file could not be read as an OnionHost backup. "
+            "Nothing was changed.", 4)
     if meta.get("format") not in (1, 2, 3) or \
             meta.get("kind") != "onionhost-backup":
         raise RestoreError(
@@ -338,8 +347,16 @@ def _read_wrapper(path):
 def _decrypt(meta, payload_age, workdir):
     import getpass
     salts = meta.get("salts") or {}
+    if not isinstance(salts, dict):
+        raise RestoreError(
+            "This backup's stored key information is damaged. "
+            "Nothing was changed.", 4)
     salt_list = []
     value = salts.get("main")
+    if value is not None and not isinstance(value, str):
+        raise RestoreError(
+            "This backup's stored key information is damaged. "
+            "Nothing was changed.", 4)
     if value:
         try:
             salt_list.append(bytes.fromhex(value))
@@ -420,14 +437,28 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup has no readable checklist inside. Nothing "
             "was changed.", 4)
+    if not isinstance(manifest, dict):
+        raise RestoreError(
+            "This backup has no readable checklist inside. Nothing "
+            "was changed.", 4)
     if manifest.get("format") not in (1, 2, 3):
         raise RestoreError(
             "This backup's checklist is from a different version. "
             "Nothing was changed.", 4)
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        raise RestoreError(
+            "This backup's checklist is damaged. Nothing was "
+            "changed.", 4)
     listed = set()
-    for entry in manifest.get("entries", []):
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RestoreError(
+                "This backup's checklist is damaged. Nothing was "
+                "changed.", 4)
         rel = entry.get("path", "")
-        if not rel.startswith(ALLOWED_PREFIXES) or \
+        if not isinstance(rel, str) or \
+                not rel.startswith(ALLOWED_PREFIXES) or \
                 ".." in rel.split("/"):
             raise RestoreError(
                 "This backup lists a file in an unexpected place "
@@ -464,16 +495,26 @@ def _verify(payload_tar_gz, stage):
     # compared it, and format 3's metadata no longer carries the
     # address at all, R-04.)
     pub_path = os.path.join(stage, "onion/hs_ed25519_public_key")
-    with open(pub_path, "rb") as f:
-        pubdata = f.read()
+    try:
+        with open(pub_path, "rb") as f:
+            pubdata = f.read()
+    except OSError:
+        raise RestoreError(
+            "This backup's website identity is damaged. Nothing "
+            "was changed.", 4)
     pubkey = pubdata[32:64] if len(pubdata) >= 64 else pubdata
     if len(pubkey) != 32:
         raise RestoreError(
             "This backup's website identity is damaged. Nothing "
             "was changed.", 4)
     address = backupkeys.onion_address_from_pubkey(pubkey)
-    with open(os.path.join(stage, "onion/hostname")) as f:
-        hostname = f.read().strip()
+    try:
+        with open(os.path.join(stage, "onion/hostname")) as f:
+            hostname = f.read().strip()
+    except OSError:
+        raise RestoreError(
+            "This backup's website identity is damaged. Nothing "
+            "was changed.", 4)
     if hostname != address + ".onion" or \
             manifest.get("onion") != hostname:
         raise RestoreError(
@@ -499,7 +540,7 @@ def _verify(payload_tar_gz, stage):
                 "This backup's application record is damaged. "
                 "Nothing was changed.", 4)
         manifest["appRuntime"] = runtime
-        paths = {e.get("path") for e in manifest.get("entries", [])}
+        paths = {e.get("path") for e in entries}
         has_dump = "app/db-dump.sql.gz" in paths
         has_creds = "app/db-credentials.env" in paths
         if has_dump and not has_creds:
@@ -512,8 +553,13 @@ def _verify(payload_tar_gz, stage):
                 "Nothing was changed.", 4)
     else:
         cur_path = os.path.join(stage, "site/current.txt")
-        with open(cur_path) as f:
-            cur_seq = f.read().strip()
+        try:
+            with open(cur_path) as f:
+                cur_seq = f.read().strip()
+        except OSError:
+            raise RestoreError(
+                "This backup's published website is incomplete. "
+                "Nothing was changed.", 4)
         if not cur_seq.isdigit() or not os.path.isdir(
                 os.path.join(stage, "site/releases", cur_seq)):
             raise RestoreError(
@@ -593,9 +639,28 @@ def _write_recipe_selection(stage):
     try:
         with open(os.path.join(stage, "content",
                                "site.json")) as f:
-            recipe = json.load(f).get("recipe")
+            model = json.load(f)
     except (OSError, ValueError):
-        recipe = None
+        model = None
+    if model is not None:
+        # The staged record parsed but is not shaped like a site
+        # model: refuse here, mid-install or not, rather than
+        # writing a selection generate-configs would have to
+        # sanitise after the fact. The recipe value must carry
+        # the recipe-id shape sitegen enforces everywhere else
+        # ([a-z0-9] then [a-z0-9-]*); anything else is damage,
+        # and nothing is written or cleared on its account.
+        if not isinstance(model, dict):
+            raise RestoreError(
+                "This backup's website record is damaged. Nothing "
+                "was changed.", 4)
+        recipe = model.get("recipe")
+        if recipe is not None and not (
+                isinstance(recipe, str)
+                and re.fullmatch(r"[a-z0-9][a-z0-9-]*", recipe)):
+            raise RestoreError(
+                "This backup's website record is damaged. Nothing "
+                "was changed.", 4)
     if recipe:
         tmp = RECIPE_SELECTION + ".restore-tmp"
         with open(tmp, "w") as f:
