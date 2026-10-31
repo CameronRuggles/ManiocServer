@@ -80,8 +80,9 @@ rates the site High (integrity/DoS; pre-existing in main).
 - The `native_files` loop and the binary staging both go
   through it (parents via `_native_parent_fd` /
   `_ensure_dir_fd`, created parents owned as before). The
-  `app` / `.app-prev` swap is now an fd-relative rename —
-  name-level, never follows. A planted `.app.new` link
+  `app` / `.app-prev` swap is now an fd-relative rename,
+  which acts on the directory entry itself — a link sitting
+  at that name is replaced, not followed. A planted `.app.new` link
   therefore refuses the apply and the live binary is not
   swapped.
 - `_makedirs_owned` rewritten component-safe: an fd walk
