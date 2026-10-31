@@ -50,10 +50,10 @@ Apply is careful in the same order the platform is:
      administrator the OWNER chose at setup time - staged
      root-only by onionhost-wizard-helper recipe-setup and
      shredded here once consumed). The seed is staged at
-     appdata/db-import.sql.gz, the slot's established import
-     point: the app container's init imports it on first start
-     and deletes it. An already-staged import (e.g. a restore's
-     dump) is never overwritten.
+     appdata/import/db-import.sql.gz, the slot's managed
+     import point (T8-A): the app container's init imports
+     it on first start and deletes it. An already-staged
+     import (e.g. a restore's dump) is never overwritten.
   4. Write the recipe's overlays to their platform homes
      (/etc/onionhost/nginx-app-extra.conf,
      php-fpm-app-extra.conf, normalize-exceptions - the seams
@@ -131,6 +131,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import struct
 import sys
 import tarfile
@@ -613,6 +614,94 @@ def _dir_fd(path):
     steering a host-root write onto a host path."""
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY
                    | os.O_NOFOLLOW)
+
+
+# The staged database import's managed home (audit T8-A,
+# re-verification 2026-10-30). Before T8 the staged file lived
+# at the appdata root, where the app container's init deletes
+# it after a successful import; T8 made the root host-root
+# owned, so the delete failed and the stale dump was
+# re-imported at every restart. The import now lives in its
+# own managed directory, owned by the container's root
+# mapping at 0700: inside it the container root controls the
+# names again (stage, read, delete exactly once), while the
+# appdata root itself stays un-renamable by the app. Host
+# tools stage into it through the directory descriptor with
+# O_NOFOLLOW|O_CREAT|O_EXCL - never by path, never through a
+# link, never overwriting a staged import.
+IMPORT_DIR_NAME = "import"
+IMPORT_FILE_NAME = "db-import.sql.gz"
+
+
+def _import_dir_fd():
+    """Open the managed import directory by descriptor,
+    creating and asserting it first when a box provisioned
+    before T8-A does not have it yet. A name planted as a
+    symlink refuses the open (T8's fail-closed rule)."""
+    path = os.path.join(APPDATA, IMPORT_DIR_NAME)
+    try:
+        fd = _dir_fd(path)
+    except FileNotFoundError:
+        os.makedirs(path, exist_ok=True)
+        fd = _dir_fd(path)
+        os.fchown(fd, CONTAINER_ROOT_UID, CONTAINER_ROOT_UID)
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def _staged_import_exists():
+    """Is a database import already staged - in the managed
+    import directory, or as a lingering pre-T8-A file at the
+    appdata root (provision migrates those at the next
+    publish; until then it is still a live staging and wins
+    over a fresh seed exactly as an import-dir staging
+    does)?"""
+    if os.path.isfile(os.path.join(
+            APPDATA, IMPORT_DIR_NAME, IMPORT_FILE_NAME)):
+        return True
+    return os.path.isfile(os.path.join(APPDATA,
+                                       IMPORT_FILE_NAME))
+
+
+def _write_staged_import(blob):
+    """Stage blob as the pending database import in the
+    managed import directory. Returns True when written,
+    False when an import was already staged there (the
+    existing staging wins - overwriting it could destroy
+    restored data). A planted symlink at the staged name
+    raises OSError: the apply fails closed."""
+    dir_fd = _import_dir_fd()
+    try:
+        try:
+            fd = os.open(IMPORT_FILE_NAME,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o644,
+                         dir_fd=dir_fd)
+        except FileExistsError:
+            # O_EXCL reports a planted symlink exactly like a
+            # genuine staging. Only a regular file is a
+            # staging that wins; anything else at the name is
+            # an attempt to plant the import point - fail
+            # closed rather than call it staged.
+            st = os.stat(IMPORT_FILE_NAME, dir_fd=dir_fd,
+                         follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode):
+                return False
+            raise OSError(
+                "the staged import name in %s is not a "
+                "regular file; refusing"
+                % os.path.join(APPDATA, IMPORT_DIR_NAME))
+        with os.fdopen(fd, "wb") as f:
+            os.fchown(f.fileno(), CONTAINER_ROOT_UID,
+                      CONTAINER_ROOT_UID)
+            os.fchmod(f.fileno(), 0o644)
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.fsync(dir_fd)
+        return True
+    finally:
+        os.close(dir_fd)
 
 
 def _grant_owner_acl(path, is_dir=True):
@@ -1503,13 +1592,12 @@ def apply_recipe(recipe_id):
     # update apply.
     seeded = bool(state.get("seeded"))
     if first_install and seed_sql_path is not None:
-        staged_import = os.path.join(APPDATA, "db-import.sql.gz")
-        if os.path.exists(staged_import):
+        if _staged_import_exists():
             # A restore (or an earlier apply that died after
             # staging) already put an import there; it wins -
             # overwriting it could destroy restored data.
-            print("onionhost-recipe: an import is already staged "
-                  "at %s; leaving it in place" % staged_import)
+            print("onionhost-recipe: a database import is "
+                  "already staged; leaving it in place")
             seeded = True
         else:
             if not onion:
@@ -1518,7 +1606,13 @@ def apply_recipe(recipe_id):
             seed_sql = build_seed_sql(manifest, seed_sql_path,
                                       tree_root, onion, admin)
             blob = gzip.compress(seed_sql.encode("utf-8"))
-            _atomic_write(staged_import, blob, mode=0o644)
+            if not _write_staged_import(blob):
+                # Staged between the check and the write (a
+                # restore landing in the same window): the
+                # existing staging wins, as above.
+                print("onionhost-recipe: a database import "
+                      "was staged concurrently; leaving it "
+                      "in place")
             seeded = True
         # The staged administrator credentials have done their
         # one job. Shred the file so the plaintext password does

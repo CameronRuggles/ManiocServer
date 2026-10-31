@@ -280,6 +280,25 @@ except Exception:
         chown "$OH_BASE:$OH_BASE" /var/lib/onionhost/appdata/db
         chmod 0755 /var/lib/onionhost/appdata/db
     fi
+    # The T8-A managed names (auditor re-verification,
+    # 2026-10-30), born in the same end state provision
+    # asserts: import/ is the staged database import's home
+    # (the app container's init must be able to delete the
+    # staged file after a successful import, which the
+    # host-root-owned appdata root forbids at the root
+    # itself), and pgdb/ is PostgreSQL's datadir, pre-created
+    # so init never has to create it at the root. Both belong
+    # to the container's root mapping at 0700.
+    if [ ! -d /var/lib/onionhost/appdata/import ]; then
+        mkdir -p /var/lib/onionhost/appdata/import
+        chown "$OH_BASE:$OH_BASE" /var/lib/onionhost/appdata/import
+        chmod 0700 /var/lib/onionhost/appdata/import
+    fi
+    if [ ! -d /var/lib/onionhost/appdata/pgdb ]; then
+        mkdir -p /var/lib/onionhost/appdata/pgdb
+        chown "$OH_BASE:$OH_BASE" /var/lib/onionhost/appdata/pgdb
+        chmod 0700 /var/lib/onionhost/appdata/pgdb
+    fi
     for d in /var/lib/onionhost/appdata/www \
              /var/lib/onionhost/appdata/native; do
         if [ ! -d "$d" ]; then

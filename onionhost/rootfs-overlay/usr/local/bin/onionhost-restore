@@ -39,8 +39,8 @@ the app-data trees (www/, native/) by the same rename swaps, the
 database credentials become this machine's /etc/onionhost/
 app-db.env, the site-kind marker + runtime are written, configs
 are re-rendered, and the database dump is staged on the app-data
-volume as db-import.sql.gz - the app container's init imports it
-into a fresh database on its next start (Maintenance runs no
+volume as import/db-import.sql.gz - the app container's init
+imports it into a fresh database on its next start (Maintenance runs no
 containers, so the import rides the proven boot path instead of
 being attempted here). A static backup restored onto a machine
 currently set up as an app site deselects the app slot again (the
@@ -687,13 +687,49 @@ def _install_app(stage, pw, tag):
     os.chmod(dbdir, 0o750)
     dump = os.path.join(app_src, "db-dump.sql.gz")
     if os.path.isfile(dump):
-        dst = os.path.join(APPDATA, "db-import.sql.gz")
-        tmp = dst + ".restore-tmp"
-        shutil.copyfile(dump, tmp)
-        os.chown(tmp, APP_UID, APP_UID)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, dst)
-        _fsync_file(dst)
+        # The staged import's home is the managed import
+        # directory (audit T8-A): the app container's init
+        # must be able to DELETE the staged file after a
+        # successful import, and T8's host-root-owned appdata
+        # root forbids that at the root itself. Written
+        # through the directory descriptor, no-follow,
+        # O_EXCL: the directory is asserted first (a box
+        # restored before its first provision may not have
+        # it), and a staged import already sitting there is
+        # unlinked through the same descriptor and replaced -
+        # a restore is the owner's chosen state, so its dump
+        # wins wholesale rather than merging with a staging.
+        import_dir = os.path.join(APPDATA, "import")
+        os.makedirs(import_dir, exist_ok=True)
+        os.chown(import_dir, APP_UID, APP_UID)
+        os.chmod(import_dir, 0o700)
+        dir_fd = os.open(import_dir, os.O_RDONLY
+                         | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = None
+            for _attempt in range(2):
+                try:
+                    fd = os.open("db-import.sql.gz",
+                                 os.O_WRONLY | os.O_CREAT
+                                 | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=dir_fd)
+                    break
+                except FileExistsError:
+                    os.unlink("db-import.sql.gz",
+                              dir_fd=dir_fd)
+            if fd is None:
+                raise ValueError("could not stage the "
+                                 "restored database import")
+            with open(dump, "rb") as src, \
+                    os.fdopen(fd, "wb") as out:
+                os.fchown(out.fileno(), APP_UID, APP_UID)
+                os.fchmod(out.fileno(), 0o600)
+                shutil.copyfileobj(src, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     creds = os.path.join(app_src, "db-credentials.env")
     if os.path.isfile(creds):
         tmp = APP_DB_ENV + ".restore-tmp"
