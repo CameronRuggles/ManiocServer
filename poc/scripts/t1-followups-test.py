@@ -82,7 +82,10 @@ class _Proc:
         self.stdout = stdout
 
 
-def stage(installed, purge_rc=0, query_raises=False):
+def stage(installed, purge_rc=0, query_raises=False,
+          running_release=None):
+    if running_release is not None:
+        _Uname.release = running_release
     calls = []
 
     import subprocess as _real_sp
@@ -155,6 +158,46 @@ try:
 except Exception:  # noqa: BLE001
     absorbed_p = False
 check("purge failure is absorbed (log-only)", absorbed_p)
+
+# --- +deb13 production naming (auditor re-verification
+# 2026-10-31 section 8): the distinguishing number is fused
+# with non-digits (6.12.107+deb13), which the old integer-
+# tuple key could not see - every 6.12.x keyed identically
+# and "newest" came out as the OLDEST. On the pre-fix tree
+# each of these three checks fails (the newest is purged,
+# or nothing is).
+D = "6.12."
+# Two kernels, running the older: both are kept (running +
+# newest), nothing is superseded.
+calls = stage([K + D + "107+deb13-amd64",
+               K + D + "113+deb13-amd64"],
+              running_release=D + "107+deb13-amd64")
+upd._purge_superseded_kernels()
+check("+deb13 two kernels, running oldest: no purge",
+      not any(c[:2] == ["apt-get", "purge"] for c, _t in calls))
+# Three kernels, running the oldest: only the middle one is
+# superseded - the newest (120) must survive.
+calls = stage([K + D + "107+deb13-amd64",
+               K + D + "113+deb13-amd64",
+               K + D + "120+deb13-amd64"],
+              running_release=D + "107+deb13-amd64")
+upd._purge_superseded_kernels()
+purges = [c for c, _t in calls if c[:2] == ["apt-get", "purge"]]
+check("+deb13 three kernels: only the middle one purged",
+      bool(purges)
+      and purges[0][3:] == [K + D + "113+deb13-amd64"])
+# Two kernels, running the newest (post-reboot): the old one
+# is superseded and purged; running==newest purges nothing
+# extra.
+calls = stage([K + D + "107+deb13-amd64",
+               K + D + "113+deb13-amd64"],
+              running_release=D + "113+deb13-amd64")
+upd._purge_superseded_kernels()
+purges = [c for c, _t in calls if c[:2] == ["apt-get", "purge"]]
+check("+deb13 running newest: the old kernel is purged",
+      bool(purges)
+      and purges[0][3:] == [K + D + "107+deb13-amd64"])
+_Uname.release = "6.1.0-21-amd64"
 
 print()
 if failures:

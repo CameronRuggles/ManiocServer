@@ -94,6 +94,7 @@ seen (state safe); 3 fetch failed (updates paused, site untouched);
 4 update failed but rolled back to a healthy legal version;
 5 FAIL-CLOSED.
 """
+import functools
 import json
 import os
 import random
@@ -622,6 +623,83 @@ def _reboot_state():
     return required, "; ".join(reasons)
 
 
+def _verrevcmp(a, b):
+    """dpkg's verrevcmp (deb-version(7)): compare two upstream
+    or revision strings - alternating non-digit / digit runs,
+    '~' sorting before everything (including end-of-string),
+    letters before non-letters. Ported from onionhost-recipe
+    (the platform tools are standalone; there is no shared
+    module to import)."""
+    i = j = 0
+    la, lb = len(a), len(b)
+
+    def order(c):
+        if not c:
+            return 0
+        if c.isdigit():
+            return 0
+        if c.isalpha():
+            return ord(c)
+        if c == "~":
+            return -1
+        return ord(c) + 256
+
+    while i < la or j < lb:
+        first_diff = 0
+        while (i < la and not a[i].isdigit()) or \
+                (j < lb and not b[j].isdigit()):
+            ac = order(a[i] if i < la else "")
+            bc = order(b[j] if j < lb else "")
+            if ac != bc:
+                return -1 if ac < bc else 1
+            if i < la and not a[i].isdigit():
+                i += 1
+            if j < lb and not b[j].isdigit():
+                j += 1
+        while i < la and a[i] == "0":
+            i += 1
+        while j < lb and b[j] == "0":
+            j += 1
+        while i < la and j < lb and a[i].isdigit() \
+                and b[j].isdigit():
+            if not first_diff:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < la and a[i].isdigit():
+            return 1
+        if j < lb and b[j].isdigit():
+            return -1
+        if first_diff:
+            return 1 if first_diff > 0 else -1
+    return 0
+
+
+def _debver_cmp(a, b):
+    """Debian version comparison in pure Python (epoch,
+    upstream, revision) - the same comparison
+    onionhost-recipe ships for its floor checks. The purge
+    orders kernel names by it rather than shelling out to
+    dpkg once per comparison."""
+    def parse(v):
+        epoch = 0
+        if ":" in v:
+            head, v = v.split(":", 1)
+            if head.isdigit():
+                epoch = int(head)
+        if "-" in v:
+            up, rev = v.rsplit("-", 1)
+        else:
+            up, rev = v, ""
+        return epoch, up, rev
+
+    ea, ua, ra = parse(a)
+    eb, ub, rb = parse(b)
+    if ea != eb:
+        return 1 if ea > eb else -1
+    return _verrevcmp(ua, ub) or _verrevcmp(ra, rb)
+
+
 def _purge_superseded_kernels():
     """Purge superseded kernel image packages (audit T1-2).
 
@@ -649,20 +727,33 @@ def _purge_superseded_kernels():
             "kernels (%s)" % exc.__class__.__name__)
         return
 
-    def _kkey(name):
-        nums = []
-        for part in name[len("linux-image-"):].replace(
-                "-", ".").split("."):
-            if part.isdigit():
-                nums.append(int(part))
-            else:
-                break
-        return tuple(nums)
+    def _kversion(name):
+        """The Debian version inside a kernel package name:
+        strip the linux-image- prefix and the trailing
+        flavour tail (-amd64 and kin - the same tail the
+        running release carries). What remains is the string
+        dpkg orders by: 6.1.0-23, 6.12.113+deb13."""
+        v = name[len("linux-image-"):]
+        release = os.uname().release
+        if "-" in release:
+            tail = "-" + release.rsplit("-", 1)[1]
+            if v.endswith(tail):
+                v = v[:-len(tail)]
+        return v
 
     running = "linux-image-" + os.uname().release
     if not names:
         return
-    newest = max(names, key=_kkey)
+    # "Newest" is dpkg's own ordering over the version part
+    # (auditor re-verification 2026-10-31 section 8). The
+    # hand-rolled integer tuple this replaces stopped at the
+    # first non-pure-digit component, so on Debian's +deb13
+    # names every 6.12.x kernel keyed identically and max()
+    # returned the OLDEST - the purge then removed the kernel
+    # the box was meant to boot next.
+    newest = max(names, key=functools.cmp_to_key(
+        lambda a, b: _debver_cmp(_kversion(a),
+                                 _kversion(b))))
     victims = sorted(n for n in names
                      if n != running and n != newest)
     if not victims:
