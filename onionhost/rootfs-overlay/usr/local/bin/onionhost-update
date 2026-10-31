@@ -535,6 +535,19 @@ OWNER_MAINTAINED = []
 # an old result look freshly checked.
 CHECK_SUCCEEDED = False
 
+# The Debian channel's outcome for THIS run (audit T3-1):
+# None until the Debian phase has run, then True only when
+# its update AND install phases both completed cleanly.
+# write_status maintains the record's debian_ok and
+# debian_last_successful_check from it, exactly as
+# CHECK_SUCCEEDED maintains the project channel's pair -
+# the two channels fail independently (A6), so their
+# freshness records must too: before T3-1 a Debian phase
+# failing on every run still ended in an "up-to-date"
+# status whose last_successful_check had advanced on the
+# project channel alone.
+DEBIAN_PHASE_OK = None
+
 
 def _reboot_state():
     """(required, reason) for the pending-reboot record.
@@ -634,6 +647,25 @@ def write_status(state, detail, packages):
     rec["last_successful_check"] = (
         now() if CHECK_SUCCEEDED
         else prev.get("last_successful_check"))
+    # The Debian channel's own pair (audit T3-1), maintained
+    # the same way: a status written before this run's
+    # Debian phase (or by an updater older than T3-1, whose
+    # record simply lacks the keys) carries the previous
+    # outcome forward; a completed phase replaces it, and
+    # its last-success time advances only on a clean phase.
+    # Every pre-existing key above is written exactly as
+    # before - the project channel's record is unchanged.
+    if DEBIAN_PHASE_OK is None:
+        if "debian_ok" in prev:
+            rec["debian_ok"] = prev.get("debian_ok")
+        if "debian_last_successful_check" in prev:
+            rec["debian_last_successful_check"] = prev.get(
+                "debian_last_successful_check")
+    else:
+        rec["debian_ok"] = DEBIAN_PHASE_OK
+        rec["debian_last_successful_check"] = (
+            now() if DEBIAN_PHASE_OK
+            else prev.get("debian_last_successful_check"))
     save_json(status_path, rec)
 
 
@@ -714,7 +746,7 @@ def disk_floor_for(pkg):
 
 
 def main():
-    global CHECK_SUCCEEDED
+    global CHECK_SUCCEEDED, DEBIAN_PHASE_OK
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
     hw_path = os.path.join(STATE_DIR, "highwater.json")
@@ -1046,7 +1078,8 @@ def main():
     log("apt-get update + upgrade (Debian base, same Tor path)")
     held = [pkg for pkg in ALL_KNOWN
             if run(["apt-mark", "hold", pkg]) == 0]
-    if run(["apt-get", "update"], timeout=1800) != 0:
+    debian_update_rc = run(["apt-get", "update"], timeout=1800)
+    if debian_update_rc != 0:
         log("Debian apt-get update failed for at least one source "
             "- logged only; upgrading from whatever lists did "
             "arrive (e.g. security), the rest retries next run")
@@ -1074,6 +1107,14 @@ def main():
     if rc != 0:
         log("Debian upgrade returned %d - logged, project state "
             "unaffected" % rc)
+    # The channel's outcome for the status record (audit
+    # T3-1): clean means its update AND its install phase
+    # both completed. Set BEFORE the status writes below so
+    # the run's final record carries this run's outcome.
+    DEBIAN_PHASE_OK = (debian_update_rc == 0 and rc == 0)
+    if not DEBIAN_PHASE_OK:
+        log("Debian phase did not complete cleanly this run; "
+            "the status record will say so (audit T3-1)")
 
     if recovering:
         # Never reached a healthy state this run (e.g. the repo
@@ -1090,6 +1131,16 @@ def main():
         return 5
     if worst == 0:
         detail = "Everything is current."
+        if DEBIAN_PHASE_OK is False:
+            # The project channel is current; the Debian
+            # channel is not known to be (audit T3-1). The
+            # record must not claim "everything" - and the
+            # Dashboard gates its "up to date" line on
+            # debian_ok besides.
+            detail = ("The platform software is current, "
+                      "but the Debian system-package phase "
+                      "did not complete this run; it will "
+                      "be retried automatically.")
         if OWNER_MAINTAINED:
             detail += (" Your %s is yours to update: a newer "
                        "packaged version is available and was "
