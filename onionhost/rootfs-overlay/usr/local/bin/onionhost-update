@@ -413,6 +413,26 @@ def save_json(path, data):
     os.rename(tmp, path)
 
 
+def _floor_value(data, pkg):
+    """The floor for pkg in a parsed floor document, or None.
+
+    S7 fix (auditor re-verification 2026-10-30, section 3): one
+    shared validation for both floor readers - deb_floor (the
+    signed candidate .deb) and disk_floor_for (the floor files
+    standing on disk). A floor value is usable only as a
+    non-empty string: deb_floor used to return an int/list value
+    unvalidated (S7-d), which crashed dpkg_compare downstream
+    and could be persisted into floors.json by main() first,
+    wedging every later run until a fixed package shipped;
+    disk_floor_for's F5 fix checked str but not empty. A document
+    of the wrong root type, a missing key, or a bad value all
+    mean the same thing to both readers: no floor from here."""
+    if isinstance(data, dict) and pkg in data \
+            and isinstance(data[pkg], str) and data[pkg]:
+        return data[pkg]
+    return None
+
+
 def deb_floor(deb_path, pkg):
     """Read the security floor for pkg from inside a .deb (the floor
     file is part of the signed package contents)."""
@@ -433,8 +453,9 @@ def deb_floor(deb_path, pkg):
                     data = json.load(tf.extractfile(name))
                 except Exception:  # noqa: BLE001 - keep looking
                     continue
-                if pkg in data:
-                    return data[pkg]
+                value = _floor_value(data, pkg)
+                if value is not None:
+                    return value
         return None
     except Exception as e:  # noqa: BLE001 - absent floor = no constraint
         log("floor: could not read floor from %s: %s" % (deb_path, e))
@@ -677,9 +698,9 @@ def disk_floor_for(pkg):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if isinstance(data, dict) and pkg in data \
-                    and isinstance(data[pkg], str):
-                return data[pkg]
+            value = _floor_value(data, pkg)
+            if value is not None:
+                return value
         except (OSError, ValueError):
             continue
     return None
