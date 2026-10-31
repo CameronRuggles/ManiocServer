@@ -565,18 +565,45 @@ def _makedirs_owned(path, uid, gid):
     creates to a container identity (see _chown_tree for why
     host-root ownership on the volume is broken). Pre-existing
     directories - the provisioned skeleton, the app's own data
-    dirs - keep their owners."""
-    missing = []
-    probe = path
-    while not os.path.isdir(probe):
-        missing.append(probe)
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    os.makedirs(path, exist_ok=True)
-    for d in missing:
-        os.chown(d, uid, gid)
+    dirs - keep their owners.
+
+    Component-safe (audit T8-B, seventh site): the walk opens
+    one component at a time through directory descriptors
+    with O_NOFOLLOW. The by-path os.makedirs + os.chown this
+    replaces followed a symlink planted at any component of
+    an app-writable path, steering the creates and the chowns
+    onto the link's target; here a planted component refuses
+    the apply (the open raises) instead."""
+    if ".." in path.split("/"):
+        raise ValueError("path with a '..' component: %s"
+                         % path)
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    fd = os.open("/" if path.startswith("/") else ".",
+                 os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            try:
+                nxt = os.open(part, os.O_RDONLY
+                              | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o777, dir_fd=fd)
+                    created = True
+                except FileExistsError:
+                    created = False
+                nxt = os.open(part, os.O_RDONLY
+                              | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+                if created:
+                    # Only a directory this call created is
+                    # given away; pre-existing ones keep
+                    # their owners (the contract above).
+                    os.fchown(nxt, uid, gid)
+            os.close(fd)
+            fd = nxt
+    finally:
+        os.close(fd)
 
 
 def _owner_gid():
@@ -614,6 +641,129 @@ def _dir_fd(path):
     steering a host-root write onto a host path."""
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY
                    | os.O_NOFOLLOW)
+
+
+def _ensure_dir_fd(parent_fd, name, uid, gid):
+    """Open the child directory `name` through parent_fd,
+    creating it (and giving it to uid/gid, the recipe-managed
+    owner) when missing. The open is O_NOFOLLOW: a name
+    planted as a symlink raises instead of steering later
+    writes onto its target (audit T8-B, seventh site).
+    Returns a new descriptor the caller closes; parent_fd
+    stays open."""
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY
+                       | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkdir(name, 0o777, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        created = False
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY
+                 | os.O_NOFOLLOW, dir_fd=parent_fd)
+    if created:
+        os.fchown(fd, uid, gid)
+    return fd
+
+
+def _place_file_fd(dir_fd, name, src_path, mode, uid, gid,
+                   keep_times=False):
+    """Place one platform file into an app-writable directory
+    through its descriptor - never by path, never through a
+    link (audit T8-B, seventh site: apply_native placed the
+    recipe-managed files and the staged binary into the
+    app-writable native/ tree with shutil.copy2 / open() by
+    path, so a symlink planted at a destination name wrote
+    the recipe's bytes into the link's host target and
+    chmod/chowned the target).
+
+    Semantics at an existing destination name - the
+    platform's fail-closed stance on planted names, the same
+    one provision and the staged import keep: a REGULAR file
+    is an ordinary refresh, unlinked through the descriptor
+    and recreated O_CREAT|O_EXCL; anything else at the name
+    (a symlink, a fifo, a directory) refuses the apply with
+    OSError, and the name's target - if any - is never
+    touched. Owner and mode are asserted through the
+    descriptor before the bytes land."""
+    sfd = os.open(src_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        sst = os.fstat(sfd)
+        if not stat.S_ISREG(sst.st_mode):
+            raise OSError("placement source %s is not a "
+                          "regular file" % src_path)
+        try:
+            dst_st = os.stat(name, dir_fd=dir_fd,
+                             follow_symlinks=False)
+        except FileNotFoundError:
+            dst_st = None
+        if dst_st is not None:
+            if not stat.S_ISREG(dst_st.st_mode):
+                raise OSError(
+                    "refusing to place %s: the destination "
+                    "name is not a regular file (audit T8-B)"
+                    % name)
+            os.unlink(name, dir_fd=dir_fd)
+        dfd = os.open(name, os.O_WRONLY | os.O_CREAT
+                      | os.O_EXCL | os.O_NOFOLLOW, 0o666,
+                      dir_fd=dir_fd)
+        try:
+            os.fchmod(dfd, mode if mode is not None
+                      else stat.S_IMODE(sst.st_mode))
+            os.fchown(dfd, uid, gid)
+            while True:
+                chunk = os.read(sfd, 1 << 16)
+                if not chunk:
+                    break
+                _write_all(dfd, chunk)
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        if keep_times:
+            # shutil.copy2 carried the payload file's times;
+            # keep that behaviour for the managed files.
+            os.utime(name, ns=(sst.st_atime_ns,
+                               sst.st_mtime_ns),
+                     dir_fd=dir_fd, follow_symlinks=False)
+    finally:
+        os.close(sfd)
+
+
+def _native_parent_fd(native_fd, rel, uid, gid):
+    """Descriptor for the directory inside native/ that the
+    relative destination `rel` lands in, creating
+    recipe-managed parents through descriptors (created
+    parents belong to uid/gid, as _makedirs_owned asserted
+    for them). The caller closes the result; a destination
+    at the native root gets a dup of native_fd."""
+    fd = os.dup(native_fd)
+    try:
+        for comp in rel.split("/")[:-1]:
+            nxt = _ensure_dir_fd(fd, comp, uid, gid)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fchown_nofollow(path, uid, gid):
+    """fchown a regular file opened no-follow (audit T8-B,
+    seventh site): the by-path os.chown this replaces would
+    land on a planted link's target. Raises OSError when the
+    name is a symlink or not a regular file - the caller
+    fails closed."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                 | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file: %s" % path)
+        os.fchown(fd, uid, gid)
+    finally:
+        os.close(fd)
 
 
 # The staged database import's managed home (audit T8-A,
@@ -1499,61 +1649,88 @@ def apply_native(recipe_id, manifest, payload_dir, state,
     # container's root mapping (D5/D6: staged as host root they
     # would be "nobody" in the namespace and unreadable where
     # their modes are tight).
-    for item in manifest.get("native_files", []):
-        src = os.path.join(payload_dir, item["src"])
-        dst = os.path.join(native, item["dst"])
-        _makedirs_owned(os.path.dirname(dst),
-                        CONTAINER_ROOT_UID, CONTAINER_ROOT_UID)
-        shutil.copy2(src, dst)
-        if item.get("mode"):
-            os.chmod(dst, int(item["mode"], 8))
-        os.chown(dst, CONTAINER_ROOT_UID, CONTAINER_ROOT_UID)
-    if first_install and cfg_spec:
-        title = (staged or {}).get("title") \
-            or manifest.get("default_title", "")
-        rendered = render_native_config(
-            os.path.join(payload_dir, cfg_spec["src"]),
-            manifest, title)
-        _makedirs_owned(os.path.dirname(cfg_dst),
-                        CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-        _atomic_write(cfg_dst, rendered.encode(), mode=0o640)
-        # The app process (www-data) is the config's reader;
-        # owned by host root it is unreadable in the namespace
-        # at any tight mode (D6 - the app died at startup).
-        os.chown(cfg_dst, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-    if first_install and manifest.get("first_boot"):
-        # Stage the administrator env ON THE VOLUME: the app
-        # container's init hands it to the recipe's first-boot
-        # step, which consumes and shreds this copy; the host
-        # copy is shredded by await-first-boot once the step
-        # reports done. Same 0400 discipline as the host file -
-        # and the volume copy belongs to the container's root,
-        # the only identity that may read it there (D5: as host
-        # root 0400 it was "nobody"-owned in the namespace and
-        # the first-boot step got Permission denied, so the
-        # administrator was never created).
-        with open(ADMIN_ENV, "rb") as f:
-            blob = f.read()
-        env_dst = os.path.join(native, FIRST_BOOT_ENV)
-        _atomic_write(env_dst, blob, mode=0o400)
-        os.chown(env_dst, CONTAINER_ROOT_UID, CONTAINER_ROOT_UID)
-    _write_overlays(recipe_id)
-    # The binary itself: stage beside the live one, then rename.
-    tmp = os.path.join(native, ".app.new")
-    with open(archive_path, "rb") as fin, \
-            open(tmp, "wb") as fout:
-        shutil.copyfileobj(fin, fout)
-        fout.flush()
-        os.fsync(fout.fileno())
-    os.chmod(tmp, 0o755)
-    # The app runs as www-data; the binary is staged under its
-    # mapping, like the rest of the native tree's working files.
-    os.chown(tmp, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
-    app = os.path.join(native, "app")
-    prev = os.path.join(native, ".app-prev")
-    if os.path.isfile(app):
-        os.replace(app, prev)
-    os.replace(tmp, app)
+    # Every placement below goes through the native tree's
+    # descriptor, never by path (audit T8-B, seventh site):
+    # native/ is app-writable, and the by-path copies and
+    # chmod/chowns this replaces followed symlinks the app
+    # planted at the destination names, writing the recipe's
+    # bytes into host files outside the tree.
+    native_fd = _dir_fd(native)
+    try:
+        for item in manifest.get("native_files", []):
+            src = os.path.join(payload_dir, item["src"])
+            parent_fd = _native_parent_fd(
+                native_fd, item["dst"],
+                CONTAINER_ROOT_UID, CONTAINER_ROOT_UID)
+            try:
+                _place_file_fd(
+                    parent_fd, item["dst"].split("/")[-1],
+                    src,
+                    int(item["mode"], 8) if item.get("mode")
+                    else None,
+                    CONTAINER_ROOT_UID, CONTAINER_ROOT_UID,
+                    keep_times=True)
+            finally:
+                os.close(parent_fd)
+        if first_install and cfg_spec:
+            title = (staged or {}).get("title") \
+                or manifest.get("default_title", "")
+            rendered = render_native_config(
+                os.path.join(payload_dir, cfg_spec["src"]),
+                manifest, title)
+            _makedirs_owned(os.path.dirname(cfg_dst),
+                            CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+            _atomic_write(cfg_dst, rendered.encode(),
+                          mode=0o640)
+            # The app process (www-data) is the config's reader;
+            # owned by host root it is unreadable in the namespace
+            # at any tight mode (D6 - the app died at startup).
+            _fchown_nofollow(cfg_dst, CONTAINER_WWW_UID,
+                             CONTAINER_WWW_GID)
+        if first_install and manifest.get("first_boot"):
+            # Stage the administrator env ON THE VOLUME: the app
+            # container's init hands it to the recipe's first-boot
+            # step, which consumes and shreds this copy; the host
+            # copy is shredded by await-first-boot once the step
+            # reports done. Same 0400 discipline as the host file -
+            # and the volume copy belongs to the container's root,
+            # the only identity that may read it there (D5: as host
+            # root 0400 it was "nobody"-owned in the namespace and
+            # the first-boot step got Permission denied, so the
+            # administrator was never created).
+            with open(ADMIN_ENV, "rb") as f:
+                blob = f.read()
+            env_dst = os.path.join(native, FIRST_BOOT_ENV)
+            _atomic_write(env_dst, blob, mode=0o400)
+            _fchown_nofollow(env_dst, CONTAINER_ROOT_UID,
+                             CONTAINER_ROOT_UID)
+        _write_overlays(recipe_id)
+        # The binary itself: stage beside the live one through
+        # the descriptor, then rename. A stale REGULAR staging
+        # is refreshed; a planted link at the staging name
+        # refuses the apply inside _place_file_fd, its target
+        # untouched. The renames are name-level operations
+        # through the same descriptor - a rename replaces the
+        # name, it never follows it.
+        # The app runs as www-data; the binary is staged under its
+        # mapping, like the rest of the native tree's working files.
+        _place_file_fd(native_fd, ".app.new", archive_path,
+                       0o755, CONTAINER_WWW_UID,
+                       CONTAINER_WWW_GID)
+        try:
+            os.stat("app", dir_fd=native_fd,
+                    follow_symlinks=False)
+            have_app = True
+        except FileNotFoundError:
+            have_app = False
+        if have_app:
+            os.replace("app", ".app-prev",
+                       src_dir_fd=native_fd,
+                       dst_dir_fd=native_fd)
+        os.replace(".app.new", "app", src_dir_fd=native_fd,
+                   dst_dir_fd=native_fd)
+    finally:
+        os.close(native_fd)
     _apply_mode_exceptions(recipe_id)
     _save_state(recipe_id, {
         "id": recipe_id,
@@ -1904,8 +2081,37 @@ def rollback_recipe(recipe_id):
         os.replace(prevb, app)
         # A binary staged by an older applier may be host-root
         # owned; the restored binary gets the www-data mapping
-        # like a fresh apply (D1, rollback path).
-        os.chown(app, CONTAINER_WWW_UID, CONTAINER_WWW_GID)
+        # like a fresh apply (D1, rollback path). Through the
+        # tree's descriptor, never by path (audit T8-B,
+        # seventh site): if the restored name is a planted
+        # link, the chown is skipped with a warning rather
+        # than landing on the link's target.
+        native_fd = _dir_fd(native)
+        try:
+            try:
+                bfd = os.open("app", os.O_RDONLY | os.O_NOFOLLOW
+                              | os.O_NONBLOCK, dir_fd=native_fd)
+            except OSError:
+                bfd = None
+            if bfd is None:
+                print("onionhost-recipe: WARNING: cannot open "
+                      "the restored binary without following "
+                      "links; not chowning it (audit T8-B)",
+                      file=sys.stderr)
+            else:
+                try:
+                    if stat.S_ISREG(os.fstat(bfd).st_mode):
+                        os.fchown(bfd, CONTAINER_WWW_UID,
+                                  CONTAINER_WWW_GID)
+                    else:
+                        print("onionhost-recipe: WARNING: the "
+                              "restored binary is not a regular "
+                              "file; not chowning it (audit "
+                              "T8-B)", file=sys.stderr)
+                finally:
+                    os.close(bfd)
+        finally:
+            os.close(native_fd)
         # The root the binary lives in gets the same assertion
         # as a fresh apply (D7, rollback path).
         _own_native_root(native)

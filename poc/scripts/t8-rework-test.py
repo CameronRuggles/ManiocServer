@@ -460,6 +460,200 @@ check("backup no-follow copy copies a regular file",
                  ctarget) is True
       and open(ctarget).read() == "<?php // site")
 
+# ============ FOLLOW-UP FIX 1 (T8-B seventh site) ========
+# The native apply path (auditor re-verification 2026-10-31
+# section 3): apply_native placed recipe files and the staged
+# binary by path over the app-writable native/ tree. Each leg
+# below drives the real apply_recipe -> apply_native (or
+# rollback_recipe) with one destination name pre-planted as a
+# symlink to a marker outside the tree; on the pre-fix tree
+# the marker is written/chmodded/chowned (FAIL), after the
+# fix the apply refuses and the marker is untouched (PASS).
+import hashlib
+import json
+
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _native_venue(tag):
+    vdir = os.path.join(tmp, "native-" + tag)
+    appdata = os.path.join(vdir, "appdata")
+    payload = os.path.join(vdir, "payload", "natapp")
+    os.makedirs(os.path.join(payload, "archive"))
+    os.makedirs(appdata)
+    helper = b"#!/bin/sh\n: helper v2\n"
+    nested = b"#!/bin/sh\n: nested v2\n"
+    binary = b"<recipe-signed binary v2>"
+    for name, blob in (("helper.sh", helper),
+                       ("nested.sh", nested),
+                       ("config.tpl", b"t=__SITE_TITLE__\n")):
+        with open(os.path.join(payload, name), "wb") as f:
+            f.write(blob)
+    with open(os.path.join(payload, "archive", "app.bin"),
+              "wb") as f:
+        f.write(binary)
+    manifest = {
+        "id": "natapp", "version": "2", "runtime": "native",
+        "app": {"version": "1.0", "name": "Native App"},
+        "archive": {"format": "file", "file": "app.bin",
+                    "sha256": _sha(binary)},
+        "native_config": {"src": "config.tpl",
+                          "dst": "config/app.conf"},
+        "native_files": [
+            {"src": "helper.sh", "dst": "helper.sh",
+             "mode": "755", "sha256": _sha(helper)},
+            {"src": "nested.sh", "dst": "sub/nested.sh",
+             "sha256": _sha(nested)}],
+    }
+    with open(os.path.join(payload, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    mod = load("oh_recipe_native_" + tag,
+               os.path.join(BIN, "onionhost-recipe"),
+               {"ONIONHOST_CONTAINER_UID_BASE": BASE,
+                "ONIONHOST_APPDATA": appdata,
+                "ONIONHOST_RECIPE_PAYLOAD_ROOT":
+                    os.path.join(vdir, "payload"),
+                "ONIONHOST_ETC": os.path.join(vdir, "etc"),
+                "ONIONHOST_RECIPE_STATE":
+                    os.path.join(vdir, "state")})
+    native = os.path.join(appdata, "native")
+    os.makedirs(os.path.join(native, "config"))
+    # Non-first apply: the config already exists.
+    with open(os.path.join(native, "config", "app.conf"),
+              "w") as f:
+        f.write("t=existing\n")
+    with open(os.path.join(native, "app"), "wb") as f:
+        f.write(b"OLD-BIN")
+    outside = os.path.join(vdir, "outside")
+    os.makedirs(outside)
+    return mod, appdata, native, outside
+
+
+def _marker(outside, name, blob):
+    p = os.path.join(outside, name)
+    with open(p, "wb") as f:
+        f.write(blob)
+    os.chmod(p, 0o600)
+    return p
+
+
+def _untouched(p, blob):
+    return open(p, "rb").read() == blob \
+        and mode_of(p) == 0o600 and owner_of(p) == (0, 0)
+
+
+def _apply_outcome(mod):
+    try:
+        return mod.apply_recipe("natapp") == 0
+    except OSError:
+        return False
+
+
+# Leg A: a native_files destination planted as a file link.
+mod, appdata, native, outside = _native_venue("a")
+tgt = _marker(outside, "nf-target", b"OUTSIDE-NF")
+os.symlink(tgt, os.path.join(native, "helper.sh"))
+ok = _apply_outcome(mod)
+check("native: planted native_files dst link refuses the "
+      "apply", not ok)
+check("native: native_files link target untouched",
+      _untouched(tgt, b"OUTSIDE-NF"))
+
+# Leg B: a nested destination's parent component planted as
+# a directory link.
+mod, appdata, native, outside = _native_venue("b")
+os.makedirs(os.path.join(outside, "subdir"))
+tgt = _marker(os.path.join(outside, "subdir"), "nested.sh",
+              b"OUTSIDE-NESTED")
+os.symlink(os.path.join(outside, "subdir"),
+           os.path.join(native, "sub"))
+ok = _apply_outcome(mod)
+check("native: planted parent-component link refuses the "
+      "apply", not ok)
+check("native: nested link target untouched",
+      _untouched(tgt, b"OUTSIDE-NESTED"))
+
+# Leg C: the binary staging name .app.new planted as a link.
+mod, appdata, native, outside = _native_venue("c")
+tgt = _marker(outside, "bin-target", b"OUTSIDE-BIN")
+os.symlink(tgt, os.path.join(native, ".app.new"))
+ok = _apply_outcome(mod)
+check("native: planted .app.new link refuses the apply",
+      not ok)
+check("native: binary staging link target untouched",
+      _untouched(tgt, b"OUTSIDE-BIN"))
+check("native: live binary not swapped when staging refuses",
+      not os.path.islink(os.path.join(native, "app"))
+      and open(os.path.join(native, "app"), "rb").read()
+      == b"OLD-BIN")
+
+# Leg D: the honest apply still works, twice (the second is
+# the refresh path: existing regular files are replaced).
+mod, appdata, native, outside = _native_venue("d")
+ok = _apply_outcome(mod)
+hfile = os.path.join(native, "helper.sh")
+nfile = os.path.join(native, "sub", "nested.sh")
+afile = os.path.join(native, "app")
+check("native: previous binary kept at .app-prev",
+      ok and open(os.path.join(native, ".app-prev"),
+                  "rb").read() == b"OLD-BIN")
+ok = ok and _apply_outcome(mod)
+check("native: honest apply + refresh succeed", ok)
+check("native: managed file placed with mode + owner",
+      os.path.isfile(hfile) and not os.path.islink(hfile)
+      and open(hfile, "rb").read()
+      == b"#!/bin/sh\n: helper v2\n"
+      and mode_of(hfile) == 0o755
+      and owner_of(hfile) == (10000, 10000))
+check("native: nested managed file placed in a real subdir",
+      os.path.isfile(nfile) and not os.path.islink(nfile)
+      and owner_of(nfile) == (10000, 10000)
+      and owner_of(os.path.join(native, "sub")) == (10000, 10000))
+check("native: binary swapped in as www-owned 0755",
+      os.path.isfile(afile) and not os.path.islink(afile)
+      and open(afile, "rb").read()
+      == b"<recipe-signed binary v2>"
+      and mode_of(afile) == 0o755
+      and owner_of(afile) == (10033, 10033))
+
+# Leg E: rollback's restored-binary chown never follows a
+# planted link (and still lands for a regular file).
+mod, appdata, native, outside = _native_venue("e")
+state_dir = os.path.join(appdata, "..", "state", "natapp")
+os.makedirs(state_dir, exist_ok=True)
+with open(os.path.join(state_dir, "state.json"), "w") as f:
+    json.dump({"id": "natapp", "version": "2",
+               "prev_version": "1"}, f)
+prevb = os.path.join(native, ".app-prev")
+with open(prevb, "wb") as f:
+    f.write(b"PREV-BIN")
+try:
+    rc = mod.rollback_recipe("natapp")
+except OSError:
+    rc = -1
+check("rollback: regular restored binary is www-owned",
+      rc == 0 and owner_of(os.path.join(native, "app"))
+      == (10033, 10033)
+      and open(os.path.join(native, "app"), "rb").read()
+      == b"PREV-BIN")
+# Planted variant: .app-prev itself is a link out of the tree.
+mod, appdata, native, outside = _native_venue("e2")
+state_dir = os.path.join(appdata, "..", "state", "natapp")
+os.makedirs(state_dir, exist_ok=True)
+with open(os.path.join(state_dir, "state.json"), "w") as f:
+    json.dump({"id": "natapp", "version": "2",
+               "prev_version": "1"}, f)
+tgt = _marker(outside, "prev-target", b"OUTSIDE-PREV")
+os.symlink(tgt, os.path.join(native, ".app-prev"))
+try:
+    mod.rollback_recipe("natapp")
+except OSError:
+    pass
+check("rollback: planted .app-prev link target untouched",
+      _untouched(tgt, b"OUTSIDE-PREV"))
+
 print()
 if failures:
     print("FAILURES: %d" % len(failures))
