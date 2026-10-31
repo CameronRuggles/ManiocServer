@@ -241,6 +241,46 @@ def _check_recipe_relative_path(recipe_id, field, value):
             % (recipe_id, field, value))
 
 
+def _check_manifest_str_list(manifest, recipe_id, field):
+    """A manifest field the applier iterates as a list of paths
+    must actually be a list of strings (S7 fix, auditor
+    re-verification 2026-10-30 section 3): the bare iterations
+    and set() calls at the use sites raise TypeError on a
+    non-list value, and a bare string would silently iterate
+    as single characters. Each entry then gets the same
+    relative-path check as every other recipe-supplied path."""
+    values = manifest.get(field, [])
+    if not isinstance(values, list):
+        raise ValueError(
+            "recipe %s: %s %r is not a list; refusing to use it"
+            % (recipe_id, field, values))
+    for value in values:
+        _check_recipe_relative_path(recipe_id, field, value)
+
+
+def _check_manifest_file_entries(manifest, recipe_id, field):
+    """A manifest field the applier iterates as a list of
+    {src, dst} objects (native_files, extra_files) must actually
+    be a list of objects; the src/dst of each entry get the
+    relative-path check. A non-list value used to reach the bare
+    iteration and raise TypeError (S7-e: "native_files": 5)."""
+    entries = manifest.get(field, [])
+    if not isinstance(entries, list):
+        raise ValueError(
+            "recipe %s: %s %r is not a list; refusing to use it"
+            % (recipe_id, field, entries))
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "recipe %s: %s entry %r is not an "
+                "object; refusing to use it"
+                % (recipe_id, field, item))
+        for sub in ("src", "dst"):
+            _check_recipe_relative_path(
+                recipe_id, "%s[].%s" % (field, sub),
+                item.get(sub))
+
+
 def _validate_manifest_paths(manifest, recipe_id):
     """Validate every recipe-supplied path the applier joins,
     at load time - before any join, verification read or
@@ -249,16 +289,13 @@ def _validate_manifest_paths(manifest, recipe_id):
     if isinstance(arc, dict) and "file" in arc:
         _check_recipe_relative_path(recipe_id, "archive.file",
                                     arc.get("file"))
-    for item in manifest.get("native_files", []):
-        if not isinstance(item, dict):
-            raise ValueError(
-                "recipe %s: native_files entry %r is not an "
-                "object; refusing to use it"
-                % (recipe_id, item))
-        for field in ("src", "dst"):
-            _check_recipe_relative_path(
-                recipe_id, "native_files[].%s" % field,
-                item.get(field))
+    _check_manifest_file_entries(manifest, recipe_id,
+                                 "native_files")
+    _check_manifest_file_entries(manifest, recipe_id,
+                                 "extra_files")
+    for field in ("data_dirs", "exclude_paths", "install_files",
+                  "config_carryover"):
+        _check_manifest_str_list(manifest, recipe_id, field)
 
 
 def _load_manifest(recipe_id):
