@@ -622,6 +622,61 @@ def _reboot_state():
     return required, "; ".join(reasons)
 
 
+def _purge_superseded_kernels():
+    """Purge superseded kernel image packages (audit T1-2).
+
+    The Debian phase deliberately installs NEW kernel ABI
+    packages (--with-new-pkgs), and nothing ever removed the
+    ones they superseded: /boot and the dpkg database grew
+    by one full kernel per ABI bump, forever. After a
+    successful install phase, purge every installed
+    versioned kernel image EXCEPT the running kernel's
+    package (never purge what the box booted) and the
+    newest installed (the one the next reboot lands on).
+    Best-effort by design: a purge failure is logged and
+    changes nothing else - the phase's recorded outcome
+    (T3-1) is the install's, not the purge's."""
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Package}\n",
+             "linux-image-[0-9]*"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=120)
+        names = [ln.strip() for ln in proc.stdout.splitlines()
+                 if ln.strip().startswith("linux-image-")]
+    except Exception as exc:  # noqa: BLE001 - log-only helper
+        log("kernel purge skipped: could not list installed "
+            "kernels (%s)" % exc.__class__.__name__)
+        return
+
+    def _kkey(name):
+        nums = []
+        for part in name[len("linux-image-"):].replace(
+                "-", ".").split("."):
+            if part.isdigit():
+                nums.append(int(part))
+            else:
+                break
+        return tuple(nums)
+
+    running = "linux-image-" + os.uname().release
+    if not names:
+        return
+    newest = max(names, key=_kkey)
+    victims = sorted(n for n in names
+                     if n != running and n != newest)
+    if not victims:
+        return
+    log("purging superseded kernel packages (audit T1-2): %s "
+        "(keeping the running %s and the newest %s)"
+        % (", ".join(victims), running, newest))
+    rc = run(["apt-get", "purge", "-y"] + victims,
+             timeout=None)
+    if rc != 0:
+        log("kernel purge returned %d - logged only; the "
+            "superseded packages stay for a later run" % rc)
+
+
 def write_status(state, detail, packages):
     status_path = os.path.join(STATE_DIR, "status.json")
     prev = load_json(status_path, {})
@@ -1093,15 +1148,28 @@ def main():
     # as new ABI packages behind linux-image-amd64, and plain
     # apt-get upgrade holds those back forever. The flag never
     # removes anything.
+    #
+    # The untimed install must never do network I/O (audit
+    # T1-1): it runs --no-download, installing only from the
+    # completed download phase, and when that phase failed
+    # the install is SKIPPED entirely (the phase is judged
+    # failed, by the download's own result). The previous
+    # shape silently re-opened the exact exposure T1
+    # closed - the timed-out download retried inside the
+    # unkillable call, this time with dpkg live.
     dl = run(["apt-get", "--download-only", "-y",
               "--with-new-pkgs"] + DPKG_OPTS + ["upgrade"],
              timeout=3600)
     if dl != 0:
         log("Debian download phase returned %d - the install "
-            "phase re-fetches what it needs and is judged by "
-            "its own result" % dl)
-    rc = run(["apt-get", "-y", "--with-new-pkgs"] + DPKG_OPTS
-             + ["upgrade"], timeout=None)
+            "phase is skipped this run (audit T1-1): the "
+            "untimed install never fetches, so there is "
+            "nothing complete to install" % dl)
+        rc = dl
+    else:
+        rc = run(["apt-get", "-y", "--no-download",
+                  "--with-new-pkgs"] + DPKG_OPTS + ["upgrade"],
+                 timeout=None)
     for pkg in held:
         run(["apt-mark", "unhold", pkg])
     if rc != 0:
@@ -1115,6 +1183,11 @@ def main():
     if not DEBIAN_PHASE_OK:
         log("Debian phase did not complete cleanly this run; "
             "the status record will say so (audit T3-1)")
+    if rc == 0:
+        # Housekeeping the phase's own growth made necessary
+        # (audit T1-2); the helper is log-only and can never
+        # change this run's outcome.
+        _purge_superseded_kernels()
 
     if recovering:
         # Never reached a healthy state this run (e.g. the repo
