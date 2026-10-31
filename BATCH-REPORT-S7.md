@@ -152,7 +152,7 @@ reproducers from `~/workspace/manioc-fuzz-2026-10-28/reproducers/`.
 ## Final gate — on code head c29feee
 
 Auditor's harness, same invocation as the positive control,
-against this tree: **all 43 rows CLEAN, 0 CRASH** — F1–F6
+against this tree: **all 42 rows CLEAN, 0 CRASH** — F1–F6
 reproducers/probes, S7-a ×2, S7-b ×2, S7-c ×2, S7-d ×2, S7-e ×2
 all follow the tools' error discipline, S7-f "n/a" on this tree
 (closure path via Task 1's guard, above), and all 11 valid-input

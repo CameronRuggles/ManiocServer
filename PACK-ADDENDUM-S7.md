@@ -16,9 +16,10 @@ his legs 2–3 run.
   exactly as the auditor's §5 states).
 - **New code head: `c29feee00252af4fb0fe006760ecef5246e57a71`**
   — run legs 2–3 against THIS head.
-- New branch tip: the single report commit directly above the
-  code head, adding only `BATCH-REPORT-S7.md` and this addendum
-  (`git diff c29feee..HEAD --stat` shows no code files).
+- New branch tip: the report commits directly above the code
+  head, adding only `BATCH-REPORT-S7.md`, this addendum, and a
+  row-count correction to both (`git diff c29feee..HEAD --stat`
+  shows no code files).
 - Base unchanged: `720aafac2d9ec75f2eaff677c19f891787a63772`.
 - Diff ranges: original batch `720aafa..7866162` (unchanged);
   this extension `7866162..c29feee` — three commits:
@@ -73,7 +74,7 @@ closes it on the merged tree whichever batch lands first.
   against pristine 720aafa reproduces his
   `results-fuzz-base-720aafa.txt` row-for-row (28 CRASH; only
   Python stdlib frame line numbers differ).
-- Final gate on `c29feee`: the same harness reports **all 43
+- Final gate on `c29feee`: the same harness reports **all 42
   rows CLEAN, 0 CRASH**, all 11 controls identical to base; the
   original batch's 33-case runner (reconstructed from its
   BATCH-REPORT after the /tmp original expired; validated by
