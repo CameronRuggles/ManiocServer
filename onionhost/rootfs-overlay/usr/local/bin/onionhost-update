@@ -380,9 +380,27 @@ def _run_images_importer(*args):
 def load_json(path, default):
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return default
+    # S7 fix (auditor re-verification 2026-10-30, section 3): a
+    # type-confused state file (valid JSON, wrong root type) used
+    # to escape this helper and crash its callers downstream -
+    # _installed_recipe and _recipe_app_name on their .get calls
+    # (that was fuzz F4's root cause, previously guarded at those
+    # two call sites), and main()'s baseline reads of status.json,
+    # highwater.json and floors.json (S7-a/b/c: the crash runs
+    # first thing every run, before fetch, and nothing rewrites
+    # the file, so it wedges every later run permanently - F5's
+    # placement). The auditor's suggested shape: a parsed result
+    # that is not the default's type is not a usable value - the
+    # caller gets its default, exactly as for a missing or
+    # unparseable file. The audit-fix branch's write_status reads
+    # status.json through this same helper, so this also closes
+    # S7-f on the merged tree whichever batch lands first.
+    if not isinstance(data, type(default)):
+        return default
+    return data
 
 
 def save_json(path, data):
