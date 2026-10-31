@@ -220,9 +220,20 @@ def provision(user, runtime, db_mode=None):
     # into import/: a restore or a recipe seed may have staged
     # it there and no container start has consumed it yet.
     # Through descriptors only, no-follow, and only when the
-    # import directory does not already hold a staged import
-    # (that one is the live staging; a second is left in place
-    # and reported, never silently overwritten or dropped).
+    # import directory does not already hold a staged import.
+    # When it does, that one is the live staging and the root
+    # copy is QUARANTINED - renamed through the appdata
+    # descriptor to db-import.sql.gz.superseded, a name no
+    # code path treats as a staged import (the migration here
+    # and onionhost-recipe's _staged_import_exists read the
+    # exact root name only, and app-init reads only import/) -
+    # never silently overwritten or dropped, but also never
+    # left where a later publish could migrate it: the
+    # original leave-in-place behaviour let the stale root
+    # copy resurrect into import/ once the live staging was
+    # consumed, and the next container start imported it over
+    # everything written since (auditor re-verification
+    # 2026-10-31 section 5).
     try:
         legacy_fd = os.open("db-import.sql.gz",
                             os.O_RDONLY | os.O_NOFOLLOW,
@@ -244,8 +255,30 @@ def provision(user, runtime, db_mode=None):
                           "import exists both at the appdata "
                           "root and in import/; the import/ "
                           "copy is the live one and the root "
-                          "copy was left in place",
+                          "copy was quarantined as "
+                          "db-import.sql.gz.superseded",
                           file=sys.stderr)
+                    # Quarantine through the appdata
+                    # descriptor (rename replaces the NAME,
+                    # never follows it), then fsync so the
+                    # rename is durable before anything else
+                    # runs. If the rename is impossible, the
+                    # root copy is unlinked through the
+                    # descriptor instead: either way it can
+                    # never be migrated later.
+                    try:
+                        os.rename("db-import.sql.gz",
+                                  "db-import.sql.gz.superseded",
+                                  src_dir_fd=appdata_fd,
+                                  dst_dir_fd=appdata_fd)
+                    except OSError:
+                        os.unlink("db-import.sql.gz",
+                                  dir_fd=appdata_fd)
+                        print("app-provision: WARNING: the "
+                              "quarantine rename failed; the "
+                              "stale root import was removed "
+                              "instead", file=sys.stderr)
+                    os.fsync(appdata_fd)
                 if mig_fd is not None:
                     with os.fdopen(mig_fd, "wb") as out, \
                             os.fdopen(os.dup(legacy_fd),

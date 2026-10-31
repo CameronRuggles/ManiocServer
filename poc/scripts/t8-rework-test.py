@@ -129,15 +129,23 @@ check("provision migrates a lingering root-level import",
       rc == 0 and not os.path.exists(legacy)
       and os.path.isfile(moved)
       and open(moved, "rb").read() == b"LEGACY-DUMP")
-# ...and stays put (with the import/ copy winning) when
-# import/ already holds a staged import.
+# ...and is quarantined (with the import/ copy winning)
+# when import/ already holds a staged import. (Follow-up
+# fix 3: left in place, the root copy resurrected into
+# import/ once the live staging was consumed - the
+# consume-then-reprovision leg at the end of this file.)
 with open(legacy, "wb") as f:
     f.write(b"SECOND-DUMP")
 rc = prov.provision("root", "php", "required")
-check("existing import/ staging wins; root copy left in place",
-      rc == 0 and os.path.isfile(legacy)
+superseded = os.path.join(pdata,
+                          "db-import.sql.gz.superseded")
+check("existing import/ staging wins; root copy quarantined",
+      rc == 0 and not os.path.exists(legacy)
+      and os.path.isfile(superseded)
+      and open(superseded, "rb").read() == b"SECOND-DUMP"
       and open(moved, "rb").read() == b"LEGACY-DUMP")
-os.unlink(legacy)
+if os.path.exists(superseded):
+    os.unlink(superseded)
 
 # ---------------- recipe staging ---------------------------
 rdata = os.path.join(tmp, "recipe", "appdata")
@@ -653,6 +661,48 @@ except OSError:
     pass
 check("rollback: planted .app-prev link target untouched",
       _untouched(tgt, b"OUTSIDE-PREV"))
+
+# ============ FOLLOW-UP FIX 3 (T8-A residual) ============
+# The migration conflict case (auditor re-verification
+# 2026-10-31 section 5), driven as the auditor's 5-step
+# sequence: fresh provision; plant OLD root copy + NEW
+# import/ staging; publish (conflict - the root copy must be
+# quarantined, not left); the container consumes the import/
+# copy; publish again - import/ must stay EMPTY. On the
+# pre-fix tree the second publish migrates OLD-DUMP into
+# import/ and these checks fail.
+qdata = os.path.join(tmp, "provq", "appdata")
+prov.APPDATA = qdata
+prov.MARKER = os.path.join(tmp, "provq", "app-site")
+prov.RUNTIME_FILE = os.path.join(tmp, "provq", "app-runtime")
+prov.DB_ENV = os.path.join(tmp, "provq", "etc", "app-db.env")
+prov.APP_CONF = os.path.join(tmp, "provq", "etc", "app.conf")
+os.makedirs(os.path.join(tmp, "provq", "etc"), exist_ok=True)
+rc = prov.provision("root", "php", "required")
+qroot = os.path.join(qdata, "db-import.sql.gz")
+qimp = os.path.join(qdata, "import", "db-import.sql.gz")
+qsup = os.path.join(qdata, "db-import.sql.gz.superseded")
+with open(qroot, "wb") as f:
+    f.write(b"OLD-DUMP")
+with open(qimp, "wb") as f:
+    f.write(b"NEW-DUMP")
+rc = prov.provision("root", "php", "required")
+check("conflict: root copy quarantined, not left in place",
+      rc == 0 and not os.path.exists(qroot)
+      and os.path.isfile(qsup)
+      and open(qsup, "rb").read() == b"OLD-DUMP")
+check("conflict: import/ staging still the live one",
+      open(qimp, "rb").read() == b"NEW-DUMP")
+os.unlink(qimp)  # the container consumes the import/ copy
+rc = prov.provision("root", "php", "required")
+check("consume-then-reprovision: nothing is resurrected",
+      rc == 0 and not os.path.exists(qimp)
+      and not os.path.exists(qroot)
+      and open(qsup, "rb").read() == b"OLD-DUMP")
+rec.APPDATA = qdata
+check("quarantined name never counts as a staged import",
+      rec._staged_import_exists() is False)
+rec.APPDATA = rdata
 
 print()
 if failures:
