@@ -554,7 +554,10 @@ case "$RUNTIME" in
                         echo "app-init: app.env: ignoring" \
                              "platform-managed name $_key"
                         continue ;;
-                    *[!A-Za-z0-9_]*|'')
+                    *[!A-Za-z0-9_]*|[0-9]*|'')
+                        # (the [0-9]* arm: a name may not BEGIN
+                        # with a digit - not a valid identifier,
+                        # and export would silently refuse it)
                         echo "app-init: app.env: ignoring a" \
                              "malformed line"
                         continue ;;
