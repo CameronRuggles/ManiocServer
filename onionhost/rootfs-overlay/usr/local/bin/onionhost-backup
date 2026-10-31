@@ -111,6 +111,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -393,6 +394,42 @@ def _dump_pg_database(work):
     return path
 
 
+# Archive paths of symlinks skipped while collecting the
+# app trees (audit T8-B), reset by create_backup per run and
+# named in the manifest's skipped list - the same honesty
+# the *.tmp skips get (S12): the owner can see that a link
+# in their app folder was NOT backed up, and why.
+_SKIPPED_LINKS = []
+
+
+def _copy_file_nofollow(src, target):
+    """Copy a regular file into the payload WITHOUT ever
+    following a symlink (audit T8-B): the source is opened
+    O_NOFOLLOW and must stat as a regular file, so a name
+    swapped for a link - or a link the collection walk
+    somehow let through - copies nothing. Returns False
+    when the source is a link or not a regular file."""
+    try:
+        sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW
+                      | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(sfd).st_mode):
+            os.close(sfd)
+            return False
+        with os.fdopen(sfd, "rb") as f, open(target, "wb") \
+                as out:
+            shutil.copyfileobj(f, out)
+        return True
+    except OSError:
+        try:
+            os.close(sfd)
+        except OSError:
+            pass
+        return False
+
+
 def _collect_app(entries, generated, work, runtime, engine):
     """The app slot's contents (see the header). May stop/start
     the app container: the native runtime's SQLite files must be
@@ -432,10 +469,35 @@ def _collect_app(entries, generated, work, runtime, engine):
             base = os.path.join(APPDATA, sub)
             if not os.path.isdir(base):
                 continue
-            for root, _dirs, files in os.walk(base):
+            for root, dirs, files in os.walk(base):
+                # Never follow a link out of the app trees
+                # (audit T8-B): the trees are app-writable,
+                # and a planted link's host target used to
+                # enter the backup under the link's innocent
+                # name (the forbidden-name filter judges the
+                # archive path, not the target), landing in
+                # the app's tree again on restore. Links -
+                # file or directory - are skipped here and
+                # recorded in _SKIPPED_LINKS, which the
+                # manifest names like the *.tmp skips.
+                kept_dirs = []
+                for dname in dirs:
+                    dpath = os.path.join(root, dname)
+                    if os.path.islink(dpath):
+                        rel = os.path.relpath(dpath, APPDATA)
+                        _SKIPPED_LINKS.append(
+                            "app/" + rel.replace(os.sep, "/")
+                            + "/")
+                    else:
+                        kept_dirs.append(dname)
+                dirs[:] = kept_dirs
                 for name in sorted(files):
                     src = os.path.join(root, name)
                     rel = os.path.relpath(src, APPDATA)
+                    if os.path.islink(src):
+                        _SKIPPED_LINKS.append(
+                            "app/" + rel.replace(os.sep, "/"))
+                        continue
                     entries.append(
                         ("app/" + rel.replace(os.sep, "/"),
                          src, "app-data"))
@@ -526,6 +588,7 @@ def create_backup(user, dest):
     salts = {"main": entry["salt"]}
 
     skipped = []
+    _SKIPPED_LINKS.clear()
     work = tempfile.mkdtemp(prefix="onionhost-backup-",
                              dir="/var/lib/onionhost")
     try:
@@ -588,7 +651,21 @@ def create_backup(user, dest):
                 digest = hashlib.sha256(data).hexdigest()
                 size = len(data)
             else:
-                shutil.copyfile(src, target)
+                if kind == "app-data" and not \
+                        _copy_file_nofollow(src, target):
+                    # The name was swapped for a link (or a
+                    # non-regular file) between collection
+                    # and copy, or the walk let one through:
+                    # skip it and record it - a backup never
+                    # copies through a link (audit T8-B).
+                    _SKIPPED_LINKS.append(arc)
+                    try:
+                        os.unlink(target)
+                    except OSError:
+                        pass
+                    continue
+                if kind != "app-data":
+                    shutil.copyfile(src, target)
                 digest = _sha256(target)
                 size = os.path.getsize(target)
             manifest_entries.append({
@@ -614,13 +691,21 @@ def create_backup(user, dest):
         }
         if site_kind == "app":
             manifest["appRuntime"] = runtime
-        if skipped:
-            manifest["skipped"] = [
-                {"path": arc,
-                 "reason": "temporary file (*.tmp): not a "
-                           "complete file, left out of the "
-                           "backup"}
-                for arc in skipped]
+        skipped_records = [
+            {"path": arc,
+             "reason": "temporary file (*.tmp): not a "
+                       "complete file, left out of the "
+                       "backup"}
+            for arc in skipped]
+        skipped_records += [
+            {"path": arc,
+             "reason": "symbolic link: not followed - a "
+                       "backup never copies through a link "
+                       "(audit T8-B), so the link's target "
+                       "is not in the backup"}
+            for arc in _SKIPPED_LINKS]
+        if skipped_records:
+            manifest["skipped"] = skipped_records
         with open(os.path.join(payload_dir, "manifest.json"),
                   "w") as f:
             f.write(json.dumps(manifest, indent=2, sort_keys=True)

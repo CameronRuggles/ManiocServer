@@ -733,7 +733,12 @@ def _grant_owner_acl(path, is_dir=True):
         out += struct.pack("<HHI", 32, other_p, 0xFFFFFFFF)
         return out
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_DIRECTORY|O_NONBLOCK (audit T8-B, Low): the name
+        # is the app's to swap between the walk and this open;
+        # a FIFO planted there must not hang the apply on a
+        # blocking open, and a non-directory must refuse.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                     | os.O_DIRECTORY | os.O_NONBLOCK)
     except OSError:
         return
     try:
@@ -811,6 +816,22 @@ def _own_data_dirs(www, manifest):
     applies - and the owner's ACL is granted on the data
     directory roots."""
     for dirname in manifest.get("data_dirs", []):
+        # EVERY component of a nested data directory is
+        # checked, not just the last (audit T8-B): for
+        # wp-content/uploads, a planted wp-content symlink
+        # would otherwise steer the fwalk below - whose top
+        # argument is resolved by path before the descriptor
+        # walk starts - onto a host directory.
+        _probe = www
+        for _part in dirname.split("/"):
+            if _part in ("", "."):
+                continue
+            _probe = os.path.join(_probe, _part)
+            if os.path.islink(_probe):
+                raise ValueError(
+                    "data directory %r has a symlink "
+                    "component %r - refusing"
+                    % (os.path.join(www, dirname), _probe))
         root = os.path.join(www, dirname)
         if os.path.islink(root):
             # A declared data directory swapped for a symlink
@@ -1085,22 +1106,183 @@ def render_wp_config(template_path, db, manifest):
     return text[:line_end + 1] + defines + text[line_end + 1:]
 
 
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _copy_file_between_fds(src_dir_fd, name, dst_dir_fd):
+    """Copy one regular file between two open directories.
+    The source is opened through its directory descriptor
+    with O_NOFOLLOW, so the bytes copied are the file the
+    name denoted inside that directory - never a link's
+    target. Returns False when the name is not a regular
+    file at copy time (a link, a special file, or a name
+    swapped mid-walk); the caller logs the skip."""
+    try:
+        sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW
+                      | os.O_NONBLOCK, dir_fd=src_dir_fd)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(sfd)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        dfd = os.open(name, os.O_WRONLY | os.O_CREAT
+                      | os.O_EXCL, 0o666, dir_fd=dst_dir_fd)
+        try:
+            while True:
+                chunk = os.read(sfd, 1 << 16)
+                if not chunk:
+                    break
+                _write_all(dfd, chunk)
+            os.fchmod(dfd, stat.S_IMODE(st.st_mode))
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    finally:
+        os.close(sfd)
+
+
 def _copy_tree(src, dst, tree_root=None,
                exclude_rels=frozenset()):
-    """Copy a tree, skipping __pycache__ anywhere and any path
-    in exclude_rels (paths relative to tree_root - the manifest's
-    exclude_paths / install_files mechanism)."""
-    def ignore(dirpath, names):
-        out = []
-        for name in names:
-            if name == "__pycache__":
-                out.append(name)
-            elif tree_root is not None and os.path.relpath(
-                    os.path.join(dirpath, name),
-                    tree_root) in exclude_rels:
-                out.append(name)
-        return out
-    shutil.copytree(src, dst, symlinks=False, ignore=ignore)
+    """Copy a tree, skipping __pycache__ anywhere and any
+    path in exclude_rels (paths relative to tree_root - the
+    manifest's exclude_paths / install_files mechanism).
+
+    NEVER follows a symlink (audit T8-B). The previous
+    implementation used shutil.copytree(symlinks=False),
+    which copies the TARGETS of links: this walk carries
+    app-writable trees across the trust boundary (a live
+    data directory into staging, the payload tree into the
+    docroot), so a compromised app could plant a link to
+    /etc/shadow or the onion key and have host root copy
+    the target into the app's own tree at the next apply.
+    The walk now goes through directory descriptors with a
+    no-follow open per component; symlinks and non-regular
+    files are skipped and logged, regular files are copied
+    from their descriptors, and directories are created in
+    the destination through its descriptor."""
+    if tree_root is None:
+        tree_root = src
+    src_fd = _dir_fd(src)
+    try:
+        os.mkdir(dst)
+        dst_fd = _dir_fd(dst)
+        try:
+            _copy_tree_contents(src_fd, dst_fd, src,
+                                tree_root, exclude_rels)
+            # Directory modes are asserted on the way OUT
+            # (see _copy_tree_contents); the root's own mode
+            # follows the source root's.
+            os.fchmod(dst_fd, stat.S_IMODE(
+                os.fstat(src_fd).st_mode))
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def _copy_tree_contents(src_fd, dst_fd, src_path, tree_root,
+                        exclude_rels):
+    for name in sorted(os.listdir(src_fd)):
+        if name == "__pycache__":
+            continue
+        if os.path.relpath(os.path.join(src_path, name),
+                           tree_root) in exclude_rels:
+            continue
+        try:
+            st = os.stat(name, dir_fd=src_fd,
+                         follow_symlinks=False)
+        except OSError:
+            continue
+        shown = os.path.join(src_path, name)
+        if stat.S_ISLNK(st.st_mode):
+            print("onionhost-recipe: WARNING: skipping "
+                  "symlink %s while copying a tree - links "
+                  "are never followed when carrying app data "
+                  "(audit T8-B)" % shown, file=sys.stderr)
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            sub_src = os.open(name, os.O_RDONLY
+                              | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=src_fd)
+            try:
+                os.mkdir(name, 0o777, dir_fd=dst_fd)
+                sub_dst = os.open(name, os.O_RDONLY
+                                  | os.O_DIRECTORY
+                                  | os.O_NOFOLLOW,
+                                  dir_fd=dst_fd)
+                try:
+                    _copy_tree_contents(
+                        sub_src, sub_dst, shown, tree_root,
+                        exclude_rels)
+                    # The directory's own mode lands after
+                    # its contents: a read-only source
+                    # directory must not refuse the copies
+                    # into its twin.
+                    os.fchmod(sub_dst,
+                              stat.S_IMODE(st.st_mode))
+                finally:
+                    os.close(sub_dst)
+            finally:
+                os.close(sub_src)
+        elif stat.S_ISREG(st.st_mode):
+            if not _copy_file_between_fds(src_fd, name,
+                                          dst_fd):
+                print("onionhost-recipe: WARNING: skipping "
+                      "%s while copying a tree - it was not "
+                      "a regular file when its turn came "
+                      "(audit T8-B)" % shown, file=sys.stderr)
+        else:
+            print("onionhost-recipe: WARNING: skipping "
+                  "non-regular file %s while copying a tree "
+                  "(audit T8-B)" % shown, file=sys.stderr)
+
+
+def _copy_config_carryover(www, name, staging):
+    """Carry the app's own config file (Settings.php,
+    wp-config.php, a DokuWiki conf file) from the live tree
+    into staging - the one file-at-a-time twin of
+    _copy_tree's rule (audit T8-B): opened no-follow, must
+    be a regular file, copied from the descriptor. Returns
+    False when the live name is a symlink or not a regular
+    file; the caller then renders (or fails) as it would
+    for a missing config, and the planted link's target
+    never enters staging."""
+    try:
+        sfd = os.open(os.path.join(www, name),
+                      os.O_RDONLY | os.O_NOFOLLOW
+                      | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(sfd)
+        if not stat.S_ISREG(st.st_mode):
+            print("onionhost-recipe: WARNING: the live "
+                  "config %s is not a regular file; not "
+                  "carrying it over (audit T8-B)"
+                  % os.path.join(www, name), file=sys.stderr)
+            return False
+        dfd = os.open(os.path.join(staging, name),
+                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                      0o666)
+        try:
+            while True:
+                chunk = os.read(sfd, 1 << 16)
+                if not chunk:
+                    break
+                _write_all(dfd, chunk)
+            os.fchmod(dfd, stat.S_IMODE(st.st_mode))
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    finally:
+        os.close(sfd)
 
 
 def _excluded(name):
@@ -1192,8 +1374,37 @@ def _apply_mode_exceptions(recipe_id):
         except ValueError:
             continue
         target = os.path.join(APPDATA, rel)
+        if os.path.islink(target):
+            # A mode exception must never land through a
+            # link (audit T8-B): the exception paths sit in
+            # app-writable trees, and a chmod by path turned
+            # a planted link's host target 0600 -> 0755 in
+            # the auditor's demonstration.
+            print("onionhost-recipe: WARNING: mode "
+                  "exception target %s is a symlink; "
+                  "skipping (audit T8-B)" % target,
+                  file=sys.stderr)
+            continue
         if os.path.isfile(target):
-            os.chmod(target, mode_int)
+            _fchmod_nofollow(target, mode_int)
+
+
+def _fchmod_nofollow(path, mode_int):
+    """fchmod a regular file opened no-follow (audit T8-B).
+    Returns False - and changes nothing - when the name is
+    a symlink, not a regular file, or cannot be opened."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                     | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.fchmod(fd, mode_int)
+        return True
+    finally:
+        os.close(fd)
 
 
 # The native slot's first-boot conventions (A23 recipes 3+4):
@@ -1549,7 +1760,14 @@ def apply_recipe(recipe_id):
         for name in config_files:
             src = os.path.join(www, name)
             if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(staging, name))
+                # Carried over WITHOUT following links
+                # (audit T8-B): the live config name is the
+                # app's to plant, and copy2 by path would
+                # copy a planted link's host target into
+                # staging. A refused carry-over leaves the
+                # staged name absent, exactly as a missing
+                # config would.
+                _copy_config_carryover(www, name, staging)
     elif renderer == "none":
         pass
     else:

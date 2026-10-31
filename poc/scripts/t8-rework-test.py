@@ -223,10 +223,247 @@ check("both engines delete via $IMPORT_FILE",
 check("both engines test via $IMPORT_FILE",
       init.count('[ -f "$IMPORT_FILE" ]') == 2)
 
+# ================= TASK 2 (T8-B) ===========================
+# Every check below is written defensively (getattr), so the
+# same file run against the pre-task-2 tree records FAILs
+# instead of crashing: that run is the positive control.
+import signal
+import subprocess  # noqa: F401  (venue parity with t3 style)
+
+# ---- _copy_tree: planted links never followed -------------
+bdata = os.path.join(tmp, "copytree")
+live = os.path.join(bdata, "live", "attachments")
+os.makedirs(os.path.join(live, "sub"))
+with open(os.path.join(live, "avatar.png"), "w") as f:
+    f.write("png")
+with open(os.path.join(live, "sub", "real.txt"), "w") as f:
+    f.write("real")
+hostdir = os.path.join(bdata, "host", "tor", "hs")
+os.makedirs(hostdir)
+with open(os.path.join(hostdir, "hs_ed25519_secret_key"),
+          "w") as f:
+    f.write("SECRET-ONION-KEY")
+shadow = os.path.join(bdata, "host", "shadow")
+with open(shadow, "w") as f:
+    f.write("root:$y$SECRETHASH")
+os.symlink(hostdir, os.path.join(live, "k"))
+os.symlink(shadow, os.path.join(live, "s.txt"))
+staged = os.path.join(bdata, "staged", "attachments")
+os.makedirs(os.path.dirname(staged))
+rec._copy_tree(live, staged)
+copied = []
+for _r, _d, files in os.walk(staged):
+    for _f in files:
+        copied.append(os.path.relpath(
+            os.path.join(_r, _f), staged))
+check("copy_tree copies the valid files",
+      "avatar.png" in copied
+      and os.path.join("sub", "real.txt") in copied)
+check("copy_tree does not copy a planted dir link's target",
+      not any(c.startswith("k") for c in copied))
+check("copy_tree does not copy a planted file link's target",
+      "s.txt" not in copied)
+leaked = False
+for c in copied:
+    with open(os.path.join(staged, c)) as f:
+        if "SECRET" in f.read():
+            leaked = True
+check("no host secret content anywhere in the copied tree",
+      not leaked)
+
+# ---- _copy_tree: exclusions still honoured ----------------
+xsrc = os.path.join(bdata, "xsrc")
+os.makedirs(os.path.join(xsrc, "sub", "__pycache__"))
+for rel, data in (("keep.txt", "k"), ("sub/skip.txt", "s"),
+                  ("sub/keep2.txt", "k2"),
+                  ("sub/__pycache__/junk.pyc", "j")):
+    with open(os.path.join(xsrc, rel), "w") as f:
+        f.write(data)
+xdst = os.path.join(bdata, "xdst")
+rec._copy_tree(xsrc, xdst, tree_root=xsrc,
+               exclude_rels={"sub/skip.txt"})
+xcopied = []
+for _r, _d, files in os.walk(xdst):
+    for _f in files:
+        xcopied.append(os.path.relpath(
+            os.path.join(_r, _f), xdst))
+check("copy_tree still honours exclude_rels + __pycache__",
+      "keep.txt" in xcopied
+      and os.path.join("sub", "keep2.txt") in xcopied
+      and os.path.join("sub", "skip.txt") not in xcopied
+      and not any("__pycache__" in c for c in xcopied))
+
+# ---- config carry-over ------------------------------------
+carry = getattr(rec, "_copy_config_carryover", None)
+cwww = os.path.join(bdata, "cwww")
+cstaging = os.path.join(bdata, "cstaging")
+os.makedirs(cwww)
+os.makedirs(cstaging)
+with open(os.path.join(cwww, "Settings.php"), "w") as f:
+    f.write("<?php // real settings")
+check("config carry-over exists and copies a regular file",
+      carry is not None
+      and carry(cwww, "Settings.php", cstaging) is True
+      and open(os.path.join(cstaging, "Settings.php")).read()
+      == "<?php // real settings")
+os.unlink(os.path.join(cwww, "Settings.php"))
+os.symlink(shadow, os.path.join(cwww, "Settings.php"))
+check("config carry-over refuses a planted symlink",
+      carry is not None
+      and carry(cwww, "Settings.php", cstaging) is False
+      and "SECRETHASH" not in open(
+          os.path.join(cstaging, "Settings.php")).read())
+
+# ---- mode exceptions --------------------------------------
+import shutil as _shutil
+mdata = os.path.join(tmp, "modeexc")
+mpayload = os.path.join(mdata, "payload", "marketplace",
+                        "overlay")
+os.makedirs(mpayload)
+_shutil.copy(os.path.join(
+    ROOT, "onionhost", "recipes", "marketplace", "overlay",
+    "normalize-exceptions"),
+    os.path.join(mpayload, "normalize-exceptions"))
+mhost = os.path.join(mdata, "hostfile")
+with open(mhost, "w") as f:
+    f.write("host")
+os.chmod(mhost, 0o600)
+mappdata = os.path.join(mdata, "appdata")
+mnative = os.path.join(mappdata, "native")
+os.makedirs(mnative)
+os.symlink(mhost, os.path.join(mnative, "media-worker"))
+with open(os.path.join(mnative, "first-boot.sh"), "w") as f:
+    f.write("#!/bin/sh\n")
+os.chmod(os.path.join(mnative, "first-boot.sh"), 0o644)
+rec_mode = load("oh_recipe_mode",
+                os.path.join(BIN, "onionhost-recipe"),
+                {"ONIONHOST_CONTAINER_UID_BASE": BASE,
+                 "ONIONHOST_APPDATA": mappdata,
+                 "ONIONHOST_RECIPE_PAYLOAD_ROOT":
+                     os.path.join(mdata, "payload"),
+                 "ONIONHOST_ETC": os.path.join(mdata, "etc"),
+                 "ONIONHOST_RECIPE_STATE":
+                     os.path.join(mdata, "state")})
+rec_mode._apply_mode_exceptions("marketplace")
+check("mode exception through a planted symlink changes "
+      "nothing on the host file",
+      mode_of(mhost) == 0o600)
+check("mode exception still applies to a regular file",
+      mode_of(os.path.join(mnative, "first-boot.sh")) == 0o755)
+
+# ---- nested data dirs: every component checked ------------
+ndata = os.path.join(tmp, "nested")
+nwww = os.path.join(ndata, "www")
+os.makedirs(nwww)
+os.symlink(hostdir, os.path.join(nwww, "wp-content"))
+try:
+    rec._own_data_dirs(nwww, {"data_dirs": ["wp-content/uploads"]})
+    nested_raised = False
+except ValueError:
+    nested_raised = True
+check("nested data dir with a symlinked middle component "
+      "refuses (ValueError)", nested_raised)
+vwww = os.path.join(ndata, "vwww")
+os.makedirs(os.path.join(vwww, "wp-content", "uploads"))
+try:
+    rec._own_data_dirs(vwww, {"data_dirs": ["wp-content/uploads"]})
+    valid_ok = True
+except Exception:  # noqa: BLE001 - recorded as a failure
+    valid_ok = False
+check("valid nested data dirs still asserted without error",
+      valid_ok and owner_of(os.path.join(
+          vwww, "wp-content", "uploads")) == (10033, 10033))
+
+# ---- _grant_owner_acl: a FIFO must not hang the apply -----
+fdata = os.path.join(tmp, "fifo")
+os.makedirs(fdata)
+fifo = os.path.join(fdata, "data-dir-as-fifo")
+os.mkfifo(fifo)
+
+
+def _alarm(signum, frame):
+    raise TimeoutError()
+
+
+signal.signal(signal.SIGALRM, _alarm)
+signal.alarm(5)
+try:
+    rec._grant_owner_acl(fifo)
+    acl_done = True
+except TimeoutError:
+    acl_done = False
+finally:
+    signal.alarm(0)
+check("_grant_owner_acl on a FIFO returns instead of "
+      "hanging (O_DIRECTORY|O_NONBLOCK)", acl_done)
+
+# ---- backup: links skipped + recorded, copy never follows -
+sys.path.insert(0, os.path.join(ROOT, "onionhost",
+                                "rootfs-overlay", "usr",
+                                "lib", "onionhost"))
+bdata = os.path.join(tmp, "backup")
+bwww = os.path.join(bdata, "appdata", "www")
+os.makedirs(bwww)
+with open(os.path.join(bwww, "index.php"), "w") as f:
+    f.write("<?php // site")
+os.symlink(shadow, os.path.join(bwww, "evil.txt"))
+os.symlink(hostdir, os.path.join(bwww, "linked-dir"))
+bak = load("oh_backup", os.path.join(BIN, "onionhost-backup"),
+           {})
+bak.APPDATA = os.path.join(bdata, "appdata")
+
+
+class _BakProc:
+    returncode = 0
+
+
+class _BakSubprocess:
+    PIPE = None
+    DEVNULL = None
+
+    @staticmethod
+    def run(*a, **kw):
+        return _BakProc()
+
+
+real_run = None
+try:
+    import subprocess as _sp
+    real_run = _sp.run
+    _sp.run = lambda *a, **kw: _BakProc()  # noqa: E731
+    entries = []
+    bak._collect_app(entries, {}, os.path.join(bdata, "work"),
+                     "php", None)
+finally:
+    if real_run is not None:
+        _sp.run = real_run
+arcs = sorted(a for a, _s, _k in entries)
+check("backup collects the regular app file",
+      "app/www/index.php" in arcs)
+check("backup does not collect a planted file link",
+      "app/www/evil.txt" not in arcs)
+check("backup does not collect a planted dir link's target",
+      not any("linked-dir" in a for a in arcs))
+check("backup records the skipped links for the manifest",
+      "app/www/evil.txt" in bak._SKIPPED_LINKS
+      and "app/www/linked-dir/" in bak._SKIPPED_LINKS)
+copyfn = getattr(bak, "_copy_file_nofollow", None)
+ctarget = os.path.join(bdata, "copied.txt")
+check("backup no-follow copy refuses a symlink",
+      copyfn is not None
+      and copyfn(os.path.join(bwww, "evil.txt"),
+                 ctarget) is False
+      and not os.path.exists(ctarget))
+check("backup no-follow copy copies a regular file",
+      copyfn is not None
+      and copyfn(os.path.join(bwww, "index.php"),
+                 ctarget) is True
+      and open(ctarget).read() == "<?php // site")
+
 print()
 if failures:
     print("FAILURES: %d" % len(failures))
     for name in failures:
         print("  - " + name)
     sys.exit(1)
-print("ALL T8-REWORK (TASK 1) CHECKS PASSED")
+print("ALL T8-REWORK CHECKS PASSED")
