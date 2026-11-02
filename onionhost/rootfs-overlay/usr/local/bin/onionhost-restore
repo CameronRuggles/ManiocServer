@@ -411,6 +411,40 @@ def _decrypt(meta, payload_age, workdir):
             pass
 
 
+def _site_record_recipe(stage):
+    """Read the backup's staged site model (stage/content/
+    site.json) and return the recipe it selects - None when the
+    model is missing or unreadable (the long-standing
+    clear-and-continue cases) and when it carries no recipe.
+
+    Raises ValueError when the model parses but is not shaped
+    like a site model: a root that is not an object, or a recipe
+    that is not a recipe-id string ([a-z0-9] then [a-z0-9-]* -
+    the shape sitegen enforces everywhere else). Both callers
+    refuse on that, each in its own phase's terms: _verify,
+    before anything has moved ("Nothing was changed.", code 4),
+    and _write_recipe_selection, the in-install belt-and-braces
+    (the restore did not finish, code 1). One helper, so the
+    two checks cannot drift (audit R5 re-verification,
+    2026-11-02)."""
+    try:
+        with open(os.path.join(stage, "content",
+                               "site.json")) as f:
+            model = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(model, dict):
+        raise ValueError("the staged site model is not an "
+                         "object")
+    recipe = model.get("recipe")
+    if recipe is not None and not (
+            isinstance(recipe, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]*", recipe)):
+        raise ValueError("the staged site model's recipe is "
+                         "not a recipe id")
+    return recipe
+
+
 def _verify(payload_tar_gz, stage):
     """Extract into stage/ and verify against the manifest.
     Returns the manifest dict."""
@@ -488,6 +522,23 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup contains files that are not on its "
             "checklist. Nothing was changed.", 4)
+    if "content/site.json" in listed:
+        # The site record itself: _install puts it in place as
+        # the owner's live record, and for an app backup the
+        # app section reinstates the recipe selection from it.
+        # It must pass the same shape check
+        # _write_recipe_selection applies - HERE, pre-install,
+        # where "Nothing was changed" is still true. When the
+        # check lived only in _write_recipe_selection it fired
+        # mid-install, after the content store and the app
+        # trees had already swapped, under that same wording
+        # (audit R5 re-verification, 2026-11-02).
+        try:
+            _site_record_recipe(stage)
+        except ValueError:
+            raise RestoreError(
+                "This backup's website record is damaged. "
+                "Nothing was changed.", 4)
     # The onion identity must agree three ways: the manifest,
     # the bundled hostname file, and the address recomputed from
     # the bundled public key. (An earlier comment said four,
@@ -634,33 +685,22 @@ def _write_recipe_selection(stage):
     selection (measured in the marketplace recipe venue; the
     unix-serve recipes render identically without it, which is
     why four earlier restores never showed this). A model with
-    no recipe clears any stale selection, matching publish."""
-    recipe = None
+    no recipe clears any stale selection, matching publish.
+
+    The shape check itself lives in _site_record_recipe and
+    runs pre-install in _verify; this call is the
+    belt-and-braces repeat, in case the staged record changed
+    after verification. If it ever fires, the content store
+    and the app trees have already been swapped, so the
+    refusal says the restore did not finish (code 1, the
+    catch-all's terms) - never "Nothing was changed."
+    (audit R5 re-verification, 2026-11-02)."""
     try:
-        with open(os.path.join(stage, "content",
-                               "site.json")) as f:
-            model = json.load(f)
-    except (OSError, ValueError):
-        model = None
-    if model is not None:
-        # The staged record parsed but is not shaped like a site
-        # model: refuse here, mid-install or not, rather than
-        # writing a selection generate-configs would have to
-        # sanitise after the fact. The recipe value must carry
-        # the recipe-id shape sitegen enforces everywhere else
-        # ([a-z0-9] then [a-z0-9-]*); anything else is damage,
-        # and nothing is written or cleared on its account.
-        if not isinstance(model, dict):
-            raise RestoreError(
-                "This backup's website record is damaged. Nothing "
-                "was changed.", 4)
-        recipe = model.get("recipe")
-        if recipe is not None and not (
-                isinstance(recipe, str)
-                and re.fullmatch(r"[a-z0-9][a-z0-9-]*", recipe)):
-            raise RestoreError(
-                "This backup's website record is damaged. Nothing "
-                "was changed.", 4)
+        recipe = _site_record_recipe(stage)
+    except ValueError:
+        raise RestoreError(
+            "This backup's website record is damaged. The "
+            "restore did not finish; you can try again.", 1)
     if recipe:
         tmp = RECIPE_SELECTION + ".restore-tmp"
         with open(tmp, "w") as f:
