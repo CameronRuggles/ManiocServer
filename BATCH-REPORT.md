@@ -1,142 +1,128 @@
-# Manioc Server — parser fuzz fix batch, 2026-10-30
+# Manioc Server — S8 value-guard batch (2026-11-02)
 
-Source findings: `~/workspace/manioc-fuzz-2026-10-28/FUZZ-REPORT-2026-10-28.md`
-(fuzz F1–F6 — a numbering series separate from the Oct 25 review's F-numbers).
-Approved by Cameron 2026-10-30.
+Source brief: the external auditor's fuzz re-verification of
+2026-11-02 (Ask 2), new finding S8. His verdict on the parent
+branch stands and is not re-argued: fuzz-fix-batch-2026-10-30 is
+MERGEABLE as-is; S8 is a pre-existing Low his sweep found one
+level below the batch's own fixes — the S7 pattern at value
+level. This batch is that follow-up, stacked on the fuzz tip.
+(It replaces the fuzz batch's own BATCH-REPORT.md at this
+branch's tip, as each stacked batch's report has; the fuzz
+batch's report remains in history at the parent tip.)
 
 ## Baseline
 
-- Clone: fresh clone of `~/workspace/onion-host-os` at
-  `~/workspace/manioc-fuzz-fix-2026-10-30/` (the source checkout was NOT
-  worked in or touched; its `main` was verified at
-  720aafac2d9ec75f2eaff677c19f891787a63772 before cloning).
-- Branch: `fuzz-fix-batch-2026-10-30`
-- Starting commit: 720aafac2d9ec75f2eaff677c19f891787a63772 (public main)
-- Tree state at start: clean (no tracked changes, no untracked files).
+- Branch: `s8-value-guard-2026-11-02` off the fuzz branch tip
+  `5cf9e1643d04a11497173df09d74548bbfb54b8a` (code head
+  `c29feee00252af4fb0fe006760ecef5246e57a71`), in a fresh clone.
+  Cameron's checkout was not worked in.
+- Code head of this batch: `ec0b37348bbf1684306ff68fb005d30aac99a8fe`
+  (this report is the tip commit on top of it).
+- Diff vs the fuzz tip: 1 file, +40/−2
+  (`onionhost/rootfs-overlay/usr/local/bin/onionhost-update`).
 
-## Positive control (gate proves it can fail) — BEFORE any fix
+## The defect (auditor S8)
 
-Runner: `/tmp/check_fuzz.py` (loads both tools from this clone, feeds the
-six reproducers in `~/workspace/manioc-fuzz-2026-10-28/reproducers/` plus
-probe variants and valid controls; classifies escapes of
-AttributeError/TypeError/UnicodeDecodeError as VIOLATION).
+S7's `load_json` guard checks the ROOT type of `highwater.json`
+and `floors.json`, but the values inside went to `dpkg_compare`
+unchecked, and `dpkg_compare` puts its arguments straight into
+subprocess argv. A non-string value (int, list) therefore died
+with `TypeError: expected str, bytes or os.PathLike` — five
+crash shapes through the real `main()`:
 
-Result on unmodified 720aafa: **33 cases, 23 VIOLATION — all six findings
-reproduce from their minimal reproducers**, all valid controls clean:
+- **S8-a** — highwater value int / list: the mark comparison
+  runs every run after fetch, before anything rewrites
+  `highwater.json`, so one bad value wedges the platform update
+  channel until the file is edited by hand — the S7-b/c
+  permanence class.
+- **S8-b** — floors value int, on the signed-floor path and on
+  the recovery path.
+- **S8-c** — the images phase's highwater value int.
 
-- F1: reproducer `42` + list/string/null manifest roots → AttributeError
-- F2: reproducer version=5 → TypeError; floor root list/int →
-  AttributeError; floor value list/int → TypeError
-- F3: reproducer `3` + list/string state roots → AttributeError
-- F4: reproducer `3` + list/string state roots, list/int manifest roots →
-  AttributeError
-- F5: reproducer `7` + list/string/null floor roots → TypeError.
-  Note: floor value list/int did NOT crash here pre-fix — they were
-  returned unvalidated (a non-string floor propagates to callers); the
-  fix validates them anyway, per the batch's one-pattern rule.
-- F6: reproducer bad UTF-8 + bad UTF-8 after the version line →
-  UnicodeDecodeError
+Reachability (auditor): root-owned, tool-written state; every
+writer now writes validated strings (S7-d), so the trigger is
+local corruption or a manual edit. Pre-existing at base
+`720aafa` — not a regression of the fuzz batch.
 
-Controls (all clean pre-fix, must stay clean): valid manifest, below-floor
-refusal (returns fail() code 1), above-floor OK (None), valid installed
-state (True / record dict), valid manifest name ('Forum'), valid disk
-floor ('1.0'), valid version file ('3.1').
+## The fix (one commit, `ec0b373`)
 
-## Task 1 — onionhost-recipe (F1, F2, F3)
+The auditor's suggested shape. A new shared helper
+`_pruned_state(data, path)` sits beside `_floor_value`, and the
+two dict reads in `main()` run through it:
 
-- Commit: **51dea25** — "Fuzz fix batch task 1: validate JSON types in
-  onionhost-recipe (fuzz F1-F3)" (1 file, +11/−1)
-- Changes (onionhost-recipe only):
-  - `_load_manifest`: non-dict root → ValueError (main()'s clean tuple).
-  - `_load_state`: non-dict root → {} (its existing default for
-    unreadable state).
-  - `_check_install_floor`: non-dict floor root → None (its existing
-    no-constraint return for an unreadable floor file).
-  - `_debver_cmp`: non-string version/floor argument → ValueError.
-- Local check: `python3 -m py_compile onionhost-recipe` OK; check runner
-  re-run — **F1/F2/F3 all 16 cases CLEAN** (ValueError / clean returns;
-  controls unchanged: below-floor refusal still returns 1, above-floor
-  None, valid installed state True). F4/F5/F6 still violated at this
-  point, as expected before Task 2 (11 violations, all in
-  onionhost-update).
+```python
+highwater = _pruned_state(load_json(hw_path, {}), hw_path)
+floors = _pruned_state(load_json(fl_path, {}), fl_path)
+```
 
-## Task 2 — onionhost-update (F4, F5, F6)
+- An entry survives only if its value passes the batch's
+  existing `_floor_value` rule (a non-empty string) — the same
+  rule the floor readers already enforce, applied here through
+  the rule itself rather than a second copy of it, so the sites
+  cannot drift apart.
+- Every dropped entry is logged through the tool's `log()` with
+  its file and key, e.g. `dropping highwater.json entry
+  'onionhost-images': value 9 is not a non-empty string`.
+- **All three consumers are covered by the two prunes.** The
+  platform phase reads the `highwater` dict; the floor paths
+  read the `floors` dict; the images phase reads
+  `highwater.get(IMAGES_PACKAGE)` from the SAME `highwater`
+  dict (there is no second read of the file anywhere in the
+  tool — verified by grep over every `load_json` call). One
+  prune per file, at the read, serves all three.
+- **Seeding logic untouched, and confirmed in code before
+  relying on it:** a dropped highwater entry is absent at the
+  baseline step, which seeds it from the installed version
+  (`if inst and pkg not in highwater`); the images mark seeds
+  the same way; a dropped floor seeds from the disk floor
+  (`if disk_floor and pkg not in floors`). Factory behaviour —
+  a dropped mark cannot move below what is installed.
+- **Posture: drop-and-log**, the auditor's primary suggestion.
+  His fail-closed alternative (refuse the run on a corrupted
+  mark rather than re-seed) is a posture call for the owner; it
+  is recorded here as not implemented, not silently decided.
 
-- Commit: **7866162** — "Fuzz fix batch task 2: validate JSON types in
-  onionhost-update (fuzz F4-F6)" (1 file, +7/−2)
-- Changes (onionhost-update only):
-  - `_installed_recipe`: non-dict state root → None (its existing
-    not-installed return).
-  - `_recipe_app_name`: non-dict manifest root → recipe id (its
-    existing fallback).
-  - `disk_floor_for` (F5, Medium): a candidate is used only when its
-    root is a dict AND the floor value is a string; otherwise the
-    candidate is skipped, exactly like its existing
-    (OSError, ValueError) skip.
-  - `_version_field`: also catches UnicodeDecodeError → None. Note:
-    a file with a valid version line followed by invalid UTF-8 now
-    returns None (file treated as unreadable) instead of crashing;
-    previously it crashed, so no working behaviour is lost.
-- Local check: `python3 -m py_compile onionhost-update` OK; check
-  runner re-run — **all 33 cases CLEAN, 0 VIOLATION** (see final gate).
+## Gates
 
-## Final gate — on final head 7866162
+Positive control first; the auditor's own harness is the gate
+throughout (`harnesses/update_values.py` and
+`harnesses/fuzz_legs.py` from his 2026-11-02 evidence zip,
+driving the real tools):
 
-Post-fix reproducer check (same runner as the positive control):
-**33 cases, 0 VIOLATION.** Per finding:
+- **Positive control (unmodified `c29feee`):** `update_values.py`
+  reproduces the auditor's `outputs/s8-values-c29feee.txt`
+  verdict rows exactly — 5 CRASH (S8-a ×2, S8-b ×2, S8-c ×1),
+  the null row and all three controls CLEAN. (His saved output
+  omits the tool's own log lines, which interleave on stdout in
+  a live run; the verdict rows are identical.)
+- **Post-fix (`ec0b373`):** the same harness reports **0 CRASH**,
+  all 9 rows CLEAN. Controls identical to the pre-fix run,
+  including the valid-strings row, the refused-downgrade row
+  (returned rc=2), the S7-b root-list row, and the S8-a null
+  row. The S8-c case now logs its drop, re-seeds the mark from
+  the installed 2.0, and the images phase installs 2.0 → 2.1
+  under the harness stubs (run completes, rc=0).
+- **Fuzz gate stays green:** `fuzz_legs.py` against the new
+  head — ROWS 46, CRASH 0, WRONG 0, OTHER 0, controls-OK 12/12;
+  verdict rows identical to the auditor's `fuzz-c29feee.txt`.
+- **Suites** (this sandbox, invoked as the auditor invoked
+  them): recipe-extract 0 assertions failed; images-delivery
+  0 assertions failed; runtime-gate `run_sim.py` 68 assertions,
+  0 failed — on the fixed tree and, as a control, on an
+  unmodified `c29feee` worktree (an earlier run pointed at the
+  wrong directory aborted in both trees alike; the rooted
+  reruns above are the evidence); backup-proof ALL 27 CHECKS
+  PASS.
+- **ci-scan** on a pristine `git archive` export of this
+  branch's tip (this report included): PASS (297 files — the
+  same count as the fuzz tip; this report replaces the parent
+  batch's report file in place, it does not add a file).
 
-- F1 CLEAN — reproducer + list/string/null roots → ValueError (clean
-  fail() path); valid manifest still loads.
-- F2 CLEAN — reproducer version=5 → ValueError; floor root list/int →
-  None (no constraint); floor value list/int → ValueError; controls
-  unchanged (below-floor refusal returns 1, above-floor None).
-- F3 CLEAN — reproducer + list/string roots → False (not installed);
-  valid installed record still True.
-- F4 CLEAN — state roots → None; manifest roots → recipe-id fallback;
-  valid state/manifest controls unchanged.
-- F5 CLEAN — reproducer + list/string/null roots → None (candidate
-  skipped); non-string floor values now skipped too (None); valid
-  floor still returns '1.0'.
-- F6 CLEAN — reproducer + bad UTF-8 after the version line → None;
-  valid file still returns '3.1'.
+## Position
 
-Suites (each run separately on the final head; exit = failed
-assertions where the harness uses that convention):
-
-- `build/ci-scan.sh` — **PASS** (295 files scanned), exit 0.
-- `poc/recipe-extract/run_tests.py` — **PASS**, 0 assertions failed.
-- `poc/images-delivery/run_tests.py` — **PASS**, 0 assertions failed.
-- `poc/backup-proof/proof.py` — **PASS**, "ALL 27 CHECKS PASS".
-- `poc/runtime-gate/run_sim.py <repo> all` — **PASS**, 68 assertions,
-  0 failed.
-- `poc/runtime-gate/test_runtime_dashboard.py <wizard.py> <sim dirs>`
-  — **PASS**, 0 assertions failed (needs the wizard.py path argument;
-  first invocation without it failed on argument parsing, before any
-  check ran).
-- `poc/runsc-wrap/run_tests.py` — **PASS**, 0 assertions failed.
-- `python3 -m py_compile` on both edited tools — **OK**.
-- `_debver_cmp` controls: (1.0~rc1, 1.0) → −1, antisymmetric 1,
-  equal 0; the Info-only non-ASCII-digit nuance is unchanged, as
-  directed (out of scope).
-
-Did NOT run / did not pass (pre-existing fixture absences at base
-720aafa, unrelated to this diff — not claimed as passes):
-
-- `poc/recipes-marketplace/unit-test.py` — FAILED before any product
-  code ran: its fixture `poc/recipes-marketplace/pkgs/
-  onionhost-recipe-marketplace_0.1.0+oh.1_amd64.deb` is absent from
-  the tree at base (dpkg-deb: No such file or directory). This is the
-  known clean-clone gap the unmerged test-hardening branch addresses.
-- `poc/installer-policy/run_proofs.py` — FAILED in its package-build
-  step: fixture `wordpress-7.1.3.zip` archive missing (the suite
-  expects it fetched via build/fetch-recipe-archives.sh). No product
-  code under test was reached.
-
-## Final state
-
-- Branch `fuzz-fix-batch-2026-10-30`, local only — NOT pushed, NOT
-  merged. Commits: 51dea25 (task 1), 7866162 (task 2), plus this
-  report committed last.
-- `~/workspace/onion-host-os` was not touched (read/clone source only).
-- The `/usr/share/onionhost` fixture dir created temporarily by the
-  disk_floor_for checks was removed after each run.
+The branch stacks on the fuzz tip, so it lands after (or with)
+the fuzz branch — which the auditor's merge-order constraint
+already requires to reach main no later than the stack that
+carries S7-f's other half. Nothing else moves: no seeding, no
+`dpkg_compare`, no writer changes. Closure is the auditor's
+re-verification against `ec0b373`, per the standing rule.
