@@ -1,189 +1,230 @@
-# Manioc Server — WS1 parser-hardening batch (2026-10-31)
+# Manioc Server — WS1 R5 rework batch (2026-11-02)
 
-Source brief: the additive verification pass of 2026-10-31,
-WS1 (fuzz of the backup/restore metadata parsers) plus the
-WS3 app-init nit. This batch is the fix path for those
-findings. Nothing here is closed until the auditor
-re-verifies it; the harness and suite runs below are the
-fix author's evidence, offered for re-run.
+Source brief: the external auditor's re-verification of
+2026-11-02 (`AUDITOR-REVERIFICATION-2026-11-02`), Ask 1:
+**SEND BACK — R5 only**. Every other WS1 site passed as built
+(R1–R4, R6, B1, B2, S1, the app-init nit) and is untouched by
+this batch. This batch answers R5 and nothing else.
+
+Approved under Cameron's standing direction (do everything
+code-wise possible without a human); ferry and merge remain
+his taps.
 
 ## Baseline
 
-- Fresh clone of github.com/CameronRuggles/ManiocServer,
-  branch `ws1-parser-hardening-2026-10-31` off the
-  t8-rework-followups tip `a0e935c` (code head `60398a9`).
-- Code head of this batch: `7ea0192`. Commits:
-  - `bb14636` — restore (R1–R6, plus the unused-import nit)
-  - `f84b059` — backup + sitegen (B1, B2, S1)
-  - `7ea0192` — golden app-init.sh env validator (WS3 nit)
-  - this report (tip, no code)
-- Diff vs the followups tip: 4 files, +110/−21.
+- Clone: fresh clone of github.com/CameronRuggles/ManiocServer
+  at ~/workspace/manioc-ws1-r5-2026-11-02 (Cameron's checkout
+  ~/workspace/onion-host-os NOT worked in; the WS1 batch clone
+  NOT touched).
+- Branch: `ws1-r5-rework-2026-11-02` off the WS1 branch tip
+  136059e7d26ae571cfde7065103d245dc25e5db6 (code head
+  7ea0192).
+- One code commit: 4064aef — `onionhost-restore` only,
+  +66/−26. This report is the tip commit on top of it.
+
+## The defect (auditor's finding, sandbox-proven by him)
+
+WS1's R5 fix made `_write_recipe_selection` refuse a damaged
+staged site record with
+`RestoreError("This backup's website record is damaged.
+Nothing was changed.", 4)`. But that function is called only
+from `_install_app`, inside `_install`, AFTER the content
+store (step 1), the app trees, the DB credentials and the
+runtime marker have already been swapped. The auditor's
+sandbox (`r5_midinstall.py`, driving the real `_install` with
+an app backup whose site.json is `[1, 2]`) showed five owner
+files CHANGED by the time the code-4 "Nothing was changed"
+refusal surfaced — the head was less honest than the base,
+whose catch-all ("the restore did not finish") was accurate.
+The check has to live in the pre-install parser, not only in
+the install path.
 
 ## Positive control (before any fix)
 
-The additive pass's own harness (`harness-ws1-fuzz.py`,
-copied to scratch outside the tree) run against the
-unmodified head reproduced the report exactly: **73 recorded
-outcomes — 39 CRASH, 2 WRONG, 1 uncaught OSError** (a
-FileNotFoundError out of `_verify`'s onion stage).
+The auditor's `harnesses/r5_midinstall.py`, unmodified,
+against the unmodified WS1 code head (7ea0192, this branch's
+base):
 
-## The fix shape
+```
+RESULT: RestoreError code=4, owner is told: "This backup's
+website record is damaged. Nothing was changed."
+  CHANGED  home/owner/.config/onionhost/site.json
+  CHANGED  var/appdata/www/index.php
+  CHANGED  etc/app-db.env
+  CHANGED  var/app-runtime
+  CHANGED  var/app-site
+  same     var/tor/hs/hostname, etc/recipe-selection, var/state
+```
 
-The pattern S7 ratified for onionhost-update, applied per
-tool: close it in the parser, not per call site. A parsed
-JSON root must be a dict before any `.get`; every value
-consumed as a string is isinstance-checked at the point of
-parse; failures raise the tool's existing shaped error
-(RestoreError in restore, the `_fail` return in backup,
-ValueError in sitegen) or degrade exactly as the site's
-valid-input error path already does.
+His result reproduced exactly.
 
-## Per-site results
+## The fix (commit 4064aef, onionhost-restore only)
 
-### Restore (onionhost-restore)
+1. **One shared helper, `_site_record_recipe(stage)`.** Reads
+   the staged `content/site.json`; returns the recipe it
+   selects, or None for the long-standing clear-and-continue
+   cases (model missing/unreadable, or no recipe carried).
+   Raises ValueError when the model parses but is not shaped
+   like a site model: a non-dict root, or a `recipe` that is
+   not None and not a str fullmatching
+   `[a-z0-9][a-z0-9-]*` — exactly the checks
+   `_write_recipe_selection` applied in the WS1 batch, moved
+   into one place so the two call sites cannot drift.
+2. **`_verify` applies it pre-install.** Right after the
+   checklist/extra-files checks, when `"content/site.json"`
+   is among the verified manifest entries (`listed`),
+   _verify runs the helper and a ValueError becomes
+   `RestoreError("This backup's website record is damaged.
+   Nothing was changed.", 4)` — the same shaped refusal as
+   before, now at a point where the wording is true.
+   Call order, confirmed in `main()`: `_read_wrapper` →
+   `_decrypt` → `_verify` (line ~1001) → `_install`
+   (line ~1006). _verify extracts only into the throwaway
+   stage directory; nothing on the machine has moved when
+   it refuses. The gate is the manifest entry, so it covers
+   every backup that stages a `content/site.json` (backup
+   writes that entry for every backup —
+   onionhost-backup's `add("content/site.json", ...)`),
+   not only app-section ones.
+3. **`_write_recipe_selection` keeps the check as
+   belt-and-braces** — the same helper — but if it ever
+   fires (the staged record changed after verification),
+   the refusal is honest and in the catch-all's family:
+   `RestoreError("This backup's website record is damaged.
+   The restore did not finish; you can try again.", 1)`.
+   Code 1, never "Nothing was changed." The write/clear
+   behaviour below the check is byte-for-byte the WS1
+   batch's: a valid recipe is written; no recipe, a missing
+   model or an unreadable model clears any stale selection.
 
-- **R1 `_read_wrapper`:** a non-dict meta.json raises the
-  shaped "could not be read as an OnionHost backup"
-  RestoreError; previously `meta.get` ran after the try and
-  escaped as AttributeError (4 shapes).
-- **R2 `_decrypt`:** `salts` must be a dict and `salts.main`
-  a string before `.get`/`fromhex`; failures raise the
-  existing damaged-key-information RestoreError (4 shapes).
-- **R3 `_verify`:** the staged manifest must be a dict,
-  `entries` a list of dicts, and each entry's `path` a
-  string before `startswith`; failures raise a
-  damaged-checklist RestoreError in the neighbouring
-  wording (9 shapes). The app section now reuses the
-  validated `entries` list instead of re-reading the raw
-  manifest value.
-- **R4 `_verify` structural:** a manifest that omits the
-  onion files now meets a shaped RestoreError ("website
-  identity is damaged") on the public-key and hostname
-  reads instead of an uncaught FileNotFoundError. The
-  site section's `current.txt` read got the same wrap
-  ("published website is incomplete").
-- **R5 `_write_recipe_selection` (the Medium placement,
-  mid-`_install`):** a non-dict staged site model raises
-  RestoreError before anything is written. The `recipe`
-  value must be a string matching the recipe-id rule
-  sitegen enforces — first char `[a-z0-9]`, rest
-  `[a-z0-9-]*`, checked with `re.fullmatch` on the same
-  pattern — or RestoreError is raised and nothing is
-  written and nothing is cleared. This closes the crash
-  shapes (3) and both WRONG shapes (an int recipe was
-  written as `123`, a list as `['gitea']`). A missing or
-  unreadable site.json, and a model with no recipe key,
-  keep the old behaviour exactly (selection cleared, no
-  error). One judgement call, stated plainly: a `recipe`
-  of `""` or `false` now raises instead of silently
-  clearing — sitegen's validation rejects both as a bad
-  recipe id, so neither can appear in a platform-written
-  record.
-- **R6 `_root_disk_prefix`:** a non-dict luks-roles.json
-  or a non-string `device` degrades to the function's
-  existing fallback for unreadable files (return None,
-  exclude nothing) instead of crashing (4 shapes).
-- Nit from the same WS3 list: the unused `io` import is
-  removed; `re` is added for the R5 match.
+## Considered and NOT adopted: full validate_model in _verify
 
-### Backup (onionhost-backup)
+The auditor's "better still" option was to run
+`sitegen.validate_model` on the staged record in `_verify`,
+so a backup could not install a site record the publisher
+would refuse. Not adopted, on these facts:
 
-- **B1 `create_backup` key record:** a parsed record that
-  is not a dict, a `main` entry that is not a dict, or a
-  recipient/salt that is missing or not a string now
-  returns the existing shaped `_fail("the backup key
-  record is damaged")` — the same outcome invalid JSON
-  already produced. This tool has no catch-all, so the 7
-  shapes were raw tracebacks; now every backup attempt on
-  a damaged record ends with that one line.
-- **B2 `_site_db_engine`:** a recipe manifest that parses
-  to a non-dict now takes the function's documented
-  unreadable-manifest outcome (MariaDB for php, none for
-  native). A `db` value of the wrong shape (null, a bare
-  string, a list) reads as no record at all, so the `{}`
-  default decides — `{"db": null}` no longer defeats the
-  default. Valid manifests decide exactly as before
-  (required false → none, engine postgres → postgres).
+- `validate_model` is applied NOWHERE in the restore path
+  today: restore does not import sitegen at all; the
+  function runs only inside sitegen's own load/save/publish
+  paths (sitegen.py's `load_model` and publish flow).
+  Adopting it would be a new policy for restore, not a
+  restored one.
+- Restore's contract is to reinstate records the platform
+  wrote at backup time, including records written by older
+  platform versions. `validate_model` is the CURRENT
+  publisher's contract and it tightens over time — the
+  auditor's own S1 Info note in this same re-verification
+  records a validate_model tightening changing which inputs
+  are accepted. Gating restore on it would let a publisher
+  tightening retroactively make old backups unrestorable.
+- The R5 defect is specifically the recipe value flowing,
+  unchecked-then-mid-install, into the recipe selection.
+  The targeted dict+recipe check closes it without
+  narrowing restore compatibility. If the owner later wants
+  restore held to the publisher's full model contract, that
+  is a policy decision to take on its own, with the
+  old-backup consequences counted first.
 
-### Site model (sitegen.py)
+## Branch state, stated exactly (R4)
 
-- **S1 `validate_model`:** `pages`/`entries` must be
-  lists before `len()` and iteration; an item `id`, an
-  entry `photo`, and an entry `date` must be strings
-  before their regex matches. The four TypeError leaks
-  now raise the designed ValueError with the neighbouring
-  messages ("bad or duplicate item id", "bad photo name",
-  "bad entry date"), so callers catching
-  (ValueError, OSError) see the shaped error.
+The auditor ratified R4's extra wrap and noted the WS1 pack
+understated it. For the record, the R4 change in `_verify`
+wraps THREE reads, each raising a shaped RestoreError
+instead of an uncaught FileNotFoundError:
 
-### App-init nit (golden app-init.sh, WS3 Info)
+1. the bundled onion public key
+   (`onion/hs_ed25519_public_key`) — "website identity is
+   damaged",
+2. the bundled hostname (`onion/hostname`) — "website
+   identity is damaged",
+3. the published-site sequence (`site/current.txt`, static
+   backups) — "published website is incomplete".
 
-- The app.env line validator's malformed arm now also
-  matches `[0-9]*`: a name beginning with a digit is
-  reported as a malformed line and skipped, like every
-  other malformed line, instead of being admitted and
-  then silently refused by `export`. Valid identifiers
-  and the platform-managed names are untouched (checked
-  against a case-statement replica: `1BAD`/`9` malformed;
-  `GOOD_1`, `_X`, `X9` still exported; `PATH` still
-  platform-managed).
+This batch does not touch any of them.
 
-## Final gate — WS1 harness
+## Gates
 
-Same harness, final head: **69 recorded outcomes, 0 CRASH,
-0 WRONG.** The count drops from 73 because the R6 fallback
-and the B2 fallback return by design (the harness records
-returns only for its named controls, which all pass). The
-lines the harness labels OTHER are the shaped outcomes it
-has no clean-type registered for at those two sites: the
-R5 RestoreError (5 lines) and the B1 `_fail` return
-(7 lines) — both are the designed shaped paths, named in
-its own detail text. Valid-input controls are unchanged
-across every site: valid meta/decrypt/verify controls,
-the valid recipe selection still writes `gitea`, the
-valid luks-roles record still returns `vda`, the db
-controls still return postgres / mariadb / none as before,
-and the valid site model still loads.
-
-## Existing suites
-
-- `poc/scripts/t8-rework-test.py` — ALL CHECKS PASSED.
-- `poc/scripts/t1-followups-test.py` — ALL CHECKS PASSED.
-- `poc/scripts/t3-debian-status-test.py` — ALL CHECKS
-  PASSED.
-- `poc/scripts/t3-reboot-state-test.py` — FAILURES: 0.
-- `poc/runtime-gate/run_sim.py` — aborts with the same
-  AssertionError (line 253, marker assert) at the branch
-  base `a0e935c` and at this head, run both ways in this
-  session; a sandbox environment limit, and this batch
-  touches no runtime-gate file. Not claimed.
-- `poc/backup-proof/proof.py` — cannot run against this
-  branch in this sandbox: the script hardcodes its tree
-  to another checkout (line 36) and needs an `age`
-  binary and `/var/lib/onionhost`, both absent here.
-  Not run, not claimed; the same wall the auditor and
-  the followups batch recorded. The backup/restore
-  valid-input behaviour control for this batch is the
-  WS1 harness's valid controls plus the suites above.
-
-## ci-scan
-
-To be run on a pristine `git archive` export of the
-branch tip (including this report) before the ferry; the
-result is stated in the ferry note. The expectation,
-from the branch base's own scan profile, is exactly the
-2 inherited ISO-BUILD-LOG.md hits and zero in touched
-files, this report included.
+- **Positive control** — above; the auditor's harness on
+  the unmodified head reproduces his result exactly.
+- **Acceptance A (new gate).** A purpose-built driver
+  (kept in scratch, out of the tree) builds REAL, fully
+  valid app-backup payloads — correct manifest sha256/size
+  entries, a consistent onion identity computed with the
+  real `backupkeys` — that differ only in
+  `content/site.json`, then drives `_verify` / `_install`
+  in main()'s order against a pre-seeded "old site"
+  machine:
+  - site.json `[1, 2]`: **_verify refuses, code 4,
+    "Nothing was changed.", and the before/after snapshot
+    of every owner file is identical** (site record, app
+    tree, db env, runtime markers, hostname, selection,
+    state — nothing moved; _install never called).
+  - site.json `{"recipe": 123}`: the same code-4 refusal
+    from _verify, no owner file changed.
+- **Acceptance B (the auditor's requested control).** A
+  valid app backup (well-formed model, recipe `gitea`)
+  passes _verify and **completes the sandbox restore end
+  to end**: site record replaced, app tree swapped, DB
+  env and runtime markers written, recipe selection
+  written as `gitea` — the selection behaviour exactly as
+  before the rework. A second control with a valid
+  recipe-less model also completes, and the stale
+  selection is cleared, as before.
+- **Acceptance C.** `_write_recipe_selection` called
+  directly on the damaged staged record raises
+  RestoreError **code 1** with "The restore did not
+  finish; you can try again." — no "Nothing was changed."
+  The auditor's own `r5_midinstall.py` (which drives
+  `_install` directly, bypassing _verify) now reports the
+  same: code 1, honest wording, with the CHANGED lines his
+  proof documented — the state the wording now admits to.
+- **WS1 harness** (`harness-ws1-fuzz.py`, unmodified, run
+  against this tree): **69 outcomes, 0 CRASH, 0 WRONG** —
+  identical totals to the WS1 head. Row-for-row against the
+  auditor's own head run (his evidence outputs), the ONLY
+  differences are the five R5 shaped rows, whose message is
+  now the honest in-install wording; every control row is
+  identical.
+- **Existing suites:** t8-rework ALL PASSED;
+  t1-followups ALL PASSED; t3-debian-status ALL PASSED;
+  t3-reboot-state FAILURES: 0.
+- **backup-proof: ALL 27 CHECKS PASS**, run the auditor's
+  way — main's portable `proof.py` (MANIOC_TREE, from
+  720aafa) placed inside this tree's `poc/backup-proof/`
+  and run against this tree. (The branch's own proof.py
+  still hardcodes another checkout, as disclosed in the
+  WS1 batch; the portable run closes that gap for this
+  branch. The proof is a static-site round trip and does
+  not exercise R5's app path — acceptance A/B above are
+  the R5 evidence.)
+- **ci-scan** on a pristine `git archive` of this branch's
+  tip (this report included): exactly the 2 inherited
+  ISO-BUILD-LOG.md findings (lines 7068, 7429), zero in
+  touched files.
 
 ## Disclosures
 
-- Harness venues use the additive pass's own staging
-  (faked `open` where a path is hardcoded); the parse code
-  under test is the real code, as in the source pass.
-- The R5 judgement call on `""`/`false` recipe values is
-  the one place behaviour changes for an input the old
-  code tolerated; it is argued above and flagged for the
-  auditor.
-- T8-A rig legs remain pending on the GCP hold and are
-  not claimed here. This branch is local only; the push
-  is Cameron's tap.
+- The acceptance driver lives in scratch (`/tmp`), not in
+  the tree — same status as the auditor's harnesses: gate
+  evidence offered for re-run, not shipped test code. It
+  stubs ownership/ACL/subprocess calls exactly as the
+  auditor's sandbox does; the parse, verify and install
+  code under test is the real code, and the payloads are
+  real tar.gz backups with real hashes and a real onion
+  identity.
+- Acceptance A's payloads pass every pre-existing _verify
+  check by construction (valid manifest, hashes, onion
+  three-way agreement, app-section sanity), so the code-4
+  refusal is attributable to the new site-record check
+  alone; acceptance B proves the same construction restores
+  cleanly when the record is valid.
+- No other WS1 site was touched: the diff is
+  `onionhost-restore` only (+66/−26), and within it only
+  `_site_record_recipe` (new), the `_verify` gate, and
+  `_write_recipe_selection`.
+- Nothing pushed, nothing merged. Merge path is unchanged:
+  this branch stacks on `ws1-parser-hardening-2026-10-31`;
+  the auditor's merge-order constraint from the same
+  re-verification (the stack must not reach main without
+  the fuzz branch — S7-f) is unaffected and still stands.
