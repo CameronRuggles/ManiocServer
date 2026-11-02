@@ -433,6 +433,44 @@ def _floor_value(data, pkg):
     return None
 
 
+def _pruned_state(data, path):
+    """A parsed state dict with every unusable value dropped.
+
+    S8 fix (auditor re-verification 2026-11-02, Ask 2): S7's
+    load_json guard checks the ROOT type of highwater.json and
+    floors.json, but the values inside went to dpkg_compare
+    unchecked, and dpkg_compare puts them straight into
+    subprocess argv - an int or list value died there with
+    TypeError (expected str, bytes or os.PathLike). The mark
+    comparison (S8-a) runs every run after fetch, before
+    anything rewrites highwater.json, so one bad value wedged
+    the platform channel permanently - the S7-b/c permanence
+    class; the floor paths (S8-b) and the images phase's mark
+    (S8-c, which reads this same highwater dict) wedged the
+    same way. A usable value in these files obeys the rule
+    _floor_value already enforces for floor readers - a
+    non-empty string - so main() runs both dicts through this
+    one prune at the read, and every consumer downstream sees
+    only values that can reach dpkg_compare. Each drop is
+    logged with its file and key. What a dropped entry held
+    re-seeds at the baseline step exactly as on a factory
+    install: a mark from the installed version, a floor from
+    the disk floor - a dropped mark cannot move below what is
+    installed. Every writer now writes validated strings
+    (S7-d), so a dropped entry means local corruption or a
+    manual edit; dropping it and saying so beats a traceback
+    on every run."""
+    kept = {}
+    for key in data:
+        if _floor_value(data, key) is not None:
+            kept[key] = data[key]
+        else:
+            log("dropping %s entry %r: value %r is not a "
+                "non-empty string"
+                % (os.path.basename(path), key, data[key]))
+    return kept
+
+
 def deb_floor(deb_path, pkg):
     """Read the security floor for pkg from inside a .deb (the floor
     file is part of the signed package contents)."""
@@ -711,8 +749,8 @@ def main():
     os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
     hw_path = os.path.join(STATE_DIR, "highwater.json")
     fl_path = os.path.join(STATE_DIR, "floors.json")
-    highwater = load_json(hw_path, {})
-    floors = load_json(fl_path, {})
+    highwater = _pruned_state(load_json(hw_path, {}), hw_path)
+    floors = _pruned_state(load_json(fl_path, {}), fl_path)
     packages = {}
     worst = 0
 
