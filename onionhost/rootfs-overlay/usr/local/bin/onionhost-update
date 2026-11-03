@@ -666,6 +666,19 @@ OWNER_MAINTAINED = []
 # an old result look freshly checked.
 CHECK_SUCCEEDED = False
 
+# The Debian channel's outcome for THIS run (audit T3-1):
+# None until the Debian phase has run, then True only when
+# its update AND install phases both completed cleanly.
+# write_status maintains the record's debian_ok and
+# debian_last_successful_check from it, exactly as
+# CHECK_SUCCEEDED maintains the project channel's pair -
+# the two channels fail independently (A6), so their
+# freshness records must too: before T3-1 a Debian phase
+# failing on every run still ended in an "up-to-date"
+# status whose last_successful_check had advanced on the
+# project channel alone.
+DEBIAN_PHASE_OK = None
+
 
 def _reboot_state():
     """(required, reason) for the pending-reboot record.
@@ -740,6 +753,61 @@ def _reboot_state():
     return required, "; ".join(reasons)
 
 
+def _purge_superseded_kernels():
+    """Purge superseded kernel image packages (audit T1-2).
+
+    The Debian phase deliberately installs NEW kernel ABI
+    packages (--with-new-pkgs), and nothing ever removed the
+    ones they superseded: /boot and the dpkg database grew
+    by one full kernel per ABI bump, forever. After a
+    successful install phase, purge every installed
+    versioned kernel image EXCEPT the running kernel's
+    package (never purge what the box booted) and the
+    newest installed (the one the next reboot lands on).
+    Best-effort by design: a purge failure is logged and
+    changes nothing else - the phase's recorded outcome
+    (T3-1) is the install's, not the purge's."""
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Package}\n",
+             "linux-image-[0-9]*"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=120)
+        names = [ln.strip() for ln in proc.stdout.splitlines()
+                 if ln.strip().startswith("linux-image-")]
+    except Exception as exc:  # noqa: BLE001 - log-only helper
+        log("kernel purge skipped: could not list installed "
+            "kernels (%s)" % exc.__class__.__name__)
+        return
+
+    def _kkey(name):
+        nums = []
+        for part in name[len("linux-image-"):].replace(
+                "-", ".").split("."):
+            if part.isdigit():
+                nums.append(int(part))
+            else:
+                break
+        return tuple(nums)
+
+    running = "linux-image-" + os.uname().release
+    if not names:
+        return
+    newest = max(names, key=_kkey)
+    victims = sorted(n for n in names
+                     if n != running and n != newest)
+    if not victims:
+        return
+    log("purging superseded kernel packages (audit T1-2): %s "
+        "(keeping the running %s and the newest %s)"
+        % (", ".join(victims), running, newest))
+    rc = run(["apt-get", "purge", "-y"] + victims,
+             timeout=None)
+    if rc != 0:
+        log("kernel purge returned %d - logged only; the "
+            "superseded packages stay for a later run" % rc)
+
+
 def write_status(state, detail, packages):
     status_path = os.path.join(STATE_DIR, "status.json")
     prev = load_json(status_path, {})
@@ -765,6 +833,25 @@ def write_status(state, detail, packages):
     rec["last_successful_check"] = (
         now() if CHECK_SUCCEEDED
         else prev.get("last_successful_check"))
+    # The Debian channel's own pair (audit T3-1), maintained
+    # the same way: a status written before this run's
+    # Debian phase (or by an updater older than T3-1, whose
+    # record simply lacks the keys) carries the previous
+    # outcome forward; a completed phase replaces it, and
+    # its last-success time advances only on a clean phase.
+    # Every pre-existing key above is written exactly as
+    # before - the project channel's record is unchanged.
+    if DEBIAN_PHASE_OK is None:
+        if "debian_ok" in prev:
+            rec["debian_ok"] = prev.get("debian_ok")
+        if "debian_last_successful_check" in prev:
+            rec["debian_last_successful_check"] = prev.get(
+                "debian_last_successful_check")
+    else:
+        rec["debian_ok"] = DEBIAN_PHASE_OK
+        rec["debian_last_successful_check"] = (
+            now() if DEBIAN_PHASE_OK
+            else prev.get("debian_last_successful_check"))
     save_json(status_path, rec)
 
 
@@ -850,7 +937,7 @@ def disk_floor_for(pkg):
 
 
 def main():
-    global CHECK_SUCCEEDED
+    global CHECK_SUCCEEDED, DEBIAN_PHASE_OK
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
     hw_path = os.path.join(STATE_DIR, "highwater.json")
@@ -1307,7 +1394,8 @@ def main():
     log("apt-get update + upgrade (Debian base, same Tor path)")
     held = [pkg for pkg in ALL_KNOWN
             if run(["apt-mark", "hold", pkg]) == 0]
-    if run(["apt-get", "update"], timeout=1800) != 0:
+    debian_update_rc = run(["apt-get", "update"], timeout=1800)
+    if debian_update_rc != 0:
         log("Debian apt-get update failed for at least one source "
             "- logged only; upgrading from whatever lists did "
             "arrive (e.g. security), the rest retries next run")
@@ -1321,20 +1409,46 @@ def main():
     # as new ABI packages behind linux-image-amd64, and plain
     # apt-get upgrade holds those back forever. The flag never
     # removes anything.
+    #
+    # The untimed install must never do network I/O (audit
+    # T1-1): it runs --no-download, installing only from the
+    # completed download phase, and when that phase failed
+    # the install is SKIPPED entirely (the phase is judged
+    # failed, by the download's own result). The previous
+    # shape silently re-opened the exact exposure T1
+    # closed - the timed-out download retried inside the
+    # unkillable call, this time with dpkg live.
     dl = run(["apt-get", "--download-only", "-y",
               "--with-new-pkgs"] + DPKG_OPTS + ["upgrade"],
              timeout=3600)
     if dl != 0:
         log("Debian download phase returned %d - the install "
-            "phase re-fetches what it needs and is judged by "
-            "its own result" % dl)
-    rc = run(["apt-get", "-y", "--with-new-pkgs"] + DPKG_OPTS
-             + ["upgrade"], timeout=None)
+            "phase is skipped this run (audit T1-1): the "
+            "untimed install never fetches, so there is "
+            "nothing complete to install" % dl)
+        rc = dl
+    else:
+        rc = run(["apt-get", "-y", "--no-download",
+                  "--with-new-pkgs"] + DPKG_OPTS + ["upgrade"],
+                 timeout=None)
     for pkg in held:
         run(["apt-mark", "unhold", pkg])
     if rc != 0:
         log("Debian upgrade returned %d - logged, project state "
             "unaffected" % rc)
+    # The channel's outcome for the status record (audit
+    # T3-1): clean means its update AND its install phase
+    # both completed. Set BEFORE the status writes below so
+    # the run's final record carries this run's outcome.
+    DEBIAN_PHASE_OK = (debian_update_rc == 0 and rc == 0)
+    if not DEBIAN_PHASE_OK:
+        log("Debian phase did not complete cleanly this run; "
+            "the status record will say so (audit T3-1)")
+    if rc == 0:
+        # Housekeeping the phase's own growth made necessary
+        # (audit T1-2); the helper is log-only and can never
+        # change this run's outcome.
+        _purge_superseded_kernels()
 
     if recovering:
         # Never reached a healthy state this run (e.g. the repo
@@ -1351,6 +1465,16 @@ def main():
         return 5
     if worst == 0:
         detail = "Everything is current."
+        if DEBIAN_PHASE_OK is False:
+            # The project channel is current; the Debian
+            # channel is not known to be (audit T3-1). The
+            # record must not claim "everything" - and the
+            # Dashboard gates its "up to date" line on
+            # debian_ok besides.
+            detail = ("The platform software is current, "
+                      "but the Debian system-package phase "
+                      "did not complete this run; it will "
+                      "be retried automatically.")
         if OWNER_MAINTAINED:
             detail += (" Your %s is yours to update: a newer "
                        "packaged version is available and was "

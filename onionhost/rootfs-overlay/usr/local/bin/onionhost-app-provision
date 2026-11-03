@@ -13,10 +13,15 @@ It creates, once:
     (Quadlet conditions) and tell onionhost-generate-configs which
     golden templates to render;
   * the app-data volume skeleton /var/lib/onionhost/appdata/
-    {www,db,native} (A12.3's reserved writable, quota'd class):
+    {www,db,native,import,pgdb} (A12.3's reserved writable,
+    quota'd class):
     www/ is the docroot the owner fills with their application's
     files, native/ holds an owner-supplied program for the native
-    runtime, db/ is MariaDB's datadir and is container-only;
+    runtime, db/ is MariaDB's datadir and is container-only,
+    import/ is the managed staging directory for a database
+    import the app container's init consumes (T8-A), and pgdb/
+    is PostgreSQL's datadir, pre-created so the init never has
+    to create a name at the appdata root (T8-A);
   * for the PHP runtime WITH a database (the default; a
     packaged recipe whose manifest declares db.required=false -
     a flat-file app like DokuWiki - is provisioned with
@@ -74,6 +79,7 @@ Prints: APP_PROVISION_OK runtime=<r> db=<created|existing|none>
 import argparse
 import os
 import pwd
+import stat
 
 import secrets
 import struct
@@ -165,7 +171,7 @@ def provision(user, runtime, db_mode=None):
     if db_mode is None:
         db_mode = "required" if runtime == "php" else "none"
     os.makedirs(APPDATA, exist_ok=True)
-    for name in ("www", "db", "native"):
+    for name in ("www", "db", "native", "import", "pgdb"):
         os.makedirs(os.path.join(APPDATA, name), exist_ok=True)
     # Audit H4 (T8): from here on, nothing under appdata is
     # touched by path - descriptors only (see _dir_fd).
@@ -182,10 +188,86 @@ def provision(user, runtime, db_mode=None):
     os.fchown(appdata_fd, 0, 0)
     os.fchmod(appdata_fd, 0o755)
     dir_fds = {}
-    for name in ("www", "db", "native"):
+    for name in ("www", "db", "native", "import", "pgdb"):
         dir_fds[name] = _dir_fd(os.path.join(APPDATA, name))
     os.fchown(dir_fds["db"], CONTAINER_UID, CONTAINER_UID)
     os.fchmod(dir_fds["db"], 0o750)
+    # The two managed names T8-A (auditor re-verification,
+    # 2026-10-30) adds, both container-root owned 0700:
+    #
+    # * import/ is the staged database import's home. T8 made
+    #   the appdata root host-root owned, so the app
+    #   container's init can no longer delete
+    #   appdata/db-import.sql.gz after a successful import -
+    #   and a staged import that is never deleted is
+    #   re-imported (DROP DATABASE + the stale dump) at every
+    #   restart, silently wiping everything written since.
+    #   Inside import/ the container's root owns the names
+    #   again, so init can consume the staged file exactly
+    #   once, while the appdata root itself stays un-renamable
+    #   by the app (T8's property is preserved: the app still
+    #   cannot create, rename or delete names AT THE ROOT).
+    # * pgdb/ is PostgreSQL's datadir, pre-created here for
+    #   the same reason: init used to `mkdir -p` it at the
+    #   appdata root, which T8 forbids, and on any appdata
+    #   born after T8 PostgreSQL never started at all. Init
+    #   keeps its mkdir -p + chown to the postgres user; they
+    #   now operate on a directory that already exists.
+    for name in ("import", "pgdb"):
+        os.fchown(dir_fds[name], CONTAINER_UID, CONTAINER_UID)
+        os.fchmod(dir_fds[name], 0o700)
+    # Migrate a lingering pre-T8-A staged import at the root
+    # into import/: a restore or a recipe seed may have staged
+    # it there and no container start has consumed it yet.
+    # Through descriptors only, no-follow, and only when the
+    # import directory does not already hold a staged import
+    # (that one is the live staging; a second is left in place
+    # and reported, never silently overwritten or dropped).
+    try:
+        legacy_fd = os.open("db-import.sql.gz",
+                            os.O_RDONLY | os.O_NOFOLLOW,
+                            dir_fd=appdata_fd)
+    except OSError:
+        legacy_fd = None
+    if legacy_fd is not None:
+        try:
+            if stat.S_ISREG(os.fstat(legacy_fd).st_mode):
+                try:
+                    mig_fd = os.open(
+                        "db-import.sql.gz",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | os.O_NOFOLLOW, 0o644,
+                        dir_fd=dir_fds["import"])
+                except FileExistsError:
+                    mig_fd = None
+                    print("app-provision: WARNING: a staged "
+                          "import exists both at the appdata "
+                          "root and in import/; the import/ "
+                          "copy is the live one and the root "
+                          "copy was left in place",
+                          file=sys.stderr)
+                if mig_fd is not None:
+                    with os.fdopen(mig_fd, "wb") as out, \
+                            os.fdopen(os.dup(legacy_fd),
+                                      "rb") as src:
+                        os.fchown(out.fileno(), CONTAINER_UID,
+                                  CONTAINER_UID)
+                        os.fchmod(out.fileno(), 0o644)
+                        while True:
+                            chunk = src.read(1 << 16)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.fsync(dir_fds["import"])
+                    os.unlink("db-import.sql.gz",
+                              dir_fd=appdata_fd)
+                    os.fsync(appdata_fd)
+                    print("app-provision: migrated a staged "
+                          "database import into import/")
+        finally:
+            os.close(legacy_fd)
     # Owner-managed dirs: owned by the app user's mapping -
     # uid AND group (setgid so new entries inherit the group).
     #

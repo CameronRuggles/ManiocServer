@@ -175,6 +175,28 @@ def update_status_text():
     except (OSError, ValueError):
         record, state = {}, ""
     if state in ("up-to-date", "updated"):
+        # Audit T3-1: the Debian channel has its own outcome
+        # in the record (debian_ok + its own last-success
+        # time), and a failed Debian phase must not render
+        # as "up to date" - kernel and Debian security
+        # updates ride that channel. Records written before
+        # T3-1 lack the key and keep the old rendering.
+        if record.get("debian_ok") is False:
+            ddays = _days_since(
+                record.get("debian_last_successful_check"))
+            if ddays is None:
+                dage = "it has not completed yet"
+            elif ddays == 0:
+                dage = "it last completed today"
+            elif ddays == 1:
+                dage = "it last completed 1 day ago"
+            else:
+                dage = ("it last completed %d days ago"
+                        % ddays)
+            return ("Some updates could not be checked "
+                    "for: the system-package (Debian) check "
+                    "is not completing - %s. Updates will "
+                    "keep retrying automatically." % dage)
         # Audit M3: the line carries the age of the last
         # SUCCESSFUL check, so a box whose updater has been
         # failing for weeks cannot present a stale result as

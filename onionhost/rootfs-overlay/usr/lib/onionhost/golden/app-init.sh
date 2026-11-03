@@ -19,10 +19,15 @@
 #           creates the application database + user from the
 #           credentials in /etc/onionhost/app-db.env (mounted
 #           read-only, readable only by this container's root), and
-#           imports /srv/appdata/db-import.sql.gz if a restore or
-#           a recipe staged one (deleted only once it imports
-#           cleanly - a failed import is kept and retried at the
-#           next start; see start_db). A database-less site
+#           imports /srv/appdata/import/db-import.sql.gz if a
+#           restore or a recipe staged one (deleted only once
+#           it imports cleanly - a failed import is kept and
+#           retried at the next start; see start_db). The
+#           staged file lives in the managed import directory
+#           (T8-A): the appdata root is host-root owned, so a
+#           staged file at the root could never be deleted
+#           from inside this container, and an undeleted
+#           import is re-applied at every start. A database-less site
 #           (ONIONHOST_APP_DB=none - a flat-file packaged recipe)
 #           skips MariaDB entirely.
 #   native  The owner-supplied program /srv/appdata/native/app,
@@ -47,6 +52,12 @@
 set -u
 CFG=/etc/onionhost
 DATA=/srv/appdata
+# The staged database import's one home (T8-A): inside the
+# managed import directory, whose names this container's root
+# owns - NOT at the appdata root, which is host-root owned
+# and where this container can neither delete nor create
+# names.
+IMPORT_FILE="$DATA/import/db-import.sql.gz"
 RUNTIME="${ONIONHOST_RUNTIME:-php}"
 
 # /run is a fresh tmpfs (Quadlet Tmpfs=/run): the sandbox-internal
@@ -205,7 +216,7 @@ SQL
                      "the application will not be able to connect"
             fi
         fi
-        if [ -f "$DATA/db-import.sql.gz" ]; then
+        if [ -f "$IMPORT_FILE" ]; then
             # A staged import (a restore's dump, a recipe's
             # seed) is applied EXACTLY ONCE, and only success
             # deletes it (D2: the first version of this branch
@@ -218,10 +229,10 @@ SQL
             echo "app-init: importing staged database import"
             imp_tmp=/tmp/.db-import.sql
             rm -f "$imp_tmp"
-            if ! gunzip -c "$DATA/db-import.sql.gz" > "$imp_tmp"; then
+            if ! gunzip -c "$IMPORT_FILE" > "$imp_tmp"; then
                 echo "app-init: ERROR: the staged database import" \
                      "is not readable gzip; it is KEPT at" \
-                     "$DATA/db-import.sql.gz and the database" \
+                     "$IMPORT_FILE and the database" \
                      "was NOT imported"
             elif ! db_root -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\`;"; then
                 echo "app-init: ERROR: could not prepare database" \
@@ -229,12 +240,12 @@ SQL
                      "KEPT and will be retried at the next start"
                 rm -f "$imp_tmp"
             elif db_root "$DB_NAME" < "$imp_tmp"; then
-                rm -f "$DATA/db-import.sql.gz" "$imp_tmp"
+                rm -f "$IMPORT_FILE" "$imp_tmp"
                 echo "app-init: database import done"
             else
                 echo "app-init: ERROR: database import FAILED;" \
                      "the staged import is KEPT at" \
-                     "$DATA/db-import.sql.gz and will be retried" \
+                     "$IMPORT_FILE and will be retried" \
                      "at the next start"
                 rm -f "$imp_tmp"
             fi
@@ -436,7 +447,7 @@ start_pg() {
                     "application database"
     fi
     echo "app-init: application database '$DB_NAME' ready (PostgreSQL)"
-    if [ -f "$DATA/db-import.sql.gz" ]; then
+    if [ -f "$IMPORT_FILE" ]; then
         # The staged-import contract, exactly as start_db
         # keeps it: applied once, deleted ONLY on success,
         # kept and retried on any failure, and a retry starts
@@ -445,10 +456,10 @@ start_pg() {
         echo "app-init: importing staged database import (PostgreSQL)"
         imp_tmp=/tmp/.db-import-pg.sql
         rm -f "$imp_tmp"
-        if ! gunzip -c "$DATA/db-import.sql.gz" > "$imp_tmp"; then
+        if ! gunzip -c "$IMPORT_FILE" > "$imp_tmp"; then
             echo "app-init: ERROR: the staged database import" \
                  "is not readable gzip; it is KEPT at" \
-                 "$DATA/db-import.sql.gz and the database" \
+                 "$IMPORT_FILE and the database" \
                  "was NOT imported"
         elif ! pg_super postgres -qc \
                 "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" \
@@ -464,12 +475,12 @@ start_pg() {
                 -p 5432 -U postgres -d "$DB_NAME" \
                 -v ON_ERROR_STOP=1 -q -f "$imp_tmp" \
                 >>/run/postgresql.log 2>&1; then
-            rm -f "$DATA/db-import.sql.gz" "$imp_tmp"
+            rm -f "$IMPORT_FILE" "$imp_tmp"
             echo "app-init: database import done"
         else
             echo "app-init: ERROR: database import FAILED;" \
                  "the staged import is KEPT at" \
-                 "$DATA/db-import.sql.gz and will be retried" \
+                 "$IMPORT_FILE and will be retried" \
                  "at the next start"
             rm -f "$imp_tmp"
         fi
