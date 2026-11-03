@@ -136,6 +136,21 @@ UPDATE_STATUS_PATH = "/var/lib/onionhost/update/status.json"
 UPDATE_MARKER_PATH = "/var/lib/onionhost/update/fail-closed.marker"
 
 
+def _days_since(ts):
+    """Whole days between an updater timestamp
+    ("%Y-%m-%dT%H:%M:%SZ", UTC) and now, or None when the
+    timestamp is missing or unparsable."""
+    import datetime
+    try:
+        then = datetime.datetime.strptime(
+            ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    delta = datetime.datetime.now(datetime.timezone.utc) - then
+    return max(delta.days, 0)
+
+
 def update_status_text():
     """Dashboard update line (Gate 4): status text only - platform
     updates are automatic (onionhost-update.timer), so there is
@@ -160,6 +175,23 @@ def update_status_text():
     except (OSError, ValueError):
         record, state = {}, ""
     if state in ("up-to-date", "updated"):
+        # Audit M3: the line carries the age of the last
+        # SUCCESSFUL check, so a box whose updater has been
+        # failing for weeks cannot present a stale result as
+        # current. (last_successful_check is maintained by the
+        # updater for exactly this; checked_at is the fallback
+        # for status files written before it existed.)
+        days = _days_since(record.get("last_successful_check")
+                           or record.get("checked_at"))
+        if days is None:
+            checked = ""
+        elif days == 0:
+            checked = " (last checked today)"
+        elif days == 1:
+            checked = " (last checked 1 day ago)"
+        else:
+            checked = " (last checked %d days ago)" % days
+        line = "Your software is up to date%s." % checked
         # A26: an installed app with a newer packaged version is
         # a normal, healthy state - the updater reports it as
         # owner_maintained, and the Dashboard words it as plain
@@ -168,15 +200,54 @@ def update_status_text():
         maintained = record.get("owner_maintained") or []
         if maintained:
             app = maintained[0].get("app") or "your app"
-            return ("Your software is up to date. A newer %s is "
+            return (line + " A newer %s is "
                     "packaged, but your installed copy is yours "
                     "to update - Manioc Server never changes an "
                     "installed program." % app)
-        return "Your software is up to date."
+        return line
     if state == "fail-closed":
         return ("Your site is off for safety. Updates will install "
                 "themselves when a fixed version is ready.")
     return "Updates will install themselves."
+
+
+def reboot_status_text():
+    """Dashboard restart line (audit H2/M3, task T3): status
+    text only, like the update and runtime lines - restarting
+    is the owner's own act (the computer asks for the phrase
+    at boot), so there is deliberately no button. An empty
+    string means no restart is pending. The fail-closed
+    marker wins, exactly as with the update line: a machine
+    that is off for safety says that and nothing else. The
+    card gives the pending restart's age in days; how hard
+    the card escalates as the age grows is the owner's open
+    question (audit owner question 4) and is NOT implemented
+    here."""
+    import json
+    if os.path.exists(UPDATE_MARKER_PATH):
+        return ""
+    try:
+        with open(UPDATE_STATUS_PATH) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if record.get("state") == "fail-closed":
+        return ""
+    if not record.get("reboot_required"):
+        return ""
+    days = _days_since(record.get("reboot_required_since"))
+    if days is None:
+        waiting = ""
+    elif days == 0:
+        waiting = " It was asked for today."
+    elif days == 1:
+        waiting = " It has been waiting 1 day."
+    else:
+        waiting = " It has been waiting %d days." % days
+    return ("A restart is needed to finish installing updates."
+            + waiting
+            + " Restart the computer when you can - you will "
+              "need your phrase at the start.")
 
 
 RUNTIME_STATUS_PATH = "/var/lib/onionhost/runtime/status.json"
@@ -1218,6 +1289,14 @@ class Dashboard:
             self.frame, text=runtime_status_text(), font=FONTS["body"],
             anchor="w", justify="left", wraplength=820)
         self.runtime_label.pack(fill="x", pady=(0, 10))
+        # Audit T3: the restart line - status text only, no
+        # button (see reboot_status_text). Empty when no
+        # restart is pending. Refreshed with every status
+        # check.
+        self.reboot_label = tk.Label(
+            self.frame, text=reboot_status_text(), font=FONTS["body"],
+            anchor="w", justify="left", wraplength=820)
+        self.reboot_label.pack(fill="x", pady=(0, 10))
         tk.Button(self.frame,
                   text="Application details" if is_app
                   else "Edit site",
@@ -1430,6 +1509,8 @@ class Dashboard:
                         text=update_status_text())
                     self.runtime_label.config(
                         text=runtime_status_text())
+                    self.reboot_label.config(
+                        text=reboot_status_text())
                 except tk.TclError:
                     pass  # the page was rebuilt again meanwhile
             self.root.after(0, apply)
