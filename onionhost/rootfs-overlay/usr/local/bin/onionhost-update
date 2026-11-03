@@ -361,7 +361,7 @@ def _version_field(path):
             for line in f:
                 if line.startswith("version:"):
                     return line.split(":", 1)[1].strip() or None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
     return None
 
@@ -380,9 +380,27 @@ def _run_images_importer(*args):
 def load_json(path, default):
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return default
+    # S7 fix (auditor re-verification 2026-10-30, section 3): a
+    # type-confused state file (valid JSON, wrong root type) used
+    # to escape this helper and crash its callers downstream -
+    # _installed_recipe and _recipe_app_name on their .get calls
+    # (that was fuzz F4's root cause, previously guarded at those
+    # two call sites), and main()'s baseline reads of status.json,
+    # highwater.json and floors.json (S7-a/b/c: the crash runs
+    # first thing every run, before fetch, and nothing rewrites
+    # the file, so it wedges every later run permanently - F5's
+    # placement). The auditor's suggested shape: a parsed result
+    # that is not the default's type is not a usable value - the
+    # caller gets its default, exactly as for a missing or
+    # unparseable file. The audit-fix branch's write_status reads
+    # status.json through this same helper, so this also closes
+    # S7-f on the merged tree whichever batch lands first.
+    if not isinstance(data, type(default)):
+        return default
+    return data
 
 
 def save_json(path, data):
@@ -393,6 +411,64 @@ def save_json(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.rename(tmp, path)
+
+
+def _floor_value(data, pkg):
+    """The floor for pkg in a parsed floor document, or None.
+
+    S7 fix (auditor re-verification 2026-10-30, section 3): one
+    shared validation for both floor readers - deb_floor (the
+    signed candidate .deb) and disk_floor_for (the floor files
+    standing on disk). A floor value is usable only as a
+    non-empty string: deb_floor used to return an int/list value
+    unvalidated (S7-d), which crashed dpkg_compare downstream
+    and could be persisted into floors.json by main() first,
+    wedging every later run until a fixed package shipped;
+    disk_floor_for's F5 fix checked str but not empty. A document
+    of the wrong root type, a missing key, or a bad value all
+    mean the same thing to both readers: no floor from here."""
+    if isinstance(data, dict) and pkg in data \
+            and isinstance(data[pkg], str) and data[pkg]:
+        return data[pkg]
+    return None
+
+
+def _pruned_state(data, path):
+    """A parsed state dict with every unusable value dropped.
+
+    S8 fix (auditor re-verification 2026-11-02, Ask 2): S7's
+    load_json guard checks the ROOT type of highwater.json and
+    floors.json, but the values inside went to dpkg_compare
+    unchecked, and dpkg_compare puts them straight into
+    subprocess argv - an int or list value died there with
+    TypeError (expected str, bytes or os.PathLike). The mark
+    comparison (S8-a) runs every run after fetch, before
+    anything rewrites highwater.json, so one bad value wedged
+    the platform channel permanently - the S7-b/c permanence
+    class; the floor paths (S8-b) and the images phase's mark
+    (S8-c, which reads this same highwater dict) wedged the
+    same way. A usable value in these files obeys the rule
+    _floor_value already enforces for floor readers - a
+    non-empty string - so main() runs both dicts through this
+    one prune at the read, and every consumer downstream sees
+    only values that can reach dpkg_compare. Each drop is
+    logged with its file and key. What a dropped entry held
+    re-seeds at the baseline step exactly as on a factory
+    install: a mark from the installed version, a floor from
+    the disk floor - a dropped mark cannot move below what is
+    installed. Every writer now writes validated strings
+    (S7-d), so a dropped entry means local corruption or a
+    manual edit; dropping it and saying so beats a traceback
+    on every run."""
+    kept = {}
+    for key in data:
+        if _floor_value(data, key) is not None:
+            kept[key] = data[key]
+        else:
+            log("dropping %s entry %r: value %r is not a "
+                "non-empty string"
+                % (os.path.basename(path), key, data[key]))
+    return kept
 
 
 def deb_floor(deb_path, pkg):
@@ -415,8 +491,9 @@ def deb_floor(deb_path, pkg):
                     data = json.load(tf.extractfile(name))
                 except Exception:  # noqa: BLE001 - keep looking
                     continue
-                if pkg in data:
-                    return data[pkg]
+                value = _floor_value(data, pkg)
+                if value is not None:
+                    return value
         return None
     except Exception as e:  # noqa: BLE001 - absent floor = no constraint
         log("floor: could not read floor from %s: %s" % (deb_path, e))
@@ -599,6 +676,8 @@ def _installed_recipe(recipe_id):
     version - the app is still installed."""
     state = load_json(os.path.join(RECIPE_STATE_ROOT, recipe_id,
                                    "state.json"), {})
+    if not isinstance(state, dict):
+        return None
     if state.get("installed") and state.get("version"):
         return state
     return None
@@ -610,6 +689,8 @@ def _recipe_app_name(recipe_id):
     manifest = load_json(os.path.join(RECIPE_PAYLOAD_ROOT,
                                       recipe_id, "manifest.json"),
                          {})
+    if not isinstance(manifest, dict):
+        return recipe_id
     return manifest.get("name") or recipe_id
 
 
@@ -655,8 +736,9 @@ def disk_floor_for(pkg):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if pkg in data:
-                return data[pkg]
+            value = _floor_value(data, pkg)
+            if value is not None:
+                return value
         except (OSError, ValueError):
             continue
     return None
@@ -667,8 +749,8 @@ def main():
     os.makedirs(os.path.join(STATE_DIR, "prev"), exist_ok=True)
     hw_path = os.path.join(STATE_DIR, "highwater.json")
     fl_path = os.path.join(STATE_DIR, "floors.json")
-    highwater = load_json(hw_path, {})
-    floors = load_json(fl_path, {})
+    highwater = _pruned_state(load_json(hw_path, {}), hw_path)
+    floors = _pruned_state(load_json(fl_path, {}), fl_path)
     packages = {}
     worst = 0
 
