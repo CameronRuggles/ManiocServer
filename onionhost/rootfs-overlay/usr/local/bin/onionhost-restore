@@ -63,10 +63,10 @@ open the backup; 4 the backup is damaged or invalid; 1 other.
 """
 import glob
 import hashlib
-import io
 import json
 import os
 import pwd
+import re
 import shutil
 import struct
 import subprocess
@@ -208,8 +208,13 @@ def _root_disk_prefix():
     the stick scan. Falls back to excluding nothing on error."""
     try:
         with open("/etc/onionhost/luks-roles.json") as f:
-            device = json.load(f).get("device", "")
+            roles = json.load(f)
     except (OSError, ValueError):
+        return None
+    if not isinstance(roles, dict):
+        return None
+    device = roles.get("device", "")
+    if not isinstance(device, str):
         return None
     base = os.path.basename(device)
     parent = "".join(ch for ch in base if not ch.isdigit())
@@ -327,6 +332,10 @@ def _read_wrapper(path):
         raise RestoreError(
             "This file could not be read as an OnionHost backup. "
             "Nothing was changed.", 4)
+    if not isinstance(meta, dict):
+        raise RestoreError(
+            "This file could not be read as an OnionHost backup. "
+            "Nothing was changed.", 4)
     if meta.get("format") not in (1, 2, 3) or \
             meta.get("kind") != "onionhost-backup":
         raise RestoreError(
@@ -338,8 +347,16 @@ def _read_wrapper(path):
 def _decrypt(meta, payload_age, workdir):
     import getpass
     salts = meta.get("salts") or {}
+    if not isinstance(salts, dict):
+        raise RestoreError(
+            "This backup's stored key information is damaged. "
+            "Nothing was changed.", 4)
     salt_list = []
     value = salts.get("main")
+    if value is not None and not isinstance(value, str):
+        raise RestoreError(
+            "This backup's stored key information is damaged. "
+            "Nothing was changed.", 4)
     if value:
         try:
             salt_list.append(bytes.fromhex(value))
@@ -394,6 +411,40 @@ def _decrypt(meta, payload_age, workdir):
             pass
 
 
+def _site_record_recipe(stage):
+    """Read the backup's staged site model (stage/content/
+    site.json) and return the recipe it selects - None when the
+    model is missing or unreadable (the long-standing
+    clear-and-continue cases) and when it carries no recipe.
+
+    Raises ValueError when the model parses but is not shaped
+    like a site model: a root that is not an object, or a recipe
+    that is not a recipe-id string ([a-z0-9] then [a-z0-9-]* -
+    the shape sitegen enforces everywhere else). Both callers
+    refuse on that, each in its own phase's terms: _verify,
+    before anything has moved ("Nothing was changed.", code 4),
+    and _write_recipe_selection, the in-install belt-and-braces
+    (the restore did not finish, code 1). One helper, so the
+    two checks cannot drift (audit R5 re-verification,
+    2026-11-02)."""
+    try:
+        with open(os.path.join(stage, "content",
+                               "site.json")) as f:
+            model = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(model, dict):
+        raise ValueError("the staged site model is not an "
+                         "object")
+    recipe = model.get("recipe")
+    if recipe is not None and not (
+            isinstance(recipe, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]*", recipe)):
+        raise ValueError("the staged site model's recipe is "
+                         "not a recipe id")
+    return recipe
+
+
 def _verify(payload_tar_gz, stage):
     """Extract into stage/ and verify against the manifest.
     Returns the manifest dict."""
@@ -420,14 +471,28 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup has no readable checklist inside. Nothing "
             "was changed.", 4)
+    if not isinstance(manifest, dict):
+        raise RestoreError(
+            "This backup has no readable checklist inside. Nothing "
+            "was changed.", 4)
     if manifest.get("format") not in (1, 2, 3):
         raise RestoreError(
             "This backup's checklist is from a different version. "
             "Nothing was changed.", 4)
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        raise RestoreError(
+            "This backup's checklist is damaged. Nothing was "
+            "changed.", 4)
     listed = set()
-    for entry in manifest.get("entries", []):
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RestoreError(
+                "This backup's checklist is damaged. Nothing was "
+                "changed.", 4)
         rel = entry.get("path", "")
-        if not rel.startswith(ALLOWED_PREFIXES) or \
+        if not isinstance(rel, str) or \
+                not rel.startswith(ALLOWED_PREFIXES) or \
                 ".." in rel.split("/"):
             raise RestoreError(
                 "This backup lists a file in an unexpected place "
@@ -457,6 +522,23 @@ def _verify(payload_tar_gz, stage):
         raise RestoreError(
             "This backup contains files that are not on its "
             "checklist. Nothing was changed.", 4)
+    if "content/site.json" in listed:
+        # The site record itself: _install puts it in place as
+        # the owner's live record, and for an app backup the
+        # app section reinstates the recipe selection from it.
+        # It must pass the same shape check
+        # _write_recipe_selection applies - HERE, pre-install,
+        # where "Nothing was changed" is still true. When the
+        # check lived only in _write_recipe_selection it fired
+        # mid-install, after the content store and the app
+        # trees had already swapped, under that same wording
+        # (audit R5 re-verification, 2026-11-02).
+        try:
+            _site_record_recipe(stage)
+        except ValueError:
+            raise RestoreError(
+                "This backup's website record is damaged. "
+                "Nothing was changed.", 4)
     # The onion identity must agree three ways: the manifest,
     # the bundled hostname file, and the address recomputed from
     # the bundled public key. (An earlier comment said four,
@@ -464,16 +546,26 @@ def _verify(payload_tar_gz, stage):
     # compared it, and format 3's metadata no longer carries the
     # address at all, R-04.)
     pub_path = os.path.join(stage, "onion/hs_ed25519_public_key")
-    with open(pub_path, "rb") as f:
-        pubdata = f.read()
+    try:
+        with open(pub_path, "rb") as f:
+            pubdata = f.read()
+    except OSError:
+        raise RestoreError(
+            "This backup's website identity is damaged. Nothing "
+            "was changed.", 4)
     pubkey = pubdata[32:64] if len(pubdata) >= 64 else pubdata
     if len(pubkey) != 32:
         raise RestoreError(
             "This backup's website identity is damaged. Nothing "
             "was changed.", 4)
     address = backupkeys.onion_address_from_pubkey(pubkey)
-    with open(os.path.join(stage, "onion/hostname")) as f:
-        hostname = f.read().strip()
+    try:
+        with open(os.path.join(stage, "onion/hostname")) as f:
+            hostname = f.read().strip()
+    except OSError:
+        raise RestoreError(
+            "This backup's website identity is damaged. Nothing "
+            "was changed.", 4)
     if hostname != address + ".onion" or \
             manifest.get("onion") != hostname:
         raise RestoreError(
@@ -499,7 +591,7 @@ def _verify(payload_tar_gz, stage):
                 "This backup's application record is damaged. "
                 "Nothing was changed.", 4)
         manifest["appRuntime"] = runtime
-        paths = {e.get("path") for e in manifest.get("entries", [])}
+        paths = {e.get("path") for e in entries}
         has_dump = "app/db-dump.sql.gz" in paths
         has_creds = "app/db-credentials.env" in paths
         if has_dump and not has_creds:
@@ -512,8 +604,13 @@ def _verify(payload_tar_gz, stage):
                 "Nothing was changed.", 4)
     else:
         cur_path = os.path.join(stage, "site/current.txt")
-        with open(cur_path) as f:
-            cur_seq = f.read().strip()
+        try:
+            with open(cur_path) as f:
+                cur_seq = f.read().strip()
+        except OSError:
+            raise RestoreError(
+                "This backup's published website is incomplete. "
+                "Nothing was changed.", 4)
         if not cur_seq.isdigit() or not os.path.isdir(
                 os.path.join(stage, "site/releases", cur_seq)):
             raise RestoreError(
@@ -588,14 +685,22 @@ def _write_recipe_selection(stage):
     selection (measured in the marketplace recipe venue; the
     unix-serve recipes render identically without it, which is
     why four earlier restores never showed this). A model with
-    no recipe clears any stale selection, matching publish."""
-    recipe = None
+    no recipe clears any stale selection, matching publish.
+
+    The shape check itself lives in _site_record_recipe and
+    runs pre-install in _verify; this call is the
+    belt-and-braces repeat, in case the staged record changed
+    after verification. If it ever fires, the content store
+    and the app trees have already been swapped, so the
+    refusal says the restore did not finish (code 1, the
+    catch-all's terms) - never "Nothing was changed."
+    (audit R5 re-verification, 2026-11-02)."""
     try:
-        with open(os.path.join(stage, "content",
-                               "site.json")) as f:
-            recipe = json.load(f).get("recipe")
-    except (OSError, ValueError):
-        recipe = None
+        recipe = _site_record_recipe(stage)
+    except ValueError:
+        raise RestoreError(
+            "This backup's website record is damaged. The "
+            "restore did not finish; you can try again.", 1)
     if recipe:
         tmp = RECIPE_SELECTION + ".restore-tmp"
         with open(tmp, "w") as f:

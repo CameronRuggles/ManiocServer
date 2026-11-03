@@ -154,6 +154,8 @@ def validate_model(model):
         raise ValueError("site title too long")
     pages = model.get("pages", [])
     entries = model.get("entries", [])
+    if not isinstance(pages, list) or not isinstance(entries, list):
+        raise ValueError("site pages/entries are not lists")
     if tier == "app":
         # An app site has no platform content: the application in
         # the app-data volume is the site. The model only records
@@ -182,7 +184,8 @@ def validate_model(model):
         if not isinstance(item, dict):
             raise ValueError("site item is not an object")
         iid = item.get("id", "")
-        if not _ID_RE.match(iid) or iid in seen:
+        if not isinstance(iid, str) or not _ID_RE.match(iid) \
+                or iid in seen:
             raise ValueError("bad or duplicate item id: %r" % iid)
         seen.add(iid)
         heading = item.get("heading", "")
@@ -194,11 +197,12 @@ def validate_model(model):
         if not isinstance(text, str) or len(text) > MAX_TEXT:
             raise ValueError("item text too long")
         photo = item.get("photo")
-        if photo is not None and not _MEDIA_RE.match(photo or ""):
+        if photo is not None and not (
+                isinstance(photo, str) and _MEDIA_RE.match(photo)):
             raise ValueError("bad photo name: %r" % (photo,))
     for entry in entries:
         date = entry.get("date", "")
-        if not _DATE_RE.match(date or ""):
+        if not isinstance(date, str) or not _DATE_RE.match(date):
             raise ValueError("bad entry date: %r" % (date,))
         # reject impossible dates like 2026-02-30
         datetime.strptime(date, "%Y-%m-%d")
