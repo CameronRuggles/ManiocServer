@@ -20,6 +20,22 @@
 #   3. the tarballs are imported, the container units are
 #      restarted, and only then is the new version recorded.
 #
+# Failure contract (full-tree audit 2026-11-03, Finding 2): a
+# change that fails AFTER the rollback tags are taken - an
+# import dying midway, a restart failing - is undone in the
+# tags before this tool exits: :latest is re-pointed at the
+# :rollback set and the restored set is restarted, so on ANY
+# non-zero exit of the change path the record and the :latest
+# tags name the same set, and the next run's tag_rollbacks can
+# never promote a stranded or half-imported set into the
+# rollback slot. A change run also leaves an in-progress
+# marker (images-import-in-progress) from just before the
+# first import until the record is written: a run killed
+# outright (SIGKILL, power loss) cannot undo anything, so the
+# NEXT run reads the marker, restores the recorded set from
+# the rollback tags before tagging anything, and only then
+# judges the delivery again.
+#
 # Whether the new set stays up is not this tool's judgement:
 # onionhost-update health-checks after an import it requested
 # and calls this tool's --rollback mode when the check fails.
@@ -46,6 +62,7 @@ SYSTEMCTL=${ONIONHOST_SYSTEMCTL:-systemctl}
 IMGDIR=${ONIONHOST_IMAGES_DIR:-/usr/lib/onionhost/images}
 STATEDIR=${ONIONHOST_IMAGES_STATE_DIR:-/var/lib/onionhost}
 RECORD=$STATEDIR/images-imported-version
+MARKER=$STATEDIR/images-import-in-progress
 OLD_MARKER=$STATEDIR/.images-imported
 MANIFEST=$IMGDIR/IMAGES-VERSION
 UNITS="onionhost-a.service onionhost-b.service onionhost-app.service onionhost-u.service"
@@ -82,12 +99,17 @@ import_one() {
 }
 
 import_all() {
+    # The || return 1 chains are load-bearing: the caller runs
+    # this function with set -e suspended to capture its status,
+    # and a bare sequence would report only the LAST import's
+    # result - a midway failure followed by a success would
+    # read as a clean import of a mixed set.
     import_one onionhost-tor.tar localhost/onionhost-tor:latest \
-        '["tor","-f","/etc/tor/torrc"]'
+        '["tor","-f","/etc/tor/torrc"]' || return 1
     import_one onionhost-web.tar localhost/onionhost-web:latest \
-        '["nginx","-c","/etc/nginx/nginx.conf","-g","daemon off;"]'
+        '["nginx","-c","/etc/nginx/nginx.conf","-g","daemon off;"]' || return 1
     import_one onionhost-app.tar localhost/onionhost-app:latest \
-        '["/bin/sh","/etc/onionhost/app-init.sh"]'
+        '["/bin/sh","/etc/onionhost/app-init.sh"]' || return 1
 }
 
 verify_all() {
@@ -121,6 +143,29 @@ tag_rollbacks() {
     done
 }
 
+restore_latest() {
+    # Re-point :latest at the :rollback tags - the set the
+    # record names. The undo half of the failure contract: a
+    # change that dies after tag_rollbacks leaves the tags
+    # naming the recorded set again, never the set it failed
+    # to deliver.
+    for img in localhost/onionhost-tor localhost/onionhost-web \
+               localhost/onionhost-app; do
+        if "$PODMAN" image exists "$img:rollback"; then
+            "$PODMAN" tag "$img:rollback" "$img:latest"
+        fi
+    done
+}
+
+write_marker() {
+    # write_marker <version> - the in-progress marker, tmp +
+    # rename like the record, so a killed run leaves either
+    # the whole marker or none of it.
+    tmp=$MARKER.tmp
+    printf 'version: %s\n' "$1" > "$tmp"
+    mv "$tmp" "$MARKER"
+}
+
 restart_units() {
     # Deliberately one call with all four units (compare
     # onionhost-update's stop path): the set changes together.
@@ -141,6 +186,9 @@ do_rollback() {
         err "no rollback images are recorded - nothing to roll back to"
         exit 2
     fi
+    # A rollback concludes any change episode: an in-progress
+    # marker still standing belongs to the set just replaced.
+    rm -f "$MARKER"
     restart_units
     prev=$(recorded_previous)
     if [ -n "$prev" ] && [ "$prev" != "-" ]; then
@@ -184,6 +232,26 @@ if [ ! -f "$RECORD" ]; then
 fi
 
 imported=$(recorded_version)
+
+# Interrupted-change recovery, before anything looks at the
+# tags: the marker standing means a previous change run died
+# between marking and recording (a soft failure restores and
+# clears it itself, so a standing marker is a hard kill). Its
+# rollback tags still hold the recorded set; restore that set
+# as :latest BEFORE any tag_rollbacks of this run can promote
+# the stranded or half-imported set into the rollback slot.
+# A marker naming the recorded version is the litter of a run
+# that did complete its record (killed on the way out) - it
+# needs no restore, only removal.
+if [ -f "$MARKER" ]; then
+    stale=$(field "$MARKER" version)
+    if [ -n "$stale" ] && [ "$stale" != "$imported" ]; then
+        err "a previous import of $stale never completed - restoring the recorded set $imported as :latest before judging this delivery"
+        restore_latest || true
+    fi
+    rm -f "$MARKER"
+fi
+
 if [ -z "$delivered" ]; then
     err "no delivered manifest at $MANIFEST - cannot judge the on-disk set against the imported $imported; refusing"
     exit 2
@@ -194,10 +262,41 @@ fi
 
 # A new set was delivered. Rollback tags first (so even a failed
 # verification leaves a named copy of what is running), then
-# verify, then load, then restart, then - only then - record.
+# verify, then mark the change in progress, then load, then
+# restart, then - only then - record. Any failure after the
+# marker restores the recorded set into :latest first (the
+# failure contract in the header), so a non-zero exit never
+# leaves the tags and the record naming different sets.
 tag_rollbacks
 verify_all || exit 2
+write_marker "$delivered"
+# The status captures run with set -e suspended around the
+# call: invoking a function in an if/|| condition would
+# suspend set -e through its whole body, and a midway import
+# failure would no longer abort the sequence - the exact
+# mixed-set outcome the failure contract exists to prevent.
+set +e
 import_all
+import_rc=$?
+set -e
+if [ $import_rc -ne 0 ]; then
+    err "importing the delivered set failed - restoring the recorded set $imported as :latest"
+    restore_latest || true
+    restart_units || err "the restored set could not be restarted either - the caller's health check will judge the stack"
+    rm -f "$MARKER"
+    exit 1
+fi
+set +e
 restart_units
+restart_rc=$?
+set -e
+if [ $restart_rc -ne 0 ]; then
+    err "restarting the container units on the new set failed - restoring the recorded set $imported as :latest"
+    restore_latest || true
+    restart_units || err "the restored set could not be restarted either - the caller's health check will judge the stack"
+    rm -f "$MARKER"
+    exit 1
+fi
 write_record "$delivered" "$imported"
+rm -f "$MARKER"
 echo "onionhost-import-images: imported image set $delivered (previous $imported kept as :rollback)"

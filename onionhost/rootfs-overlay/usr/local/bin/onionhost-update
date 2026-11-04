@@ -90,7 +90,14 @@ repository offers a different images package it is installed
 (the same high-water refusal applies), the importer runs, and
 the SAME health judgement as the platform phase decides - the
 importer's :rollback tags are the way back, exit 4 when that
-rollback is healthy, fail-closed (5) when it is not. The change
+rollback is healthy, fail-closed (5) when it is not. An
+importer failure is judged by the record it leaves, never by
+assumption (full-tree audit 2026-11-03, Finding 2): if the
+record did not advance, the importer's own failure contract
+leaves the recorded set tagged, and health decides whether it
+serves - a restart of that set is attempted before anything
+fails closed; if the record DID advance, the run is judged
+exactly like a reported success. The change
 test is content, not version arithmetic: the manifest the
 package delivered vs the importer's record of what is loaded.
 The images package is held across the Debian phase like the
@@ -652,6 +659,21 @@ def health_ok_after_restart():
     it - is health_ok() unchanged."""
     _sleep_settle("post-restart settle, drawn per judgement")
     return health_ok()
+
+
+def _restart_recorded_set():
+    """Recovery attempt for the images phase's importer-failure
+    branch (full-tree audit 2026-11-03, Finding 2): the importer
+    failed without recording the delivered set, and the recorded
+    set - the set the :latest tags name, by the importer's
+    failure contract - is not healthy as it stands. Restart the
+    stack on those tags and re-judge, exactly the platform
+    phase's recovery shape. True iff the recorded set answers
+    healthy after the restart."""
+    log("container images: the recorded image set is not "
+        "healthy - restarting the stack on it and re-checking")
+    stackctl("restart")
+    return health_ok_after_restart()
 
 
 # A26 owner-maintained report: one entry per INSTALLED app whose
@@ -1408,18 +1430,56 @@ def main():
         # republication lands at a drawn time, and the
         # judgement is then plain health_ok().
         _sleep_settle("pre-restart settle, drawn per install")
-        if _run_images_importer() != 0:
-            # The importer refused (a tarball failed its
-            # manifest hash) or failed before restarting
-            # anything: the previous set is still what serves.
-            log("container images: the importer refused or "
-                "failed - the previous image set still serves")
-            write_status(
-                "update-failed",
-                "A container software update could not be "
-                "applied. Your site is running the previous "
-                "version.", packages)
-            worst = max(worst, 4)
+        imp_rc = _run_images_importer()
+        if imp_rc != 0 and _version_field(IMAGES_RECORD) != delivered:
+            # The importer did not record the delivered set.
+            # Its contract (full-tree audit 2026-11-03,
+            # Finding 2) is that a refused or failed change
+            # leaves the record and the :latest tags naming the
+            # same - the recorded - set: a hash refusal imported
+            # nothing, and a midway failure is undone in the
+            # tags before the importer exits. What the record
+            # cannot say is whether that set is actually
+            # SERVING (a failed restart can leave units down),
+            # so judge by health, never by assumption: the
+            # previous wording here claimed the previous set
+            # still served on a path where the new set was
+            # already live.
+            if health_ok():
+                log("container images: the importer refused "
+                    "or failed - health check confirms the "
+                    "recorded image set %s still serves"
+                    % imported)
+                write_status(
+                    "update-failed",
+                    "A container software update could not be "
+                    "applied. Your site is running the previous "
+                    "version.", packages)
+                worst = max(worst, 4)
+            elif _restart_recorded_set():
+                log("container images: the recorded image set "
+                    "%s serves again after a restart" % imported)
+                write_status(
+                    "update-failed",
+                    "A container software update could not be "
+                    "applied. Your site is running the previous "
+                    "version.", packages)
+                worst = max(worst, 4)
+            else:
+                log("container images: the importer failed and "
+                    "the recorded set %s is unhealthy even "
+                    "after a restart - failing closed" % imported)
+                stop_gateway()
+                stackctl("stop")
+                write_status(
+                    "fail-closed",
+                    "An update could not be applied safely, so "
+                    "your site was turned off rather than left "
+                    "running out-of-date software. It will come "
+                    "back automatically when a fixed update is "
+                    "available.", packages)
+                write_marker(packages, floors)
+                return 5
         elif health_ok():
             if img_inst:
                 highwater[IMAGES_PACKAGE] = img_inst

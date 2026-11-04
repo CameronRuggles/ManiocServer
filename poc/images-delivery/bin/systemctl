@@ -1,5 +1,16 @@
 #!/bin/bash
 # Stub systemctl for the images-delivery suite: records every
-# invocation to $SYSTEMCTL_LOG and succeeds.
+# invocation to $SYSTEMCTL_LOG and succeeds - unless
+# SYSTEMCTL_STUB_FAIL names the action (argv[1]), in which case
+# that action exits 1. The injection exists for the
+# restart-failure path of the full-tree audit's Finding 2
+# (2026-11-03): a real systemctl can fail a restart, and what
+# the importer and the updater do on that path is part of what
+# this suite proves. Before the injection existed the stub
+# always exited 0, so that path was never driven.
 echo "$*" >> "${SYSTEMCTL_LOG:?}"
+if [ -n "${SYSTEMCTL_STUB_FAIL:-}" ] && [ "$1" = "$SYSTEMCTL_STUB_FAIL" ]; then
+  echo "stub systemctl: injected failure of $1" >&2
+  exit 1
+fi
 exit 0

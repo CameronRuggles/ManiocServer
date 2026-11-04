@@ -20,8 +20,22 @@ if [ "$1" = "tag" ]; then
 fi
 if [ "$1" = "import" ]; then
   # argv: import --change <json> <file> <ref>
+  # Failure injection (full-tree audit Finding 2, 2026-11-03):
+  # PODMAN_STUB_FAIL_IMPORT_ON=<n> makes the n-th import of the
+  # run exit 1 before writing; PODMAN_STUB_KILL_PARENT_ON_IMPORT
+  # =<n> makes the n-th import write and then SIGKILL the
+  # importer (a hard-killed change run). The invocation count
+  # comes from the log, which the suite unlinks per run.
+  n=$(grep -c '^import ' "$LOG")
+  if [ "${PODMAN_STUB_FAIL_IMPORT_ON:-}" = "$n" ]; then
+    echo "stub podman: injected import failure $n" >&2; exit 1
+  fi
   eval "file=\${$(( $# - 1 ))}"; eval "ref=\${$#}"
   [ -f "$file" ] || { echo "stub podman: no such file $file" >&2; exit 1; }
-  head -n 1 "$file" > "$D/$(flat "$ref")"; exit 0
+  head -n 1 "$file" > "$D/$(flat "$ref")"
+  if [ "${PODMAN_STUB_KILL_PARENT_ON_IMPORT:-}" = "$n" ]; then
+    kill -9 "$PPID"
+  fi
+  exit 0
 fi
 echo "stub podman: unhandled $*" >&2; exit 125

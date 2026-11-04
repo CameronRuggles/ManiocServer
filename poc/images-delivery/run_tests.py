@@ -26,6 +26,17 @@ Cases:
       again, units restart, the record is restored
   (f) pre-F2 migration: the old .images-imported marker becomes
       a record at the ISO manifest's version, with no import
+  (g) restart failure on a change (full-tree audit Finding 2,
+      2026-11-03): the failed change is undone in the tags
+      before the tool exits - record and :latest keep naming
+      the old set, the rollback copy survives, and a later
+      retry lands the change cleanly
+  (h) an import failing midway leaves no mixed :latest: the
+      recorded set is restored over the partial import
+  (i) a change run killed mid-import leaves the in-progress
+      marker; the next run restores the recorded set from the
+      rollback tags BEFORE tagging anything, so the rollback
+      copy is never the half-imported set
 
 Paths are derived from this file's location, never a hardcoded
 home directory (review 2026-10-25, finding F7).
@@ -231,6 +242,96 @@ def main():
     check("(f) migration imports nothing",
           not any(l.startswith("import ")
                   for l in w.log_lines("podman")))
+
+    # (g) restart failure on a change (Finding 2)
+    w = World("g")
+    v1 = w.make_images("v1")
+    w.run()
+    v2 = w.make_images("v2")
+    w.env["SYSTEMCTL_STUB_FAIL"] = "restart"
+    p = w.run()
+    check("(g) failed restart exits nonzero", p.returncode != 0)
+    check("(g) record still names the old version",
+          w.record().get("version") == v1)
+    check("(g) latest tags restored to the old set",
+          all(w.stored("localhost/%s:latest" % img)
+              == "imgid-%s-v1" % t
+              for img, t in (("onionhost-tor", "onionhost-tor.tar"),
+                             ("onionhost-web", "onionhost-web.tar"),
+                             ("onionhost-app", "onionhost-app.tar"))))
+    check("(g) rollback tags still hold the old set",
+          w.stored("localhost/onionhost-app:rollback")
+          == "imgid-onionhost-app.tar-v1")
+    del w.env["SYSTEMCTL_STUB_FAIL"]
+    p = w.run()
+    check("(g) retry with a working restart exits 0",
+          p.returncode == 0)
+    check("(g) record moved to the new version on retry",
+          w.record().get("version") == v2
+          and w.record().get("previous") == v1)
+    check("(g) latest carries the new set after retry",
+          w.stored("localhost/onionhost-app:latest")
+          == "imgid-onionhost-app.tar-v2")
+    check("(g) rollback still holds the old set after retry",
+          w.stored("localhost/onionhost-app:rollback")
+          == "imgid-onionhost-app.tar-v1")
+
+    # (h) an import failing midway (second tarball)
+    w = World("h")
+    v1 = w.make_images("v1")
+    w.run()
+    v2 = w.make_images("v2")
+    w.env["PODMAN_STUB_FAIL_IMPORT_ON"] = "2"
+    p = w.run()
+    check("(h) failed import exits nonzero", p.returncode != 0)
+    check("(h) record still names the old version",
+          w.record().get("version") == v1)
+    check("(h) no mixed latest: the partial import is undone",
+          w.stored("localhost/onionhost-tor:latest")
+          == "imgid-onionhost-tor.tar-v1"
+          and w.stored("localhost/onionhost-web:latest")
+          == "imgid-onionhost-web.tar-v1"
+          and w.stored("localhost/onionhost-app:latest")
+          == "imgid-onionhost-app.tar-v1")
+    check("(h) rollback tags hold the old set",
+          w.stored("localhost/onionhost-tor:rollback")
+          == "imgid-onionhost-tor.tar-v1")
+
+    # (i) a change run killed mid-import (first tarball written)
+    w = World("i")
+    v1 = w.make_images("v1")
+    w.run()
+    v2 = w.make_images("v2")
+    w.env["PODMAN_STUB_KILL_PARENT_ON_IMPORT"] = "1"
+    p = w.run()
+    marker = os.path.join(w.state, "images-import-in-progress")
+    check("(i) the killed run died by the injected SIGKILL",
+          p.returncode == -9)
+    check("(i) the killed run left the in-progress marker",
+          os.path.exists(marker))
+    check("(i) the kill really landed mid-import (tor is new)",
+          w.stored("localhost/onionhost-tor:latest")
+          == "imgid-onionhost-tor.tar-v2")
+    check("(i) record still names the old version",
+          w.record().get("version") == v1)
+    del w.env["PODMAN_STUB_KILL_PARENT_ON_IMPORT"]
+    p = w.run()
+    check("(i) the recovery run exits 0", p.returncode == 0)
+    check("(i) record moved to the new version",
+          w.record().get("version") == v2
+          and w.record().get("previous") == v1)
+    check("(i) rollback holds the pure old set, not the mix",
+          w.stored("localhost/onionhost-tor:rollback")
+          == "imgid-onionhost-tor.tar-v1"
+          and w.stored("localhost/onionhost-web:rollback")
+          == "imgid-onionhost-web.tar-v1"
+          and w.stored("localhost/onionhost-app:rollback")
+          == "imgid-onionhost-app.tar-v1")
+    check("(i) latest carries the new set",
+          w.stored("localhost/onionhost-tor:latest")
+          == "imgid-onionhost-tor.tar-v2")
+    check("(i) the marker is gone after the recovery run",
+          not os.path.exists(marker))
 
     print("---")
     print("%d assertion(s) failed" % len(FAILS))
