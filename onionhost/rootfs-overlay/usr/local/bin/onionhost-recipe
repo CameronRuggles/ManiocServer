@@ -1374,6 +1374,49 @@ def _copy_file_between_fds(src_dir_fd, name, dst_dir_fd):
         os.close(sfd)
 
 
+def _live_parent_fd(www, rel):
+    """Open the directory HOLDING www/rel through directory
+    descriptors, one O_NOFOLLOW open per INTERMEDIATE
+    component (audit F3). The live tree is app-writable
+    while this tool runs as host root, and a manifest path
+    can be multi-component (wp-content/uploads, conf): the
+    final-component no-follow opens the rest of T8-B uses
+    say nothing about the components in between, and a
+    planted intermediate symlink would steer a carryover
+    read onto a host directory. The final component is the
+    caller's to open through the returned descriptor, so
+    its behaviour is exactly what it was before this walk
+    existed. Returns (fd, None) with fd open on the parent
+    directory (the caller closes it), (None, None) when an
+    intermediate component is simply not there, or
+    (None, shown) with the first intermediate component
+    path that exists but is not a directory resolvable
+    no-follow (a symlink, a plain file, an unreadable
+    directory)."""
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    try:
+        fd = _dir_fd(www)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, www
+    shown = www
+    for part in parts[:-1]:
+        shown = os.path.join(shown, part)
+        try:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY
+                          | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
+            os.close(fd)
+            return None, None
+        except OSError:
+            os.close(fd)
+            return None, shown
+        os.close(fd)
+        fd = nfd
+    return fd, None
+
+
 def _copy_tree(src, dst, tree_root=None,
                exclude_rels=frozenset()):
     """Copy a tree, skipping __pycache__ anywhere and any
@@ -1397,20 +1440,92 @@ def _copy_tree(src, dst, tree_root=None,
         tree_root = src
     src_fd = _dir_fd(src)
     try:
-        os.mkdir(dst)
-        dst_fd = _dir_fd(dst)
-        try:
-            _copy_tree_contents(src_fd, dst_fd, src,
-                                tree_root, exclude_rels)
-            # Directory modes are asserted on the way OUT
-            # (see _copy_tree_contents); the root's own mode
-            # follows the source root's.
-            os.fchmod(dst_fd, stat.S_IMODE(
-                os.fstat(src_fd).st_mode))
-        finally:
-            os.close(dst_fd)
+        _copy_tree_from_fd(src_fd, src, dst, tree_root,
+                           exclude_rels)
     finally:
         os.close(src_fd)
+
+
+def _copy_tree_from_fd(src_fd, src_path, dst, tree_root,
+                       exclude_rels):
+    """_copy_tree's body for a source directory the caller
+    has already opened no-follow - the live data-directory
+    carryover resolves its path component by component
+    first (audit F3) and hands the walk's descriptor over,
+    so the copy starts from a directory root has itself
+    resolved without following any component."""
+    os.mkdir(dst)
+    dst_fd = _dir_fd(dst)
+    try:
+        _copy_tree_contents(src_fd, dst_fd, src_path,
+                            tree_root, exclude_rels)
+        # Directory modes are asserted on the way OUT
+        # (see _copy_tree_contents); the root's own mode
+        # follows the source root's.
+        os.fchmod(dst_fd, stat.S_IMODE(
+            os.fstat(src_fd).st_mode))
+    finally:
+        os.close(dst_fd)
+
+
+def _carry_data_dir(www, dirname, staging):
+    """Carry one declared data directory from the live tree
+    into staging (the apply's data-directory carryover).
+
+    The live path's intermediate components are resolved
+    through _live_parent_fd, never by path (audit F3):
+    dirname can be multi-component (wp-content/uploads),
+    and while its final component was already opened
+    no-follow by the copy, a planted INTERMEDIATE symlink
+    (wp-content itself) steered the old by-path isdir +
+    copy onto a host directory, whose matching child then
+    landed in the served tree. An intermediate component
+    that exists but cannot be resolved no-follow refuses
+    the carryover for this directory - loudly, on stderr,
+    in the shape of the tree copy's own warnings - and
+    staging keeps the archive's copy, exactly as it does
+    when the app has not created the directory yet. The
+    final component is still opened no-follow through the
+    walk's descriptor, with the old semantics: a planted
+    final symlink raises and aborts the apply."""
+    live = os.path.join(www, dirname)
+    staged = os.path.join(staging, dirname)
+    parts = [p for p in dirname.split("/") if p not in ("", ".")]
+    live_fd = None
+    blocked = None
+    if parts:
+        parent_fd, blocked = _live_parent_fd(www, dirname)
+        if parent_fd is not None:
+            try:
+                try:
+                    live_fd = os.open(
+                        parts[-1], os.O_RDONLY
+                        | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd)
+                except FileNotFoundError:
+                    live_fd = None
+            finally:
+                os.close(parent_fd)
+    if live_fd is not None:
+        try:
+            shutil.rmtree(staged, ignore_errors=True)
+            _copy_tree_from_fd(live_fd, live, staged, live,
+                               frozenset())
+        finally:
+            os.close(live_fd)
+        return
+    if blocked is not None:
+        print("onionhost-recipe: WARNING: not carrying over "
+              "the live data directory %s - %s is a symlink "
+              "or not a directory, and links are never "
+              "followed when carrying app data (audit T8-B)"
+              % (live, blocked), file=sys.stderr)
+    if not os.path.isdir(staged):
+        # The app's distribution ships no such directory
+        # (WordPress's uploads/, which it would otherwise
+        # create lazily at runtime); the recipe declares it
+        # a data directory, so it exists from the start.
+        os.makedirs(staged, exist_ok=True)
 
 
 def _copy_tree_contents(src_fd, dst_fd, src_path, tree_root,
@@ -1479,13 +1594,36 @@ def _copy_config_carryover(www, name, staging):
     False when the live name is a symlink or not a regular
     file; the caller then renders (or fails) as it would
     for a missing config, and the planted link's target
-    never enters staging."""
-    try:
-        sfd = os.open(os.path.join(www, name),
-                      os.O_RDONLY | os.O_NOFOLLOW
-                      | os.O_NONBLOCK)
-    except OSError:
+    never enters staging. The name can be multi-component
+    (a DokuWiki conf file): its intermediate components
+    are resolved through _live_parent_fd's per-component
+    no-follow opens (audit F3), where the old by-path open
+    followed an intermediate conf symlink to its target;
+    the final component is opened no-follow through that
+    descriptor, exactly as the by-path open treated it."""
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts:
         return False
+    dir_fd, blocked = _live_parent_fd(www, name)
+    if dir_fd is None:
+        if blocked is not None:
+            print("onionhost-recipe: WARNING: the live "
+                  "config %s cannot be resolved without "
+                  "passing %s, a symlink or not a "
+                  "directory; not carrying it over "
+                  "(audit T8-B)"
+                  % (os.path.join(www, name), blocked),
+                  file=sys.stderr)
+        return False
+    try:
+        try:
+            sfd = os.open(parts[-1], os.O_RDONLY
+                          | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          dir_fd=dir_fd)
+        except OSError:
+            return False
+    finally:
+        os.close(dir_fd)
     try:
         st = os.fstat(sfd)
         if not stat.S_ISREG(st.st_mode):
@@ -1991,17 +2129,7 @@ def apply_recipe(recipe_id):
     # owner's uploads/avatars); on first install the archive's
     # empty guarded directories are already in place.
     for dirname in manifest.get("data_dirs", []):
-        live = os.path.join(www, dirname)
-        staged = os.path.join(staging, dirname)
-        if os.path.isdir(live):
-            shutil.rmtree(staged, ignore_errors=True)
-            _copy_tree(live, staged)
-        elif not os.path.isdir(staged):
-            # The app's distribution ships no such directory
-            # (WordPress's uploads/, which it would otherwise
-            # create lazily at runtime); the recipe declares it
-            # a data directory, so it exists from the start.
-            os.makedirs(staged, exist_ok=True)
+        _carry_data_dir(www, dirname, staging)
     # The app config: carried over once the app owns it; rendered
     # from the template (with this machine's DB credentials) on
     # first install. A recipe with config_renderer "none" has no
