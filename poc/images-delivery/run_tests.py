@@ -333,6 +333,19 @@ def main():
     check("(i) the marker is gone after the recovery run",
           not os.path.exists(marker))
 
+    # Sibling harnesses for the same audit's two findings run
+    # as part of this suite: the updater's importer-failure
+    # branch (Finding 2) and the package version ordering
+    # (Finding 1).
+    for sibling in ("updater_failure_tests.py",
+                    "version_order_tests.py"):
+        p = subprocess.run([sys.executable,
+                            os.path.join(HERE, sibling)],
+                           capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+        check("sibling harness %s passes" % sibling,
+              p.returncode == 0)
+
     print("---")
     print("%d assertion(s) failed" % len(FAILS))
     return len(FAILS)

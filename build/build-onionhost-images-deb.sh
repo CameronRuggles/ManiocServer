@@ -12,11 +12,35 @@
 # onionhost-app.tar (the same files build-iso.sh places in the
 # image). VERSION is the release/platform version being built.
 #
-# The package version is VERSION+img.<hash>, where <hash> is the
-# first 12 hex of the sha256 over the three tarballs' own
-# sha256 lines: the version CHANGES whenever any tarball changes,
-# so a rebuilt image set can never hide behind an unchanged
-# version string.
+# The package version is 1:VERSION+img.<counter>.<hash>, where
+# <hash> is the first 12 hex of the sha256 over the three
+# tarballs' own sha256 lines: the version CHANGES whenever any
+# tarball changes, so a rebuilt image set can never hide behind
+# an unchanged version string.
+#
+# The <counter> is the version's ORDER (full-tree audit
+# 2026-11-03, Finding 1): onionhost-update judges this package
+# by dpkg ordering - the repository's best version is the
+# dpkg-max, and the high-water mark refuses anything below it -
+# but a content hash orders lexically, not temporally, so a
+# hash-only version refused legitimate same-base rebuilds about
+# half the time and admitted older sets whose hash happened to
+# sort higher. The counter is a plain integer the release bumps
+# (build/images-build-counter, in the same commit that cuts an
+# images release; never reused, never decreased), so dpkg
+# orders two builds of a base version by build order and the
+# hash is reached only as a tie-break between builds of the
+# same counter - which, the content being identical, is no
+# decision at all. The epoch "1:" marks the scheme: every
+# pre-scheme version (VERSION+img.<hash>, epoch 0) sorts below
+# every counter version, so the first counter release is never
+# refused as a downgrade by a mark an old-format install left
+# behind, whatever its hash. Rebuilding the same content with
+# the same counter reproduces the same version: the version is
+# a pure function of VERSION, the counter file and the content
+# - no wall clock anywhere in it. (IMAGES_BUILD_COUNTER
+# overrides the file for verification builds and tests; a
+# release build reads the file.)
 #
 # The payload is the tarballs plus IMAGES-VERSION, a manifest
 # carrying that same content identity (version: img-<hash>) and
@@ -64,7 +88,18 @@ IMGVER="img-${COMBINED:0:12}"
   cat "$STAGE/.hashlines"
 } > "$PAYLOAD/IMAGES-VERSION"
 rm -f "$STAGE/.hashlines"
-PKGVER="${VERSION}+img.${COMBINED:0:12}"
+COUNTER_FILE="$(dirname "$(readlink -f "$0")")/images-build-counter"
+COUNTER=${IMAGES_BUILD_COUNTER:-$(cat "$COUNTER_FILE" 2>/dev/null)}
+case $COUNTER in
+  ''|*[!0-9]*)
+    echo "bad images build counter '${COUNTER}': expected a positive integer from $COUNTER_FILE (or IMAGES_BUILD_COUNTER) - bump the counter file in the release commit" >&2
+    exit 2 ;;
+esac
+COUNTER=$((10#$COUNTER))
+[ "$COUNTER" -ge 1 ] || {
+  echo "bad images build counter 0: expected a positive integer" >&2
+  exit 2; }
+PKGVER="1:${VERSION}+img.${COUNTER}.${COMBINED:0:12}"
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: onionhost-images
 Version: $PKGVER
